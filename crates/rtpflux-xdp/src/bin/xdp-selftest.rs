@@ -574,7 +574,11 @@ fn check_replace(
     let key = key_of(&frame);
     let mut action = random_action(rng, &key, 1);
     fp.insert(key, action)?;
-    fp.test_run(&frame, &mut out, 3)?;
+    // Repetitions reuse packet data, so the first rewrite changes the
+    // tuple used for subsequent lookups. Start each run with the original.
+    for _ in 0..3 {
+        fp.test_run(&frame, &mut out, 1)?;
+    }
     let before = fp.stats(key)?.map_or(0, |s| s.packets);
     action.flags = flags::DROP;
     fp.insert(key, action)?;

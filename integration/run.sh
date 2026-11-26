@@ -159,7 +159,9 @@ done
 sas_a=$(sas zrtp-a)
 sas_b=$(sas zrtp-b)
 echo "short authentication strings: $sas_a / $sas_b"
-[ -n "$sas_a" ] && [ "$sas_a" = "$sas_b" ] || fail "zrtp: the two sides' SAS differ"
+if [ -z "$sas_a" ] || [ "$sas_a" != "$sas_b" ]; then
+    fail "zrtp: the two sides' SAS differ"
+fi
 zrtp=$(( $(metric rtpflux_zrtp_forwarded_total) - zrtp_before ))
 echo "ZRTP packets forwarded by rtpflux: $zrtp"
 [ "$zrtp" -gt 0 ] || fail "zrtp: rtpflux relayed no ZRTP packets"

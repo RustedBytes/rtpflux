@@ -1,5 +1,7 @@
 # rtpflux
 
+[![CI](https://github.com/RustedBytes/rtpflux/actions/workflows/ci.yml/badge.svg)](https://github.com/RustedBytes/rtpflux/actions/workflows/ci.yml)
+
 **A fast media relay for SIP voice and video calls, written in Rust.**
 
 rtpflux sits between the phones (or browsers) in a call and forwards their
@@ -9,11 +11,6 @@ or [OpenSIPS](https://opensips.org/) tells it about each call over the
 already speak. So rtpflux can take the place of
 [rtpengine](https://github.com/sipwise/rtpengine) without changing how the
 proxy is set up.
-
-> **Status: early development.** The relay is tested with its own test
-> suite, with conformance vectors from an independent reference model,
-> and with real calls from Firefox. It has not yet been tested
-> behind a production SIP proxy. Expect rough edges.
 
 ## What it does
 

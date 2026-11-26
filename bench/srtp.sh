@@ -22,7 +22,9 @@ OUT="bench/results/$(date +%Y%m%d-%H%M%S)-srtp-modes.txt"
 TMP=$(mktemp -d)
 PID=""
 cleanup() {
-    [ -n "$PID" ] && kill -INT "$PID" 2>/dev/null || true
+    if [ -n "$PID" ]; then
+        kill -INT "$PID" 2>/dev/null || true
+    fi
     rm -rf "$TMP"
     finish_output
 }

@@ -47,7 +47,9 @@ OUT="bench/results/$(date +%Y%m%d-%H%M%S)$( [ "$SRTP" = none ] || echo "-srtp-$S
 TMP=$(mktemp -d)
 RTPFLUX_PID=""
 cleanup() {
-    [ -n "$RTPFLUX_PID" ] && kill -INT "$RTPFLUX_PID" 2>/dev/null || true
+    if [ -n "$RTPFLUX_PID" ]; then
+        kill -INT "$RTPFLUX_PID" 2>/dev/null || true
+    fi
     podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
     rm -rf "$TMP"
     finish_output

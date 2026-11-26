@@ -59,7 +59,9 @@ LOADED_MODULE=0
 RELAY_PID=""
 
 cleanup() {
-    [ -n "$RELAY_PID" ] && sudo kill -INT "$RELAY_PID" 2>/dev/null || true
+    if [ -n "$RELAY_PID" ]; then
+        sudo kill -INT "$RELAY_PID" 2>/dev/null || true
+    fi
     sudo podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
     del_netns "$RELAY_NS" "$PEER_NS"
     if [ "$LOADED_MODULE" = 1 ]; then
