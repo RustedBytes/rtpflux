@@ -1,0 +1,5 @@
+# The build contexts of the bench's images: no logs, no ferrosip history or
+# build output.
+out/
+ferrosip-src/.git/
+ferrosip-src/target/

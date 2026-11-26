@@ -1,0 +1,11 @@
+# Only the sources the image build needs.
+target
+crates/rtpflux-xdp-ebpf/target
+bench
+docs
+scripts
+.git
+*.md
+!crates/**/*.md
+crates/rtpflux/webui/ui/node_modules
+crates/rtpflux/webui/ui/dist

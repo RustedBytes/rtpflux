@@ -1,0 +1,5 @@
+# The BPF target is tier 3: it needs -Z build-std, hence a dated nightly.
+# Everything else in the workspace uses the pinned stable 1.100.0.
+[toolchain]
+channel = "nightly-2026-11-13"
+components = ["rust-src", "clippy"]

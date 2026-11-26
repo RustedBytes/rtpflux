@@ -1,0 +1,19 @@
+{
+  "name": "rtpflux-webui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "rtpflux read-only admin UI (Preact + TypeScript). The built bundle is embedded in the binary from ../assets.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "preact": "11.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}

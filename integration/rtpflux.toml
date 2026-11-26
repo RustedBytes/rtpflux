@@ -1,0 +1,17 @@
+# rtpflux in the integration bench: one interface on the bench network.
+[control]
+listen = ["172.30.89.10:2223"]
+
+[[interface]]
+name = "default"
+address = "172.30.89.10"
+
+[ports]
+min = 30000
+max = 30199
+
+[sessions]
+max = 50
+
+[metrics]
+listen = ["172.30.89.10:9101"]

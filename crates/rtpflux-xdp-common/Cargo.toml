@@ -1,0 +1,11 @@
+[package]
+name = "rtpflux-xdp-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Types and arithmetic shared by the rtpflux XDP program and its loader"
+
+[lints]
+workspace = true

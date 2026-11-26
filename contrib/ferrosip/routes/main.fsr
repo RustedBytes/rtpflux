@@ -1,0 +1,67 @@
+// Every INVITE goes to the PBX, record-routed, with its SDP rewritten by
+// rtpflux: the offer here, the answer in `on reply`; BYE, CANCEL and
+// failed calls delete the call in rtpflux, freeing its ports.
+
+import route_set, media
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(483)
+
+    if msg.has_to_tag {
+        return in_dialog(msg)
+    }
+    match msg.method {
+        INVITE => call(msg)
+        CANCEL => {
+            if txn.exists() {
+                media.delete()
+                relay(msg)
+            }
+            drop
+        }
+        ACK => {
+            if txn.exists() {
+                relay(msg)
+            }
+            drop
+        }
+        OPTIONS => reply(200)
+        _ => reply(405)
+    }
+}
+
+fn in_dialog(msg: Request) -> Action {
+    guard route_set.follow() else reply(404)
+    if msg.method == BYE {
+        media.delete()
+    } else if msg.has_sdp {
+        media.manage(features.flags)  // a re-INVITE's offer, or ACK's answer
+    }
+    relay(msg)
+}
+
+fn call(msg: Request) -> Action {
+    route_set.record()
+    if msg.has_sdp {
+        guard media.offer(features.flags) else reply(500, "Media relay failed")
+    }
+    msg.dst_uri = features.pbx
+    let res = await txn.relay(msg, timeout: 60s)
+    match res {
+        Final(r) if r.code in 200..299 => forward(r)
+        Final(r) => {
+            media.delete()  // the call failed: free its ports
+            forward(r)
+        }
+        Timeout => {
+            media.delete()
+            reply(408)
+        }
+    }
+}
+
+// The answer, in a provisional or final reply.
+on reply(r: Reply) where r.has_sdp && r.code in 180..299 {
+    media.answer(features.flags)
+}

@@ -1,0 +1,40 @@
+# systemd unit for rtpflux. Install the binary as /usr/bin/rtpflux, the
+# configuration as /etc/rtpflux/rtpflux.toml (rtpflux --print-example-config),
+# and, for the XDP fast path, the program as /usr/lib/rtpflux/rtpflux-xdp.
+[Unit]
+Description=rtpflux media relay
+Documentation=https://github.com/RustedBytes/rtpflux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/rtpflux --check -c /etc/rtpflux/rtpflux.toml
+ExecStart=/usr/bin/rtpflux -c /etc/rtpflux/rtpflux.toml
+# SIGTERM ends the relay cleanly (calls' state is written when enabled).
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=1
+DynamicUser=yes
+StateDirectory=rtpflux
+# Four sockets per call: raise well above sessions.max * 4.
+LimitNOFILE=1048576
+# Attaching the XDP program needs CAP_BPF, CAP_NET_ADMIN and CAP_PERFMON
+# (CAP_SYS_ADMIN on older kernels); without [xdp] enabled none are needed.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# For [xdp] af_xdp (a build with the af-xdp feature), add CAP_NET_RAW to
+# both capability lines and AF_XDP to RestrictAddressFamilies; each
+# receive queue's socket locks af_xdp_frames x 4 KiB of memory, so also
+# raise LimitMEMLOCK= (e.g. infinity) or add CAP_IPC_LOCK.
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

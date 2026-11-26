@@ -1,0 +1,5 @@
+# ferrosip routing scripts (contrib/ferrosip/routes/*.fsr): a language of
+# ferrosip's own, which GitHub's Linguist does not know. Highlight them as
+# Rust, the closest (fn, let, match with =>, -> types, // comments, await),
+# without counting them as Rust in the repository's language statistics.
+*.fsr linguist-language=Rust linguist-detectable=false

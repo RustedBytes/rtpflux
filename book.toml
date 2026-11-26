@@ -1,0 +1,22 @@
+# The documentation in docs/ as an mdBook, published to GitHub Pages by
+# .github/workflows/docs.yml. Build locally with `mdbook build` (output in
+# target/book) or preview with `mdbook serve --open`.
+[book]
+title = "rtpflux"
+description = "A fast RTP media relay for SIP calls, controlled over the ng protocol"
+authors = ["RustedBytes"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/RustedBytes/rtpflux"
+edit-url-template = "https://github.com/RustedBytes/rtpflux/edit/main/docs/{path}"
+site-url = "/rtpflux/"
+
+[output.html.search]
+enable = true
+

@@ -1,0 +1,22 @@
+[package]
+name = "rtpflux-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Load generator and measurement for RTP relays controlled over ng"
+publish = false
+
+[dependencies]
+clap.workspace = true
+nix = { workspace = true, features = ["feature", "resource", "sched"] }
+rtpflux-core = { path = "../rtpflux-core" }
+rtpflux-ng = { path = "../rtpflux-ng" }
+rtpflux-srtp = { path = "../rtpflux-srtp" }
+
+[dev-dependencies]
+rtpflux = { path = "../rtpflux" }
+
+[lints]
+workspace = true

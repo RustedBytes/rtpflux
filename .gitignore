@@ -1,0 +1,13 @@
+/target
+/crates/rtpflux-xdp-ebpf/target
+/bench/kmod/
+# Benchmark output (bench/*.sh); the docs keep the numbers that matter.
+/bench/results/
+
+# Integration bench logs (integration/run.sh)
+/integration/out/
+/integration/ferrosip-src/
+
+# Python bytecode (scripts/, examples/scenarios/)
+__pycache__/
+*.py[co]

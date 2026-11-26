@@ -1,0 +1,5 @@
+# linphonec (Debian's linphone-cli, built with bzrtp) for the ZRTP calls.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends linphone-cli \
+ && rm -rf /var/lib/apt/lists/*

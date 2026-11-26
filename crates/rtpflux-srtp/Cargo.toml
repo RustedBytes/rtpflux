@@ -1,0 +1,18 @@
+[package]
+name = "rtpflux-srtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SRTP and SRTCP (RFC 3711) with the AES-CM / HMAC-SHA1 suites, in place and allocation-free"
+
+[dependencies]
+aes = "0.9.4"
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"] }
+ctr = "0.10.1"
+hmac = "0.13.0"
+sha1 = { version = "0.11.0", default-features = false }
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+# ferrosip as the edge proxy in front of a PBX, with rtpflux relaying the
+# media: ferrosip's media module drives rtpflux over the ng protocol, as
+# Kamailio's rtpengine module does (see contrib/kamailio for that one).
+#
+#   ferrosip --config contrib/ferrosip/ferrosip.toml
+#   ferrosip check --config contrib/ferrosip/ferrosip.toml
+#
+# Settings come from the environment, with these defaults:
+#
+#   SIP_ADDR        127.0.0.1             where ferrosip listens (UDP 5060)
+#   PBX_URI         sip:127.0.0.1:5080    where calls go
+#   RTPFLUX_NG      udp:127.0.0.1:2223    rtpflux's ng control socket
+#   RTPFLUX_FLAGS   trust-address replace-origin
+#                                         flags of every offer and answer
+#
+# This file is also the configuration of the integration bench
+# (integration/), which checks real calls through it.
+
+[core]
+workers = 2
+log_level = "info"
+rpc_socket = "${FERROSIP_RPC:-/tmp/ferrosip-rpc.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "${SIP_ADDR:-127.0.0.1}:5060"
+
+[feature]
+pbx = "${PBX_URI:-sip:127.0.0.1:5080}"
+flags = "${RTPFLUX_FLAGS:-trust-address replace-origin}"
+
+[modules.media]                   # Kamailio's rtpengine module
+rtpengine_sock = "${RTPFLUX_NG:-udp:127.0.0.1:2223}"
+rtpengine_tout_ms = "1s"
+rtpengine_retr = 3
+
+[modules.route_set]               # rr
+append_fromtag = true
+
+[routing]
+entry = "routes/main.fsr"

@@ -1,0 +1,14 @@
+# ferrosip, built from the checkout run.sh (or CI) puts in ferrosip-src at
+# the commit pinned in ferrosip.ref, with the media module and without the
+# optional database, Lua, HTTP and web UI features.
+FROM docker.io/library/rust:1.100.0-slim-trixie AS build
+ENV RUSTUP_TOOLCHAIN=1.100.0 \
+    CARGO_TERM_COLOR=never
+WORKDIR /src
+COPY ferrosip-src/ ./
+RUN cargo build --release --locked -p ferrosip --no-default-features \
+ && install -D -m 755 target/release/ferrosip /out/ferrosip
+
+FROM docker.io/library/debian:trixie-slim
+COPY --from=build /out/ferrosip /usr/local/bin/ferrosip
+ENTRYPOINT ["ferrosip"]

@@ -1,0 +1,193 @@
+# rtpflux configuration.
+#
+# Every section is optional except [[interface]]; omitted keys take the
+# values shown here. Unknown keys are an error.
+
+# The ng control protocol (bencoded commands over UDP), as used by the
+# rtpengine modules of Kamailio and OpenSIPS.
+[control]
+listen = ["127.0.0.1:2223"]
+# The same commands over TCP, and over HTTP / WebSocket (POST /ng,
+# /ng-plain; subprotocols ng.rtpengine.com and ng-plain.rtpengine.com).
+listen_tcp = []
+listen_http = []
+# Largest accepted command datagram, in octets (512..=65535).
+max_message = 65535
+
+# Media interfaces. `direction=<name>` in ng commands selects them.
+# `advertise` is the address written into SDP; it defaults to `address`
+# and is set when the host sits behind a 1:1 NAT.
+[[interface]]
+name = "external"
+address = "203.0.113.10"
+# advertise = "198.51.100.20"
+
+[[interface]]
+name = "internal"
+address = "10.0.0.5"
+
+# Media ports: RTP on even ports, RTCP on the next odd one. Each call uses
+# two pairs, so the range must hold at least 2 * sessions.max pairs.
+[ports]
+min = 30000
+max = 60000
+
+# Limits and timeouts, in seconds.
+[sessions]
+max = 5000
+# No media in either direction for this long, once answered, ends the call.
+timeout = 60
+# How long an offer may wait for its answer (rings without the media
+# timeout meanwhile).
+offer_timeout = 3600
+# The media timeout of calls on hold (a side offered or answered sendonly,
+# recvonly or inactive, or c=0.0.0.0), and the longest a call may last
+# from its first offer, whatever its media (0 = no limit).
+silent_timeout = 3600
+final_timeout = 0
+# Every call as if the proxy sent the strict-source flag: once a side's
+# address is known, media from other sources is dropped (no injection by
+# third parties; a phone whose NAT mapping changes mid-call is not
+# followed).
+strict_source = false
+# Keep calls across restarts: the dialogs are written here within a second
+# of every change (at most once a second: a crash can lose the last
+# second's changes) and on shutdown, and recreated on their ports at start
+# (SDES and plain calls carry on; DTLS sides wait for a new handshake). A
+# file that cannot be read is kept aside as <name>.bad. The systemd unit's
+# state directory is /var/lib/rtpflux.
+# state_file = "/var/lib/rtpflux/state.json"
+# The same state in Redis too (or instead): another host can take the calls
+# over. The newer of the file and Redis is restored at start. The value
+# holds SRTP keys: use a password and a private network (no TLS).
+# redis = "redis://:password@127.0.0.1:6379/0"
+# redis_key = "rtpflux:state"
+
+# Threads and buffers, all allocated once at start-up.
+[runtime]
+# Media worker threads, one session shard each; 0 = one per CPU.
+workers = 0
+# Datagrams per receive / send system call (1..=64).
+batch = 32
+# Slots in each worker's packet ring (a power of two).
+ring_capacity = 4096
+# Bytes per packet buffer (1500..=65535).
+packet_buffer = 2048
+# How the media workers receive: "io_uring" (multishot receive on all their
+# sockets, Linux 6.0+; recvmmsg where the kernel lacks it) or "recvmmsg".
+receive = "io_uring"
+
+# In-driver fast path for established plain RTP streams.
+[xdp]
+enabled = false
+# devices = ["eth0"]
+# "native" (in the driver) or "generic" (any driver, slower).
+mode = "native"
+# The compiled program (crates/rtpflux-xdp-ebpf, cargo build --release).
+object = "/usr/lib/rtpflux/rtpflux-xdp"
+# Receive the calls the kernel does not relay (SRTP, WebRTC, BUNDLE, calls
+# not settled yet) through AF_XDP sockets on the first device instead of the
+# kernel's UDP stack. Needs a build with the `af-xdp` cargo feature.
+af_xdp = false
+# AF_XDP memory per receive queue, in 4 KiB frames.
+af_xdp_frames = 2048
+
+# Level: error, warn, info, debug, trace (RUST_LOG and --log-level take
+# precedence). Format: "full" or "compact".
+[log]
+level = "info"
+format = "full"
+
+# Prometheus metrics over HTTP (GET /metrics): packet counters, sessions,
+# calls, ng requests. Off unless addresses are given.
+[metrics]
+listen = []
+# listen = ["127.0.0.1:9101"]
+
+# A read-only administrator web UI: live statistics, calls and logs. Off
+# unless an address is given. Every request needs the login (HTTP Basic
+# auth): keep it on 127.0.0.1 (SSH tunnel) or behind a TLS reverse proxy.
+[webui]
+# listen = "127.0.0.1:8090"
+# user = "admin"
+# The password's hash: `rtpflux --webui-hash` (reads the password).
+# password_hash = "sha256:<salt>:<hex>"
+realm = "rtpflux"
+max_connections = 64
+# How often the UI refreshes, in milliseconds.
+refresh_ms = 2000
+# Log lines kept in memory for the Logs page (0: off).
+log_buffer = 2000
+
+[ice]
+# Towards endpoints that use ICE: "full" (the relay checks their candidates
+# too, nominates, and keeps checking consent) or "lite" (it only answers
+# their checks). The ICE-lite option overrides it per call.
+mode = "full"
+# Ta: how often a new connectivity check goes out, in milliseconds.
+pacing_ms = 50
+# A STUN server the relay asks for its public address on interfaces
+# without `advertise` (offered as a server-reflexive candidate).
+# stun_server = "stun.example.net:3478"
+
+[recording]
+# `start recording` writes one pcap per media section here (created at
+# start); without it the command is refused.
+# dir = "/var/spool/rtpflux"
+# What a recording becomes when it ends: "pcap" (the packets, as recorded),
+# "wav" (16-bit PCM), "flac", "opus" (Ogg Opus) or "mp3" (builds with the
+# `mp3` feature). The audio file is written next to the pcap, with a .json
+# file describing the call. `start recording` can override each of these.
+format = "pcap"
+# "stereo" (the caller on the left, the callee on the right) or "mono".
+channels = "stereo"
+# 8000, 16000, 24000 or 48000.
+sample_rate = 8000
+# kbit/s, for opus (6 to 510) and mp3 (8 to 320, MP3's steps).
+bitrate = 32
+# Keep the pcap once converted (a failed conversion always keeps it).
+keep_pcap = false
+# Where finished recordings go: "local" (they stay in dir) or "s3" (they
+# are uploaded, then removed from dir; builds with the `s3` feature).
+# Credentials come from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and
+# AWS_SESSION_TOKEN) in the environment.
+storage = "local"
+# File names, without the extension: text (letters, digits, . - _ @) and
+# {call_id}, {from_tag}, {to_tag}, {section}, {date}, {time} (UTC) and
+# {timestamp}. A name a file already has gets -2, -3, ..., never reused.
+file_name = "{call_id}-{from_tag}-{section}"
+
+# Used with storage = "s3".
+[recording.s3]
+bucket = ""
+region = ""
+# The service URL; by default https://s3.<region>.amazonaws.com. Set it
+# for S3-compatible servers (MinIO, Ceph, Cloudflare R2, ...).
+# endpoint = "http://127.0.0.1:9000"
+# Prepended to each file name to make the object key.
+prefix = ""
+# endpoint/bucket/key URLs instead of bucket.endpoint/key; most
+# S3-compatible servers need them.
+path_style = false
+# Keep the local files after uploading them.
+keep_local = false
+
+# After each recording is uploaded, POST a JSON description of it (call,
+# tags, metadata, object keys, URLs, sizes) to url. Retried with backoff on
+# timeouts, connection errors, 5xx, 408 and 429; every attempt has a strict
+# deadline. With RTPFLUX_WEBHOOK_SECRET in the environment each request is
+# signed (X-Rtpflux-Signature).
+# [recording.s3.webhook]
+# url = "https://hooks.example.com/recordings"
+# timeout_ms = 5000          # each attempt, DNS to response (100-60000)
+# connect_timeout_ms = 2000  # connecting (100-timeout_ms)
+# attempts = 5               # 1-20
+# backoff_ms = 1000          # before the first retry, doubled after (jittered)
+# backoff_max_ms = 30000     # longest wait, Retry-After included
+# queue = 1000               # notifications waiting; more are dropped
+
+# Tags every recording carries, in its JSON and its audio file (WAV INFO,
+# FLAC and Opus comments, MP3 ID3); `start recording` adds its own
+# `metadata`. Keys: letters, digits, _ - . (up to 64).
+[recording.metadata]
+# company = "Example Ltd"

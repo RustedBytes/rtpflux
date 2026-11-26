@@ -1,0 +1,32 @@
+[package]
+name = "rtpflux-xdp-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "The rtpflux XDP fast path (eBPF program)"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.3.0"
+rtpflux-xdp-common = { path = "../rtpflux-xdp-common" }
+
+[[bin]]
+name = "rtpflux-xdp"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+overflow-checks = false
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# The workspace's lints (this crate is outside it): Clippy's pedantic set.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,30 @@
+<!--
+  Calls from the proxy (sip_profiles/rtpflux.xml). Two test numbers, then
+  your own extensions:
+    echo  answers and sends back every frame it hears
+    tone  answers and plays a 440 Hz tone until hangup
+  Drop it into conf/dialplan/ of a standard configuration.
+-->
+<include>
+  <context name="from-proxy">
+    <extension name="echo">
+      <condition field="destination_number" expression="^echo$">
+        <action application="answer"/>
+        <action application="echo"/>
+      </condition>
+    </extension>
+    <extension name="tone">
+      <condition field="destination_number" expression="^tone$">
+        <action application="answer"/>
+        <action application="playback" data="tone_stream://%(1000,0,440);loops=-1"/>
+      </condition>
+    </extension>
+    <!-- Your extensions here, or transfer to the default context:
+    <extension name="default">
+      <condition field="destination_number" expression="^(.+)$">
+        <action application="transfer" data="$1 XML default"/>
+      </condition>
+    </extension>
+    -->
+  </context>
+</include>

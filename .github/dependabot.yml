@@ -1,0 +1,73 @@
+# Dependabot: weekly update pull requests, one grouped pull request per
+# ecosystem and directory (security updates still arrive as they are
+# published). The Rust toolchains are pinned on purpose (rust-toolchain.toml,
+# the rust:1.100.0 base images, the XDP program's nightly), so Dependabot
+# leaves them alone: change them by hand.
+version: 2
+
+updates:
+  # The workspace.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # The XDP program: its own workspace and lock file (aya-ebpf).
+  - package-ecosystem: cargo
+    directory: /crates/rtpflux-xdp-ebpf
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-xdp-ebpf:
+        patterns: ["*"]
+
+  # The web UI's build. Its bundle in webui/assets/ must be rebuilt in the
+  # same pull request (npm ci && npm run check); CI checks that it was.
+  - package-ecosystem: npm
+    directory: /crates/rtpflux/webui/ui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Base images of the release image and the integration bench, and the
+  # digest-pinned FreeSWITCH and OpenSIPS images in its compose file.
+  - package-ecosystem: docker
+    directories: [/, /integration]
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      - dependency-name: "library/rust"
+      - dependency-name: "rust"
+    groups:
+      docker:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /integration
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker-compose:
+        patterns: ["*"]

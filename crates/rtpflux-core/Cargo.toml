@@ -1,0 +1,21 @@
+[package]
+name = "rtpflux-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+hmac = "0.13.0"
+rtpflux-srtp = { path = "../rtpflux-srtp" }
+sha1 = { version = "0.11.0", default-features = false }
+
+[dev-dependencies]
+# The same G.722 reference code in another Rust translation, to check ours
+# against bit for bit (tests only).
+ezk-g722 = "=0.1.2"
+
+[lints]
+workspace = true

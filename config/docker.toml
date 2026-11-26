@@ -1,0 +1,38 @@
+# rtpflux configuration for the container (compose.yaml mounts it as
+# /etc/rtpflux/rtpflux.toml). The container uses the host network, so the
+# addresses below are the host's own. Every key is documented in
+# config/rtpflux.toml and docs/configuration.md.
+
+# Where the SIP proxy sends ng commands. Keep it private: ng has no
+# authentication.
+[control]
+listen = ["127.0.0.1:2223"]
+
+# CHANGE ME: an address of this host that phones can reach. Behind a 1:1
+# NAT, also set `advertise` to the public address.
+[[interface]]
+name = "default"
+address = "127.0.0.1"
+# advertise = "198.51.100.20"
+
+# Open this range (UDP) in the host firewall.
+[ports]
+min = 30000
+max = 40000
+
+[sessions]
+max = 2000
+# Calls survive a container restart (the volume at /var/lib/rtpflux).
+state_file = "/var/lib/rtpflux/state.json"
+
+[metrics]
+listen = ["127.0.0.1:9101"]
+
+[recording]
+# The volume at /var/spool/rtpflux.
+dir = "/var/spool/rtpflux"
+# Recordings end as audio files: wav, flac, opus or mp3 (this image has
+# MP3 support), or pcap to keep the packets only.
+format = "wav"
+channels = "stereo"
+sample_rate = 16000

@@ -1,0 +1,22 @@
+# linphonec for the bench: SIP on UDP 5060 only, no video, no ICE, and
+# ZRTP mandatory (the call fails rather than going unencrypted).
+[sip]
+sip_port=5060
+sip_udp_port=5060
+sip_tcp_port=-1
+sip_tls_port=-1
+default_proxy=-1
+media_encryption=zrtp
+media_encryption_mandatory=1
+
+[rtp]
+audio_rtp_port=7078
+
+[video]
+capture=0
+display=0
+automatically_initiate=0
+automatically_accept=0
+
+[net]
+firewall_policy=0

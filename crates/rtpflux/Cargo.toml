@@ -1,0 +1,75 @@
+[package]
+name = "rtpflux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rtpflux"
+path = "src/main.rs"
+
+[dependencies]
+# Decodes announcements (play media) in MP3, FLAC or WAV at any rate (pure
+# Rust); tests also use it to decode recordings.
+symphonia = { version = "0.6.1", default-features = false, features = ["wav", "flac", "mp3", "ogg", "pcm"] }
+log = { workspace = true, features = ["std"] }
+nix.workspace = true
+# DTLS handshakes (DTLS-SRTP keying) only; media is protected by rtpflux-srtp.
+dimpl.workspace = true
+g729-sys.workspace = true
+amr-nb = { workspace = true, optional = true }
+amr-wb = { workspace = true, optional = true }
+hmac.workspace = true
+p256.workspace = true
+rand.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+x509-cert.workspace = true
+zeroize.workspace = true
+opus-rs.workspace = true
+flacenc.workspace = true
+ogg.workspace = true
+mp3lame-encoder = { workspace = true, optional = true }
+rusty-s3 = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+rtpflux-core = { path = "../rtpflux-core" }
+rtpflux-uring = { path = "../rtpflux-uring" }
+rtpflux-ng = { path = "../rtpflux-ng" }
+rtpflux-srtp = { path = "../rtpflux-srtp" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+tracing-core.workspace = true
+rtpflux-xdp = { path = "../rtpflux-xdp" }
+rtpflux-xdp-common = { path = "../rtpflux-xdp-common" }
+
+[features]
+# MP3 recordings through LAME (a C library under the LGPL); off by default so
+# that the default build is pure Rust.
+mp3 = ["dep:mp3lame-encoder"]
+# Recordings stored in an S3 bucket (rustls over ring, which builds C and
+# assembly); off by default: recordings stay on the local filesystem.
+s3 = ["dep:rusty-s3", "dep:ureq", "dep:url"]
+# AF_XDP receive sockets for the calls the XDP fast path does not relay
+# (`[xdp] af_xdp`), through xdpilone, which is under the EUPL-1.2; off by
+# default.
+af-xdp = ["rtpflux-xdp/af-xdp"]
+# AMR and AMR-WB transcoding and recording (pure Rust, ports of
+# opencore-amr). Off by default: AMR's patents need checking where the
+# relay is used.
+amr = ["dep:amr-nb", "dep:amr-wb"]
+
+[dev-dependencies]
+nix = { workspace = true, features = ["sched", "signal"] }
+rtpflux-ng = { path = "../rtpflux-ng" }
+
+[lints]
+workspace = true

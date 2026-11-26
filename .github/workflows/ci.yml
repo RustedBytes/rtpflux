@@ -1,0 +1,177 @@
+# Continuous integration: formatting, Clippy's pedantic set, the test suite
+# with and without the optional features, the web UI bundle, the XDP
+# program and its kernel tests, and real calls through Kamailio to SIPp,
+# FreeSWITCH and a ZRTP phone, and through ferrosip.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: fmt and Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # rustup reads rust-toolchain.toml (1.100.0 with rustfmt and Clippy).
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # shellcheck is on the runner image; -x follows `. bench/lib.sh`.
+      - run: shellcheck --version
+      - run: git ls-files -z '*.sh' | xargs -0 shellcheck -x
+
+  python:
+    name: Python tooling (${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest the scenarios support, and the newest (no audioop).
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # ruff.toml: errors and likely bugs in examples/scenarios and scripts.
+      - run: pipx run ruff==0.17.6 check
+      - run: python -m unittest discover -s examples/scenarios/lib -v
+
+  test:
+    name: Tests (${{ matrix.features }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all-features]
+    steps:
+      - uses: actions/checkout@v7
+      # rustup reads rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: cargo test
+        run: |
+          if [ "${{ matrix.features }}" = all-features ]; then
+            cargo test --workspace --all-features
+          else
+            cargo test --workspace
+          fi
+
+  webui:
+    name: Web UI bundle
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/rtpflux/webui/ui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/rtpflux/webui/ui/package-lock.json
+      - run: npm ci
+      # Type check and build; the committed bundle must be what the sources
+      # build (the gzipped copies depend on zlib's version, so the plain
+      # files are compared).
+      - run: npm run check
+      - run: git diff --exit-code -- ../assets/index.html ../assets/app.js ../assets/app.css ../assets/favicon.svg
+
+  xdp:
+    name: XDP program and kernel tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # rustup reads rust-toolchain.toml.
+      - run: rustup toolchain install
+      - name: Nightly toolchain for the BPF target
+        working-directory: crates/rtpflux-xdp-ebpf
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/rtpflux-xdp-ebpf -> target
+      # bpf-linker's recommended install: its release binary (static, with
+      # its own LLVM), not `cargo install`, which needs the matching LLVM
+      # development files on the runner.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+      - name: bpf-linker
+        run: |
+          command -v bpf-linker || cargo binstall --no-confirm --disable-strategies compile bpf-linker@0.13.0
+          bpf-linker --version
+      - name: Build and lint the XDP program
+        working-directory: crates/rtpflux-xdp-ebpf
+        run: |
+          cargo build --release
+          cargo clippy --release -- -D warnings
+      # The runner has passwordless sudo: load the program into the kernel
+      # and run it on generated frames, then real calls through it in
+      # network namespaces (generic XDP on veth pairs).
+      - name: xdp-selftest
+        run: |
+          cargo build -p rtpflux-xdp --bin xdp-selftest
+          sudo target/debug/xdp-selftest
+      - name: xdp-e2e
+        run: ./scripts/xdp-e2e.sh
+
+  integration:
+    name: Kamailio, FreeSWITCH, ferrosip and ZRTP integration
+    runs-on: ubuntu-24.04
+    env:
+      # ferrosip is a private repository: a read-only token for it (a
+      # fine-grained token with Contents: read on RustedBytes/ferrosip),
+      # stored as this repository's FERROSIP_TOKEN secret. Without it the
+      # ferrosip call is skipped; the other calls still run.
+      FERROSIP_TOKEN: ${{ secrets.FERROSIP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: ferrosip
+        run: echo "ref=$(cat integration/ferrosip.ref)" >> "$GITHUB_OUTPUT"
+      - if: env.FERROSIP_TOKEN != ''
+        uses: actions/checkout@v7
+        with:
+          repository: RustedBytes/ferrosip
+          ref: ${{ steps.ferrosip.outputs.ref }}
+          path: integration/ferrosip-src
+          token: ${{ secrets.FERROSIP_TOKEN }}
+      # SIPp calls through Kamailio's rtpengine module and rtpflux (built
+      # from the repository's Dockerfile) to SIPp and to FreeSWITCH, through
+      # ferrosip's media module to SIPp, and a ZRTP call between two
+      # linphones; see integration/compose.yaml.
+      - run: integration/run.sh
+        env:
+          REQUIRE_FERROSIP: ${{ env.FERROSIP_TOKEN != '' && '1' || '' }}
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-logs
+          path: integration/out/
+          if-no-files-found: ignore

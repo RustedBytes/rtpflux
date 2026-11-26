@@ -1,0 +1,219 @@
+# Integration bench: SIPp calls through Kamailio (its rtpengine module
+# driving rtpflux over ng) to an answering endpoint that echoes the audio:
+# SIPp, then FreeSWITCH. Run with ./run.sh, which also checks the results.
+#
+#   uac .13 ──SIP──▶ kamailio      .11 ──SIP──▶ uas (SIPp)        .12
+#   uac .13 ──SIP──▶ kamailio-fs   .15 ──SIP──▶ freeswitch:5080   .14
+#   zrtp-a .21 ─SIP─▶ kamailio-zrtp .16 ──SIP──▶ zrtp-b (linphone) .22
+#   uac .13 ──SIP──▶ ferrosip      .17 ──SIP──▶ uas (SIPp)        .12
+#   uac .13 ──SIP──▶ kamailio-g722 .18 ──SIP──▶ freeswitch:5080   .14
+#     (rtpflux offers FreeSWITCH G.722 only and transcodes PCMA <-> G.722)
+#   uac .13 ──SIP──▶ opensips      .19 ──SIP──▶ uas (SIPp)        .12
+#     │                    │ ng                     │
+#     └──────RTP──▶ rtpflux 172.30.89.10 ◀──RTP─────┘
+#
+# The linphone pair talk ZRTP end to end (RFC 6189) through rtpflux.
+# ferrosip (its media module driving rtpflux over ng) runs when run.sh
+# could fetch it (the "ferrosip" profile).
+
+networks:
+  bench:
+    ipam:
+      config:
+        - subnet: 172.30.89.0/24
+
+services:
+  rtpflux:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rtpflux:integration
+    command: ["--config", "/etc/rtpflux/rtpflux.toml"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./rtpflux.toml:/etc/rtpflux/rtpflux.toml:ro
+    networks:
+      bench:
+        ipv4_address: 172.30.89.10
+
+  kamailio:
+    build:
+      context: .
+      dockerfile: Dockerfile.sip
+    image: rtpflux-integration-sip:latest
+    command: ["kamailio", "-DD", "-E", "-f", "/etc/kamailio/kamailio.cfg"]
+    environment:
+      KAMAILIO_LISTEN: "udp:172.30.89.11:5060"
+      PBX_URI: "sip:172.30.89.12:5060"
+      RTPFLUX_NG: "udp:172.30.89.10:2223"
+    volumes:
+      - ../contrib/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    depends_on: [rtpflux]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.11
+
+  # The same Kamailio configuration, sending calls to FreeSWITCH.
+  kamailio-fs:
+    image: rtpflux-integration-sip:latest
+    command: ["kamailio", "-DD", "-E", "-f", "/etc/kamailio/kamailio.cfg"]
+    environment:
+      KAMAILIO_LISTEN: "udp:172.30.89.15:5060"
+      PBX_URI: "sip:172.30.89.14:5080"
+      RTPFLUX_NG: "udp:172.30.89.10:2223"
+    volumes:
+      - ../contrib/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    depends_on: [rtpflux, kamailio]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.15
+
+  # FreeSWITCH with contrib/freeswitch's profile and dialplan ("echo"
+  # answers and echoes). The image, pinned: the community build of
+  # FreeSWITCH by Sergey Safarov (FreeSWITCH 1.11.3).
+  freeswitch:
+    image: docker.io/safarov/freeswitch@sha256:f156e01a96d48944078ed7f0e24304be63ea15f6466cf607a0aeb6cb47761da7
+    volumes:
+      - ./freeswitch/freeswitch.xml:/etc/freeswitch/freeswitch.xml:ro
+      - ../contrib/freeswitch:/etc/freeswitch/contrib:ro
+    networks:
+      bench:
+        ipv4_address: 172.30.89.14
+
+  # The same Kamailio configuration, sending calls to a linphone.
+  kamailio-zrtp:
+    image: rtpflux-integration-sip:latest
+    command: ["kamailio", "-DD", "-E", "-f", "/etc/kamailio/kamailio.cfg"]
+    environment:
+      KAMAILIO_LISTEN: "udp:172.30.89.16:5060"
+      PBX_URI: "sip:172.30.89.22:5060"
+      RTPFLUX_NG: "udp:172.30.89.10:2223"
+    volumes:
+      - ../contrib/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    depends_on: [rtpflux, kamailio]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.16
+
+  # The same Kamailio configuration, with flags asking rtpflux to offer
+  # FreeSWITCH G.722 instead of the caller's PCMA, and transcode.
+  kamailio-g722:
+    image: rtpflux-integration-sip:latest
+    command: ["kamailio", "-DD", "-E", "-f", "/etc/kamailio/kamailio.cfg"]
+    environment:
+      KAMAILIO_LISTEN: "udp:172.30.89.18:5060"
+      PBX_URI: "sip:172.30.89.14:5080"
+      RTPFLUX_NG: "udp:172.30.89.10:2223"
+      RTPFLUX_FLAGS: "trust-address replace-origin codec-transcode-G722 codec-mask-PCMA"
+    volumes:
+      - ../contrib/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+    depends_on: [rtpflux, kamailio]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.18
+
+  # OpenSIPS with contrib/opensips's configuration (its rtpengine module
+  # driving rtpflux over ng), in front of the SIPp callee. Its listen
+  # socket and rtpflux's ng address are the bench's. The official image,
+  # pinned: OpenSIPS 3.6.10 on Debian trixie.
+  opensips:
+    image: docker.io/opensips/opensips@sha256:413c4e2fd2a8c8e596f77db09bc1d18adb7cf8af61aed84d46ea32cb9c545a6d
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        sed -e 's|^socket = .*|socket = udp:172.30.89.19:5060|'
+        -e 's|"udp:127.0.0.1:2223"|"udp:172.30.89.10:2223"|'
+        /etc/opensips/contrib.cfg > /tmp/opensips.cfg
+        && exec /usr/sbin/opensips -F -f /tmp/opensips.cfg
+    environment:
+      PBX_URI: "sip:172.30.89.12:5060"
+    volumes:
+      - ../contrib/opensips/opensips.cfg:/etc/opensips/contrib.cfg:ro
+    depends_on: [rtpflux]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.19
+
+  # ferrosip with contrib/ferrosip's configuration, in front of the SIPp
+  # callee.
+  ferrosip:
+    build:
+      context: .
+      dockerfile: Dockerfile.ferrosip
+    image: rtpflux-integration-ferrosip:latest
+    profiles: [ferrosip]
+    command: ["--config", "/etc/ferrosip/ferrosip.toml"]
+    environment:
+      SIP_ADDR: "172.30.89.17"
+      PBX_URI: "sip:172.30.89.12:5060"
+      RTPFLUX_NG: "udp:172.30.89.10:2223"
+    volumes:
+      - ../contrib/ferrosip:/etc/ferrosip:ro
+    depends_on: [rtpflux]
+    networks:
+      bench:
+        ipv4_address: 172.30.89.17
+
+  # Two linphones with ZRTP mandatory: B answers, A (run.sh) calls.
+  zrtp-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.linphone
+    image: rtpflux-integration-linphone:latest
+    command: ["/linphone/phone.sh", "zrtp-b"]
+    volumes:
+      - ./linphone:/linphone:ro
+      - ./out:/out
+    networks:
+      bench:
+        ipv4_address: 172.30.89.22
+
+  zrtp-a:
+    image: rtpflux-integration-linphone:latest
+    profiles: [call]
+    command: ["/linphone/phone.sh", "zrtp-a", "sip:b@172.30.89.16"]
+    volumes:
+      - ./linphone:/linphone:ro
+      - ./out:/out
+    networks:
+      bench:
+        ipv4_address: 172.30.89.21
+
+  # The called party: answers and sends back every RTP packet it gets.
+  uas:
+    image: rtpflux-integration-sip:latest
+    depends_on: [kamailio]
+    working_dir: /sipp
+    command: ["sipp", "-sf", "uas.xml", "-i", "172.30.89.12", "-p", "5060",
+              "-mi", "172.30.89.12", "-mp", "6000", "-rtp_echo",
+              "-trace_msg", "-message_file", "/out/uas-messages.log"]
+    # SIPp draws its screen on a terminal.
+    tty: true
+    volumes:
+      - ./sipp:/sipp:ro
+      - ./out:/out
+    networks:
+      bench:
+        ipv4_address: 172.30.89.12
+
+  # The caller, started by run.sh: one call playing G.711 audio, to
+  # ${PROXY} (a Kamailio or ferrosip), named ${CALL} in the logs and in its
+  # Call-ID (SIPp ignores a Call-ID it saw end within the last half
+  # minute, and each run of this container would otherwise reuse one).
+  uac:
+    image: rtpflux-integration-sip:latest
+    profiles: [call]
+    working_dir: /sipp
+    command: ["sipp", "${PROXY:-172.30.89.11}:5060", "-sf", "uac.xml", "-s", "echo",
+              "-i", "172.30.89.13", "-p", "5060", "-mi", "172.30.89.13", "-mp", "6000",
+              "-m", "1", "-timeout", "60", "-cid_str", "%u-%p@%s-${CALL:-sipp}",
+              "-trace_msg", "-message_file", "/out/uac-${CALL:-sipp}-messages.log",
+              "-trace_err", "-error_file", "/out/uac-${CALL:-sipp}-errors.log"]
+    tty: true
+    volumes:
+      - ./sipp:/sipp:ro
+      - ./out:/out
+    networks:
+      bench:
+        ipv4_address: 172.30.89.13

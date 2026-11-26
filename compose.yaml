@@ -1,0 +1,50 @@
+# rtpflux with Docker Compose (or Podman Compose).
+#
+#   1. Edit config/docker.toml: at least [[interface]] address.
+#   2. docker compose up -d --build      (docker-compose with Compose v1)
+#   3. docker compose logs -f rtpflux
+#
+# The relay uses the host network: it opens a port pair per call from
+# [ports] and writes the host's address into the SDP, which port mapping
+# cannot do.
+
+services:
+  rtpflux:
+    build: .
+    image: rtpflux:latest
+    container_name: rtpflux
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config/docker.toml:/etc/rtpflux/rtpflux.toml:ro
+      - rtpflux-state:/var/lib/rtpflux
+      - rtpflux-recordings:/var/spool/rtpflux
+    # Four sockets per call.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    # Docker's default seccomp profile refuses io_uring: the media workers
+    # then receive with recvmmsg (and log a warning). To let them use
+    # io_uring (runtime.receive, the default), lift the profile, or give
+    # the container one that allows io_uring_setup, io_uring_enter and
+    # io_uring_register:
+    # security_opt: ["seccomp=unconfined"]
+    # For recordings in S3 ([recording] storage = "s3"): the credentials,
+    # from the shell or an .env file next to this one.
+    # environment:
+    #   AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    #   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    # For the XDP fast path ([xdp] enabled = true), grant these, run as
+    # root (added capabilities do not reach the image's unprivileged user),
+    # and mount the compiled program (see docs/xdp.md):
+    # user: "0"
+    # cap_add: [BPF, NET_ADMIN, PERFMON]
+    # volumes:
+    #   - ./crates/rtpflux-xdp-ebpf/target/bpfel-unknown-none/release/rtpflux-xdp:/usr/lib/rtpflux/rtpflux-xdp:ro
+
+volumes:
+  rtpflux-state:
+  rtpflux-recordings:

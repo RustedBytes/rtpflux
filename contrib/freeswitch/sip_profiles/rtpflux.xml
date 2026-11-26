@@ -1,0 +1,52 @@
+<!--
+  A FreeSWITCH SIP profile for calls that arrive through Kamailio with
+  rtpflux relaying the media (contrib/kamailio/kamailio.cfg).
+
+  Drop it into conf/sip_profiles/ of a standard configuration. It needs:
+    * an ACL list "rtpflux_proxies" with the proxy's addresses, in
+      autoload_configs/acl.conf.xml:
+          <list name="rtpflux_proxies" default="deny">
+            <node type="allow" cidr="10.0.0.10/32"/>
+          </list>
+      Calls from those addresses are taken without digest authentication
+      (the proxy authenticates its users); anything else is challenged.
+    * the "from-proxy" context (dialplan/rtpflux.xml), or your own.
+
+  The media addresses FreeSWITCH sees are rtpflux's, and its replies go
+  back through the proxy, which rewrites the answer for the caller; so
+  no NAT handling is needed here (ext-*-ip stay as the local address).
+-->
+<profile name="rtpflux">
+  <aliases>
+  </aliases>
+  <gateways>
+  </gateways>
+  <domains>
+  </domains>
+  <settings>
+    <param name="sip-ip" value="$${local_ip_v4}"/>
+    <param name="rtp-ip" value="$${local_ip_v4}"/>
+    <param name="ext-sip-ip" value="$${local_ip_v4}"/>
+    <param name="ext-rtp-ip" value="$${local_ip_v4}"/>
+    <param name="sip-port" value="5080"/>
+    <param name="context" value="from-proxy"/>
+    <param name="dialplan" value="XML"/>
+    <!-- The proxy is trusted; others must authenticate. -->
+    <param name="apply-inbound-acl" value="rtpflux_proxies"/>
+    <param name="auth-calls" value="true"/>
+    <!-- G722 needs mod_spandsp loaded. -->
+    <param name="inbound-codec-prefs" value="G722,PCMA,PCMU,OPUS"/>
+    <param name="outbound-codec-prefs" value="G722,PCMA,PCMU,OPUS"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <!-- rtpflux already latches to where media really comes from. -->
+    <param name="aggressive-nat-detection" value="false"/>
+    <param name="NDLB-force-rport" value="false"/>
+    <param name="manage-presence" value="false"/>
+    <param name="sip-trace" value="no"/>
+  </settings>
+</profile>

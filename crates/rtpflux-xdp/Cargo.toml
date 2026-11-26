@@ -1,0 +1,26 @@
+[package]
+name = "rtpflux-xdp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Userspace side of the rtpflux XDP fast path: forwarding rules, loader, self-test"
+
+[dependencies]
+aya.workspace = true
+nix.workspace = true
+rtpflux-xdp-common = { path = "../rtpflux-xdp-common" }
+xdpilone = { workspace = true, optional = true }
+
+[features]
+# AF_XDP receive sockets (the `xsk` module), through xdpilone, which is
+# under the EUPL-1.2; off by default.
+af-xdp = ["dep:xdpilone"]
+
+[[bin]]
+name = "xdp-selftest"
+path = "src/bin/xdp-selftest.rs"
+
+[lints]
+workspace = true

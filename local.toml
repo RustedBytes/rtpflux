@@ -1,0 +1,11 @@
+[control]
+listen = ["127.0.0.1:2223"]
+
+[[interface]]
+name = "default"
+address = "127.0.0.1"
+
+[webui]
+listen = "0.0.0.0:8090"
+user = "admin"
+password_hash = "sha256:0a856b929ea8da34e01f762b:5ba04d919a1648780d4662a15ac148dddb008905a1f2688dca32550070666c81"
