@@ -50,7 +50,7 @@ the evidence, and what is left. Updated with every step.
 | 7. Fencing epochs issued by an ownership authority | P0-HA | done |
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | done |
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | done |
-| 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | planned |
+| 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | done |
 | 11. Media graph, conference recovery | P2 | planned |
 | 12. Benchmarks against the baseline | all | planned |
 
@@ -488,3 +488,58 @@ Deviations and gaps found:
   own tests, but there is no end-to-end test: S3 needs the `s3` feature
   and credentials.
 - Disk full mid-recording is not simulated; an unwritable directory is.
+
+## Step 10b: access controls, rotation, rate limits, audit, ng isolation
+
+- **Unix socket ACL.** Bug fixed: the socket was always mode 0600, so the
+  users configured in `native_uids` could not reach it, and the
+  `SO_PEERCRED` check never ran for them. The mode is now 0600, 0666 when
+  other users are listed (the credentials decide), or 0660 with
+  `native_socket_group`.
+- **Token rotation.** `native_tokens_file` (several tokens per tenant) is
+  re-read when it changes. A connection whose token was removed is
+  refused at its next request and closed. An unreadable file keeps the
+  last tokens.
+- **Quotas.** `native_rate_limit`: a per-tenant token bucket, refused with
+  `exhausted` before anything runs. The existing per-tenant endpoint
+  quota stays.
+- **Protected transport.** A non-loopback `native_listen` is refused unless
+  `native_allow_remote`, and the TLS proxy setup is documented. This
+  changes behaviour: it used to be a warning.
+- **Audit.** The `rtpflux::audit` log target gets one line per mutation,
+  claim, authentication and refused connection: who, what and outcome,
+  never a body.
+- **No secrets in logs:**
+  - the audit line's unit test feeds an SDP with `a=crypto` and checks
+    no key reaches the line;
+  - the logs were checked with grep: no log statement prints SDP or a
+    request body;
+  - digits stopped being logged in step 9.
+- **ng isolation.** `ng_protect_native` gives the `[ha]` guard without HA.
+
+Evidence:
+- `native.rs` unit tests:
+  - socket modes 0600, 0666 and 0660 (with the group set);
+  - token rotation with overlap, revocation, and a short token left out;
+  - an unreadable file keeps the tokens.
+- `audit.rs` unit tests: the audit line never holds SDP keys; per-tenant
+  buckets.
+- `tests/security.rs`:
+  - TCP rotation end to end: the old and new tokens overlap, then the
+    revoked connection is refused and closed, and the old token can no
+    longer connect;
+  - the rate limit refuses a burst, another tenant is unaffected, and it
+    recovers;
+  - `ng` delete of a native call is refused while `query` answers;
+  - a non-loopback `native_listen` is refused unless allowed.
+
+Not covered:
+- A second Unix user connecting (the test runs as one user): the
+  `SO_PEERCRED` path is the existing one, and the file modes are tested.
+- Native TLS: none; a TLS proxy is required.
+
+Also in this step: two async SDK tests that failed only under a fully
+loaded test run were made tolerant of it. The slow-consumer test now
+waits for each event instead of stopping after 500 ms of quiet; the
+durable-mode test has a 30 s deadline. Neither showed a logic fault:
+both pass alone, and the events arrived complete and in order.

@@ -27,6 +27,14 @@ native_max_endpoints = 0
 # authenticates with a tenant's token (16 characters or more).
 native_listen = []
 native_tokens = {}
+# More tokens ("tenant token" per line), re-read when the file changes.
+# native_tokens_file = "/etc/rtpflux/tokens"
+# Requests per second per tenant (0: no limit).
+native_rate_limit = 0
+# A non-loopback native_listen is refused unless allowed (use a TLS proxy).
+native_allow_remote = false
+# Keep ng from changing calls that hold native endpoints.
+ng_protect_native = false
 # Native API events kept (in memory) for subscribers resuming from a cursor.
 native_event_journal = 65536
 

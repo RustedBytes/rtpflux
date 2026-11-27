@@ -626,7 +626,7 @@ impl super::Control {
         command: &[u8],
         body: &rtpflux_ng::bencode::Dict<'_>,
     ) -> bool {
-        if self.native.ha.is_none()
+        if (self.native.ha.is_none() && !self.native.ng_protect)
             || matches!(command, b"ping" | b"list" | b"query" | b"statistics")
         {
             return false;

@@ -26,13 +26,22 @@ native_socket = "/run/rtpflux/native.sock"
 native_uids = [1001]          # users allowed besides the relay's own and root
 native_max_endpoints = 0      # per tenant; 0: up to sessions.max
 pcm_dir = "/run/rtpflux/pcm"  # where audio services listen (PCM streams)
-native_listen = ["10.0.0.5:2224"]   # also over TCP (put TLS in front)
+native_listen = ["127.0.0.1:2224"]  # also over TCP, behind a TLS proxy
 native_tokens = { switch-a = "a long random token", switch-b = "another one" }
+native_tokens_file = "/etc/rtpflux/tokens"  # more tokens, re-read when it changes
+native_rate_limit = 0         # requests per second per tenant; 0: no limit
+ng_protect_native = false     # keep ng off calls holding native endpoints
 ```
 
-The socket is created with mode 0600. Only the relay's own user, root,
-and the users in `native_uids` may connect; the peer's credentials are
-checked. At most 64 connections are served at once.
+**The Unix socket.** Only the relay's own user, root and the users in
+`native_uids` may connect: the peer's credentials (`SO_PEERCRED`) are
+checked on each connection. The socket file's mode follows:
+- 0600 (the relay's user only) when `native_uids` is empty;
+- 0666 when other users are listed, so they can reach the socket and
+  the credentials check decides;
+- 0660 with `native_socket_group` (a gid), the file's group.
+
+At most 64 connections are served at once.
 
 **Over TCP** (`native_listen`), a connection's first request must
 authenticate, with a tenant's token:
@@ -44,9 +53,45 @@ Tokens are compared in constant time, and must be 16 characters or more.
 - An authenticated connection is that tenant's. A request naming another
   tenant is refused (`unauthorized`).
 
-The relay has no TLS of its own: keep `native_listen` on a private
-network, or put a TLS proxy in front. A non-loopback `native_listen` is
-warned about at start.
+**Rotating tokens.** `native_tokens_file` holds more tokens, one
+`tenant token` per line (`#` comments). A tenant may have several. The
+file is re-read, at most once a second, when it changes. To rotate:
+1. add the new token next to the old one;
+2. move the clients to the new token;
+3. remove the old one.
+
+A connection that authenticated with a removed token is refused at its
+next request (`unauthorized`) and closed. Write the file whole and
+rename it into place: while it cannot be read, the tokens it last gave
+stay.
+
+**Rate limits.** `native_rate_limit` is the number of requests one tenant
+may make each second, with a burst of the same size. Beyond it, requests
+are refused with `exhausted` and nothing is done. Each tenant has its
+own budget.
+
+**Protected transport.** The relay has no TLS of its own. A
+`native_listen` on an address other than loopback is refused at start
+unless `native_allow_remote = true`. Listen on loopback and put an
+authenticated TLS proxy in front, for example stunnel or HAProxy with
+client certificates, that forwards to it.
+
+**Audit.** Every request that changes something, each `ownership.claim`,
+each authentication (success or failure) and each refused connection is
+logged on the `rtpflux::audit` target at `info` or `warn`. A line has:
+- the tenant, the peer (uid and pid, or TCP address) and the connection;
+- the operation, its `operation_id` and `idempotency_key`;
+- the resources named and made;
+- the outcome.
+
+It never has a request's body: no SDP (it can hold SRTP keys), no token,
+no digit. Send the target to its own sink with `RUST_LOG`, for example
+`RUST_LOG=info,rtpflux::audit=info`.
+
+**`ng` isolation.** `ng` has no authentication of its own: keep its
+port on a trusted network. With `ng_protect_native` (always under
+`[ha]`), an `ng` command cannot change a call that holds native
+endpoints. `ping`, `list`, `query` and `statistics` still work.
 
 Each message, in either direction, is a 4-octet big-endian length
 followed by that many octets of JSON, at most 1 MiB. A connection's

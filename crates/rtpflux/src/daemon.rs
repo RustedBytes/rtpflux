@@ -473,6 +473,8 @@ fn start_native(
     }
     control.set_native_max_endpoints(c.native_max_endpoints);
     control.set_native_journal(c.native_event_journal);
+    control.set_native_rate_limit(c.native_rate_limit);
+    control.set_ng_protect_native(c.ng_protect_native);
     if let Some(path) = &config.sessions.ledger {
         control
             .open_ledger(
@@ -506,6 +508,17 @@ fn start_native(
         source,
     })?;
     let mut threads = Vec::new();
+    let tokens = if c.native_listen.is_empty() {
+        None
+    } else {
+        let set =
+            crate::native::TokenSet::new(c.native_tokens.clone(), c.native_tokens_file.clone())
+                .map_err(|source| StartError::Native {
+                    path: c.native_tokens_file.clone().unwrap_or_default(),
+                    source,
+                })?;
+        Some(Arc::new(set))
+    };
     for addr in &c.native_listen {
         let listener =
             std::net::TcpListener::bind(addr).map_err(StartError::listen("native", *addr))?;
@@ -514,7 +527,11 @@ fn start_native(
             .map_err(StartError::listen("native", *addr))?;
         log::info!("native API on tcp {bound}");
         addrs.push(bound);
-        let (stop, link, tokens) = (Arc::clone(stop), link.clone(), c.native_tokens.clone());
+        let (stop, link) = (Arc::clone(stop), link.clone());
+        let tokens = tokens.clone().ok_or_else(|| StartError::Native {
+            path: std::path::PathBuf::new(),
+            source: std::io::Error::other("no tokens"),
+        })?;
         threads.push(
             std::thread::Builder::new()
                 .name("rtpflux-native-tcp".to_owned())
@@ -525,10 +542,13 @@ fn start_native(
     let Some(path) = &c.native_socket else {
         return Ok((addrs, threads));
     };
-    let listener = crate::native::bind(path).map_err(|source| StartError::Native {
-        path: path.clone(),
-        source,
-    })?;
+    let listener =
+        crate::native::bind(path, &c.native_uids, c.native_socket_group).map_err(|source| {
+            StartError::Native {
+                path: path.clone(),
+                source,
+            }
+        })?;
     log::info!("native API on {}", path.display());
     let (stop, uids) = (Arc::clone(stop), config.control.native_uids.clone());
     let t = std::thread::Builder::new()

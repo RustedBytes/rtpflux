@@ -507,9 +507,19 @@ fn ng_control_never_panics() {
 /// Native API requests (JSON, mutated and random, of every operation,
 /// with fields of every type) never panic the control thread, which still
 /// answers afterwards; PCM stream frame headers never panic their parser.
+/// A request's origin for the fuzzing below.
+fn test_origin() -> rtpflux::control::native::Origin {
+    rtpflux::control::native::Origin {
+        connection: 1,
+        events: None,
+        tenant: None,
+        peer: "test".to_owned(),
+    }
+}
+
 #[test]
 fn native_requests_and_pcm_frames_never_panic() {
-    use rtpflux::control::native::{OPERATIONS, Origin};
+    use rtpflux::control::native::OPERATIONS;
     logging::init();
     let config = Config::from_toml(
         "[[interface]]\nname = \"pub\"\naddress = \"127.0.0.1\"\n\
@@ -517,11 +527,7 @@ fn native_requests_and_pcm_frames_never_panic() {
     )
     .unwrap();
     let mut c = Control::new(Relay::start(&config).unwrap(), config.interfaces.clone());
-    let origin = Origin {
-        connection: 1,
-        events: None,
-        tenant: None,
-    };
+    let origin = test_origin();
     let sdp = String::from_utf8_lossy(PLAIN_SDP).into_owned();
     let values = [
         serde_json::json!(null),

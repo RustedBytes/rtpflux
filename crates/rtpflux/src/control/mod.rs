@@ -35,6 +35,7 @@
 
 mod answer;
 mod args;
+mod audit;
 mod copies;
 mod create;
 mod dtmf_security;

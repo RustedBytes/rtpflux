@@ -72,12 +72,21 @@ commands over TCP, and over HTTP (`POST /ng`, `/ng-plain`) and WebSocket
 
 `native_socket` serves the [native control API](native-api.md), for a
 B2BUA or softswitch that manages media endpoints itself. It is a Unix
-socket, created mode 0600: only the relay's own user, root and the user ids
-in `native_uids` may connect (checked with the peer's credentials).
+socket: only the relay's own user, root and the user ids in `native_uids`
+may connect (checked with the peer's credentials). The file is mode 0600,
+0666 when `native_uids` lists other users, or 0660 with
+`native_socket_group`.
+
 `native_listen` serves the same API over TCP, for a softswitch on another
-host. Each connection authenticates with one of `native_tokens` first, and
-is then that tenant's. There is no TLS: use a private network or a TLS
-proxy. `pcm_dir` is the directory where external audio services listen
+host. Each connection authenticates with one of `native_tokens` first, or
+with one of `native_tokens_file` (re-read when it changes, for rotation),
+and is then that tenant's. There is no TLS. A non-loopback `native_listen`
+is refused unless `native_allow_remote = true`: listen on loopback behind
+an authenticated TLS proxy.
+
+`native_rate_limit` caps the requests per second of each tenant.
+`ng_protect_native` keeps `ng` from changing calls that hold native
+endpoints. See [Connecting](native-api.md#connecting). `pcm_dir` is the directory where external audio services listen
 for [PCM streams](native-api.md#pcm-streams); a stream names its socket by
 its file name there.
 

@@ -40,7 +40,11 @@ async fn capabilities_inventory_operations_and_recovery() {
     ))
     .unwrap();
     let daemon = Daemon::start(&config).unwrap();
-    let media = MediaClient::connect(Config::unix(&sock)).await.unwrap();
+    // Durable mode syncs to disk before each reply: generous on a busy
+    // machine.
+    let mut client = Config::unix(&sock);
+    client.default_deadline = Duration::from_secs(30);
+    let media = MediaClient::connect(client).await.unwrap();
 
     let caps = media.hello().await.unwrap();
     assert!(caps.versions.contains(&1));

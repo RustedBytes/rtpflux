@@ -114,8 +114,14 @@ pub struct Control {
     /// connection; see `docs/native-api.md`). None: not served.
     pub native_socket: Option<std::path::PathBuf>,
     /// The user ids allowed to connect to `native_socket`, besides the
-    /// relay's own user (always allowed) and root.
+    /// relay's own user (always allowed) and root. Checked on each
+    /// connection (`SO_PEERCRED`); with any listed, the socket file is
+    /// made reachable to other users (mode 0666, or 0660 with
+    /// `native_socket_group`) so that check can run.
     pub native_uids: Vec<u32>,
+    /// The group (gid) given the socket file, mode 0660; its members still
+    /// need to be in `native_uids`.
+    pub native_socket_group: Option<u32>,
     /// Endpoints one tenant may hold through the native API at once (0: up
     /// to `sessions.max`).
     pub native_max_endpoints: usize,
@@ -130,6 +136,21 @@ pub struct Control {
     /// The native API's tokens over TCP: tenant name → token (at least 16
     /// characters).
     pub native_tokens: std::collections::BTreeMap<String, String>,
+    /// More tokens, one `tenant token` per line (`#` comments), several
+    /// per tenant allowed: re-read when it changes, so tokens rotate
+    /// without a restart. A connection whose token is gone from it is
+    /// refused at its next request.
+    pub native_tokens_file: Option<std::path::PathBuf>,
+    /// Requests one tenant may make each second (with a burst as large);
+    /// beyond, `exhausted`. 0: no limit.
+    pub native_rate_limit: u32,
+    /// Allow `native_listen` on addresses other than loopback. Off, such
+    /// a configuration is refused: put an authenticated TLS proxy in
+    /// front, listening on the network, and the relay on loopback.
+    pub native_allow_remote: bool,
+    /// `ng` may not change a call that holds native endpoints (always so
+    /// under `[ha]`).
+    pub ng_protect_native: bool,
     /// Events kept for replay (`events.subscribe` with a cursor).
     pub native_event_journal: usize,
 }
@@ -147,6 +168,11 @@ impl Default for Control {
             pcm_dir: None,
             native_listen: Vec::new(),
             native_tokens: std::collections::BTreeMap::new(),
+            native_tokens_file: None,
+            native_rate_limit: 0,
+            native_allow_remote: false,
+            ng_protect_native: false,
+            native_socket_group: None,
             native_event_journal: 65_536,
         }
     }
@@ -551,6 +577,9 @@ pub enum Problem {
     MaxMessage,
     /// `control.native_listen` without tokens, or a token shorter than 16.
     NativeTokens,
+    /// `control.native_listen` on an address other than loopback, without
+    /// `native_allow_remote`.
+    NativeRemote,
     /// `sessions.ledger` without `sessions.state_file`, or a retention or
     /// quota of 0.
     Ledger,
@@ -640,6 +669,9 @@ impl fmt::Display for Problem {
             ),
             Problem::Ledger => f.write_str(
                 "sessions.ledger: needs sessions.state_file, and a ledger_retention and ledger_quota above 0",
+            ),
+            Problem::NativeRemote => f.write_str(
+                "control.native_listen: not loopback; put an authenticated TLS proxy in front and listen on loopback, or set native_allow_remote",
             ),
             Problem::NativeTokens => f.write_str(
                 "control.native_tokens: native_listen needs a token per tenant, each of 16 characters or more",
@@ -802,6 +834,33 @@ impl Config {
         Ok(config)
     }
 
+    /// The problems of `[ha]` and the native API's access settings.
+    fn access_problems(&self, problems: &mut Vec<Problem>) {
+        if self.ha.enabled
+            && (self.ha.state.is_none()
+                || self.ha.authority_keys.is_empty()
+                || self.ha.authority_keys.values().any(|k| k.len() < 32))
+        {
+            problems.push(Problem::Ha);
+        }
+        if !self.control.native_allow_remote
+            && self
+                .control
+                .native_listen
+                .iter()
+                .any(|a| !a.ip().is_loopback())
+        {
+            problems.push(Problem::NativeRemote);
+        }
+        if (!self.control.native_listen.is_empty()
+            && self.control.native_tokens.is_empty()
+            && self.control.native_tokens_file.is_none())
+            || self.control.native_tokens.values().any(|t| t.len() < 16)
+        {
+            problems.push(Problem::NativeTokens);
+        }
+    }
+
     /// Check the cross-field rules; returns every problem found.
     ///
     /// # Errors
@@ -819,18 +878,7 @@ impl Config {
         {
             problems.push(Problem::Ledger);
         }
-        if self.ha.enabled
-            && (self.ha.state.is_none()
-                || self.ha.authority_keys.is_empty()
-                || self.ha.authority_keys.values().any(|k| k.len() < 32))
-        {
-            problems.push(Problem::Ha);
-        }
-        if (!self.control.native_listen.is_empty() && self.control.native_tokens.is_empty())
-            || self.control.native_tokens.values().any(|t| t.len() < 16)
-        {
-            problems.push(Problem::NativeTokens);
-        }
+        self.access_problems(&mut problems);
         if !(512..=65_535).contains(&self.control.max_message) {
             problems.push(Problem::MaxMessage);
         }

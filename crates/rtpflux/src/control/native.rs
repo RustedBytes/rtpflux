@@ -431,6 +431,9 @@ pub struct Origin {
     /// The tenant the connection authenticated as (over TCP): its requests
     /// are that tenant's, and name no other.
     pub tenant: Option<String>,
+    /// Who is at the other end (`uid 1000 pid 42`, `tcp 192.0.2.7:51234`),
+    /// for the audit log.
+    pub peer: String,
 }
 
 /// The native API's state, on the control thread.
@@ -452,6 +455,10 @@ pub struct Native {
     /// Endpoints' IVR state: DTMF policy, sensitive digits, playback
     /// queues.
     pub(super) ivr: HashMap<String, super::ivr::Ivr>,
+    /// Requests per second per tenant.
+    pub(super) limiter: super::audit::Limiter,
+    /// `ng` may not change calls holding native endpoints.
+    pub(super) ng_protect: bool,
     /// Under `[ha]`: resource id (an endpoint's, `mixer_id:N`,
     /// `stream_id:N`) → the (tenant, group) owning it.
     pub(super) owned: HashMap<String, (String, String)>,
@@ -849,6 +856,18 @@ impl Control {
         if let Err(e) = Self::precheck(&req) {
             return serde_json::to_vec(&reply(req.operation_id, Err(e))).unwrap_or_default();
         }
+        // Over its rate: definitely not executed.
+        if !self
+            .native
+            .limiter
+            .allow(req.tenant, std::time::Instant::now())
+        {
+            let e = NativeError::new(
+                Code::Exhausted,
+                format!("tenant {}: over its rate limit", req.tenant),
+            );
+            return serde_json::to_vec(&reply(req.operation_id, Err(e))).unwrap_or_default();
+        }
         // Under `[ha]`: refused unless it proves the current epoch of what
         // it touches (definitely not executed, never recorded).
         if let Err(e) = self.fence(&req) {
@@ -869,6 +888,9 @@ impl Control {
             reply(req.operation_id, outcome)
         };
         self.record_owned(&req, &r);
+        if mutates(req.op) && !req.op.starts_with("events.") {
+            log::info!(target: "rtpflux::audit", "{}", super::audit::line(&req, origin, &r));
+        }
         let out = serde_json::to_vec(&r).unwrap_or_default();
         if mutates(req.op) {
             self.native.topology_epoch += 1;
@@ -2623,6 +2645,17 @@ impl Control {
     /// Keep `cap` events for replay (`[control] native_event_journal`).
     pub fn set_native_journal(&mut self, cap: usize) {
         self.native.journal_cap = cap;
+    }
+
+    /// Requests one tenant may make each second (0: no limit).
+    pub fn set_native_rate_limit(&mut self, rate: u32) {
+        self.native.limiter.rate = rate;
+    }
+
+    /// Keep `ng` off calls holding native endpoints (always so under
+    /// `[ha]`).
+    pub fn set_ng_protect_native(&mut self, on: bool) {
+        self.native.ng_protect = on;
     }
 
     /// Set the most endpoints one tenant may hold (0: no limit of its own).

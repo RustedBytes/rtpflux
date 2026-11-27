@@ -343,11 +343,23 @@ async fn tcp_tokens_and_a_slow_event_consumer() {
         made.push(ep.endpoint_id);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // Each comes, however slowly the stream resumes on a busy machine;
+    // nothing comes after.
     let mut got = Vec::new();
-    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), events.next()).await {
+    while got.len() < made.len() {
+        let e = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("the next event")
+            .unwrap();
         assert_ne!(e.kind, EventKind::Gap, "{e:?}");
         got.push(e.endpoint_id.unwrap());
     }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), events.next())
+            .await
+            .is_err(),
+        "nothing twice"
+    );
     assert_eq!(got, made, "every destroy, once, in order");
     drop((media, events));
     tokio::task::spawn_blocking(move || daemon.stop())
