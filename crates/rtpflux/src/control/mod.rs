@@ -672,6 +672,7 @@ impl Control {
         // Leases that ran out, endpoints a delayed delete ended.
         self.native_reconcile("ended");
         self.native_media_events();
+        self.native_flush_gaps();
         let ended = self.relay.take_ended();
         if ended.is_empty() {
             return;

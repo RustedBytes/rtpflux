@@ -90,11 +90,12 @@ pub const OPERATIONS: [&str; 31] = [
 ];
 
 /// The events of version 1.
-pub const EVENTS: [&str; 18] = [
+pub const EVENTS: [&str; 19] = [
     "endpoint.ready",
     "endpoint.failed",
     "endpoint.timeout",
     "endpoint.destroyed",
+    "endpoint.events_lost",
     "bridge.changed",
     "ice.connected",
     "dtls.ready",
@@ -264,6 +265,10 @@ pub(super) struct Endpoint {
     pub(super) recording: Option<String>,
     /// Counts the changes of what it is bridged to.
     pub(super) topology_revision: u64,
+    /// Some of its media events were lost (the relay's queue was full):
+    /// what it collected (digits) or awaited (an announcement's end) is
+    /// indeterminate.
+    pub(super) events_indeterminate: bool,
     /// `unconfirmed` while a change of its media's routing was not
     /// confirmed by its workers.
     pub(super) topology_state: Option<&'static str>,
@@ -336,6 +341,62 @@ struct Subscriber {
     tx: SyncSender<Vec<u8>>,
     /// Events it missed (its queue was full), to tell it about.
     missed: u64,
+    /// The `global_seq` of the last event it was given: a gap says to
+    /// resume from there.
+    last: u64,
+}
+
+/// Events kept for replay by default.
+pub const DEFAULT_JOURNAL: usize = 65_536;
+
+impl Subscriber {
+    /// Tell it about the events it missed, if its queue has room now:
+    /// `false` once its connection is gone.
+    fn flush_gap(&mut self, boot: &str) -> bool {
+        if self.missed == 0 {
+            return true;
+        }
+        let gap = json!({"event": "gap", "reason": "overflow", "missed": self.missed,
+            "subscription_id": self.id, "resume_cursor": format!("{boot}:{}", self.last)});
+        match self.tx.try_send(frame_json(&gap)) {
+            Ok(()) => {
+                self.missed = 0;
+                true
+            }
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Give it `event` (number `seq`, framed as `bytes`): `false` once its
+    /// connection is gone. A full queue counts the event missed; the next
+    /// time there is room, a gap says how many, and the cursor to resume
+    /// from (`resume_cursor`) to get them back.
+    fn deliver(&mut self, boot: &str, seq: u64, bytes: Vec<u8>) -> bool {
+        if self.missed > 0 {
+            let gap = json!({"event": "gap", "reason": "overflow", "missed": self.missed,
+                "subscription_id": self.id, "resume_cursor": format!("{boot}:{}", self.last)});
+            match self.tx.try_send(frame_json(&gap)) {
+                Ok(()) => self.missed = 0,
+                Err(TrySendError::Full(_)) => {
+                    self.missed += 1;
+                    return true;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        match self.tx.try_send(bytes) {
+            Ok(()) => {
+                self.last = seq;
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                self.missed += 1;
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
 }
 
 /// The connection a request came on: its tenant's subscriptions go to
@@ -372,6 +433,13 @@ pub struct Native {
     /// Changes whenever a resource or a link between resources may have:
     /// a paged inventory taken across a change starts again.
     pub(super) topology_epoch: u64,
+    /// The events kept for replay (`global_seq`, event), oldest first, and
+    /// how many at most.
+    pub(super) journal: VecDeque<(u64, Json)>,
+    pub(super) journal_cap: usize,
+    /// The highest `global_seq` evicted from the journal (a cursor at or
+    /// before it cannot be resumed).
+    pub(super) journal_evicted: u64,
     /// Recordings: id → what became of it.
     pub(super) recordings: HashMap<String, Recording>,
     /// What the last restart could not bring back.
@@ -624,42 +692,43 @@ impl Native {
     /// Hand `event` to the subscribers that want it.
     fn publish(&mut self, mut event: Json) {
         self.global_seq += 1;
+        let seq = self.global_seq;
+        let journaled = event.get("event").and_then(Json::as_str) != Some("gap");
         if let Some(o) = event.as_object_mut() {
-            o.insert("global_seq".to_owned(), json!(self.global_seq));
+            o.insert("global_seq".to_owned(), json!(seq));
             o.insert(
                 "time_unix_ms".to_owned(),
                 json!(crate::relay::media_events::unix_ms()),
             );
+            o.insert("boot_id".to_owned(), json!(self.boot_id));
+            if journaled {
+                o.insert(
+                    "event_id".to_owned(),
+                    json!(format!("{}:{seq}", self.boot_id)),
+                );
+            }
+        }
+        // Kept for replay (a gap is the subscriber's own).
+        if journaled && self.journal_cap > 0 {
+            if self.journal.len() >= self.journal_cap
+                && let Some((old, _)) = self.journal.pop_front()
+            {
+                self.journal_evicted = old;
+            }
+            self.journal.push_back((seq, event.clone()));
         }
         let tenant = event
             .get("tenant")
             .and_then(Json::as_str)
             .map(str::to_owned);
         let mut encoded: Option<Vec<u8>> = None;
+        let boot = self.boot_id.clone();
         self.subscribers.retain_mut(|(_, s)| {
             if tenant.as_deref().is_some_and(|t| t != s.tenant) || !s.filter.wants(&event) {
                 return true;
             }
-            if s.missed > 0 {
-                let gap = json!({"event": "gap", "missed": s.missed, "subscription_id": s.id});
-                match s.tx.try_send(frame_json(&gap)) {
-                    Ok(()) => s.missed = 0,
-                    Err(TrySendError::Full(_)) => {
-                        s.missed += 1;
-                        return true;
-                    }
-                    Err(TrySendError::Disconnected(_)) => return false,
-                }
-            }
             let bytes = encoded.get_or_insert_with(|| frame_json(&event)).clone();
-            match s.tx.try_send(bytes) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => {
-                    s.missed += 1;
-                    true
-                }
-                Err(TrySendError::Disconnected(_)) => false,
-            }
+            s.deliver(&boot, seq, bytes)
         });
     }
 }
@@ -1071,7 +1140,8 @@ impl Control {
                 "idempotency_retention_ms": self.native.ledger.retention_ms,
                 "operation_key_quota": self.native.ledger.quota,
                 "state_commit": if self.native.ledger.durable() { "synced_before_reply" } else { "periodic" },
-                "events": "at_most_once_with_gaps",
+                "events": "replayable_within_journal",
+                "event_journal": self.native.journal_cap,
             },
             "limits": {
                 "retention_ms": RETENTION.as_millis(),
@@ -1104,6 +1174,7 @@ impl Control {
             "recording_id": ep.recording,
             "topology_revision": ep.topology_revision,
             "topology_state": ep.topology_state.unwrap_or("confirmed"),
+            "events_indeterminate": ep.events_indeterminate,
         })
     }
 
@@ -1222,6 +1293,7 @@ impl Control {
             recording: None,
             topology_revision: 0,
             topology_state: None,
+            events_indeterminate: false,
         };
         self.native.endpoints.insert(id.clone(), ep);
         if let Some(x) = external_id {
@@ -1429,9 +1501,15 @@ impl Control {
             return;
         };
         if reason != "ended" {
+            // Its dialog with the hidden side, by the key it is under (an
+            // unanswered offer of the relay's has no to-tag yet: its own
+            // tag would not find it).
+            let from = self
+                .created_dialog(ep.session.as_bytes(), ep.id.as_bytes())
+                .map_or_else(|| ep.id.as_bytes().to_vec(), |k| k.1);
             let entries = vec![
                 (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
-                (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
+                (b"from-tag".to_vec(), bytes(&from)),
             ];
             if let Err(e) = self.ng_run(b"delete", entries) {
                 log::debug!("native: endpoint {id}: delete: {}", e.message);
@@ -1819,17 +1897,59 @@ impl Control {
         };
         self.native.next_subscription += 1;
         let id = self.native.next_subscription;
-        self.native.subscribers.push((
-            origin.connection,
-            Subscriber {
-                id,
-                tenant: req.tenant.to_owned(),
-                filter,
-                tx,
-                missed: 0,
-            },
-        ));
-        Ok(json!({"subscription_id": id, "global_seq": self.native.global_seq}))
+        let n = &mut self.native;
+        let mut sub = Subscriber {
+            id,
+            tenant: req.tenant.to_owned(),
+            filter,
+            tx,
+            missed: 0,
+            last: n.global_seq,
+        };
+        // From a cursor: what came after it first, then live. A cursor of
+        // another run, or older than the journal, gets a gap saying so
+        // (reconcile with the inventory), never a silent loss.
+        let mut resumed = json!(null);
+        if let Some(c) = req.str("cursor") {
+            let parsed = c
+                .rsplit_once(':')
+                .and_then(|(boot, seq)| Some((boot, seq.parse::<u64>().ok()?)));
+            let Some((boot, after)) = parsed else {
+                return Err(NativeError::invalid("cursor: <boot_id>:<global_seq>"));
+            };
+            let reason = if boot != n.boot_id {
+                Some("boot_changed")
+            } else if after < n.journal_evicted {
+                Some("retention_expired")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let gap = json!({"event": "gap", "reason": reason, "subscription_id": id,
+                    "boot_id": n.boot_id, "global_seq": n.global_seq});
+                let _ = sub.tx.try_send(frame_json(&gap));
+                resumed = json!(false);
+            } else {
+                let boot = n.boot_id.clone();
+                sub.last = after;
+                for (seq, e) in n.journal.iter().filter(|(seq, _)| *seq > after) {
+                    let mine = e
+                        .get("tenant")
+                        .and_then(Json::as_str)
+                        .is_none_or(|t| t == sub.tenant);
+                    if mine && sub.filter.wants(e) && !sub.deliver(&boot, *seq, frame_json(e)) {
+                        break;
+                    }
+                }
+                if sub.last < n.global_seq && sub.missed == 0 {
+                    sub.last = n.global_seq;
+                }
+                resumed = json!(true);
+            }
+        }
+        n.subscribers.push((origin.connection, sub));
+        Ok(json!({"subscription_id": id, "global_seq": n.global_seq,
+            "cursor": format!("{}:{}", n.boot_id, n.global_seq), "resumed": resumed}))
     }
 
     fn native_unsubscribe(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
@@ -1915,10 +2035,56 @@ impl Control {
             return;
         };
         let (events, dropped) = inbox.take();
+        let lost = if dropped > 0 {
+            inbox.take_lost()
+        } else {
+            Vec::new()
+        };
         if dropped > 0 {
             self.native.events_dropped += dropped;
+            // The endpoints known to have lost events: marked, and told.
+            let mut marked = Vec::new();
+            for subject in &lost {
+                let party = match subject {
+                    Subject::Leg(call, leg) => self.party_on_leg(*call, *leg),
+                    Subject::Call(call) => self.party_on_leg_any(*call),
+                    Subject::Dialog {
+                        call_id, from_tag, ..
+                    } => Some((
+                        call_id.as_bytes().to_vec(),
+                        from_tag
+                            .strip_prefix(std::str::from_utf8(super::create::CREATOR).unwrap_or(""))
+                            .unwrap_or(from_tag)
+                            .as_bytes()
+                            .to_vec(),
+                    )),
+                };
+                if let Some((_, tag)) = party
+                    && let Ok(id) = String::from_utf8(tag)
+                    && let Some(ep) = self.native.endpoints.get_mut(&id)
+                {
+                    ep.events_indeterminate = true;
+                    marked.push(id);
+                }
+            }
+            marked.sort();
+            marked.dedup();
+            for id in &marked {
+                self.endpoint_event(
+                    id,
+                    "endpoint.events_lost",
+                    None,
+                    json!({
+                        "reason": "the relay's media event queue was full: key presses, \
+                                   announcements' ends or recordings' outcomes may be missing",
+                    }),
+                );
+            }
+            // And for every subscriber: some events were lost, perhaps of
+            // endpoints not known (`attributed` says how many were).
             self.native
-                .publish(json!({"event": "gap", "missed": dropped, "source": "media"}));
+                .publish(json!({"event": "gap", "reason": "media_overflow",
+                "missed": dropped, "source": "media", "attributed_endpoints": marked}));
         }
         if self.native.subscribers.is_empty() {
             // Playbacks still end for the endpoints' snapshots.
@@ -2261,6 +2427,20 @@ impl Control {
         Ok(())
     }
 
+    /// Tell subscribers that missed events, as soon as they have room, even
+    /// when no event follows (on the control thread's every pass).
+    pub(super) fn native_flush_gaps(&mut self) {
+        let boot = self.native.boot_id.clone();
+        self.native
+            .subscribers
+            .retain_mut(|(_, s)| s.flush_gap(&boot));
+    }
+
+    /// Keep `cap` events for replay (`[control] native_event_journal`).
+    pub fn set_native_journal(&mut self, cap: usize) {
+        self.native.journal_cap = cap;
+    }
+
     /// Set the most endpoints one tenant may hold (0: no limit of its own).
     pub fn set_native_max_endpoints(&mut self, max: usize) {
         self.native.max_endpoints = max;
@@ -2392,6 +2572,7 @@ impl Control {
                 recording: e.recording.clone(),
                 topology_revision: e.topology_revision,
                 topology_state: None,
+                events_indeterminate: false,
             };
             if let Some(x) = &e.external_id {
                 self.native

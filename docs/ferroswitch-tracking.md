@@ -44,7 +44,7 @@ the evidence, and what is left. Updated with every step.
 | 1. Durable operation ledger, fingerprints, `operation.query`, `external_id` | P0 | done |
 | 2. Inventory, boot id, recovery report | P0 | done |
 | 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | done |
-| 4. Replayable critical events with cursors | P0 | planned |
+| 4. Replayable critical events with cursors | P0 | done |
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | planned |
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | planned |
 | 7. Fencing epochs issued by an ownership authority | P0-HA | planned |
@@ -151,3 +151,38 @@ Residual: worker acknowledgements are synchronous barriers on the control
 thread (at most a second), so a late acknowledgement cannot overwrite a
 newer intent. Early media and delayed SDP are the existing endpoint
 flows, exercised end to end in step 6.
+
+## Step 4: replayable events
+
+- Every event has `event_id` (`<boot_id>:<global_seq>`) and `boot_id`, and
+  goes into a bounded in-memory journal (`[control] native_event_journal`).
+- `events.subscribe` takes a `cursor`. It replays what came after, then
+  goes live (`resumed: true`). A cursor of another run (`boot_changed`) or
+  older than the journal (`retention_expired`) gets an explicit gap. The
+  reply's `cursor` and the inventory's watermark are cursors (a snapshot
+  and a subscription without a race).
+- An overflowing subscriber gets a gap with `resume_cursor` as soon as it
+  has room, even when no event follows. Pending gaps are flushed on every
+  pass of the control thread.
+- Events dropped before the journal (the workers' queue was full) are
+  attributed where possible: the endpoints get `endpoint.events_lost` and
+  `events_indeterminate: true`, and the gap is `media_overflow`.
+
+Two bugs were found and fixed while testing:
+- Destroying an endpoint whose relay offer was never answered deleted
+  nothing, leaking its session and ports. Its dialog had no to-tag yet.
+- A subscriber's overflow gap was only sent with its next event, so a
+  burst followed by quiet left the subscriber unaware.
+
+Evidence (`tests/native.rs`):
+- `events_resume_from_a_cursor`: replay in order after a disconnect;
+  `boot_changed`; subscribing from a watermark.
+- `an_overflowing_subscriber_resumes_without_loss`: 3000 events to a
+  subscriber that does not read, resumed from the gaps' cursors, every
+  event seen once after deduplication; a cursor older than the journal is
+  `retention_expired`.
+
+Residual: the journal is in memory. Events of a run do not survive a
+relay restart, which is reported as `boot_changed`, and the terminal
+results are reconciled from the saved state. Events are not persisted
+across power loss by design.

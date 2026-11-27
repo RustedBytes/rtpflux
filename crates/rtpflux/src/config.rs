@@ -111,6 +111,8 @@ pub struct Control {
     /// The native API's tokens over TCP: tenant name → token (at least 16
     /// characters).
     pub native_tokens: std::collections::BTreeMap<String, String>,
+    /// Events kept for replay (`events.subscribe` with a cursor).
+    pub native_event_journal: usize,
 }
 
 impl Default for Control {
@@ -126,6 +128,7 @@ impl Default for Control {
             pcm_dir: None,
             native_listen: Vec::new(),
             native_tokens: std::collections::BTreeMap::new(),
+            native_event_journal: 65_536,
         }
     }
 }

@@ -39,6 +39,7 @@ impl native::Native {
     pub(super) fn fresh() -> Self {
         let mut n = Self::default();
         n.boot_id = native::random_id("boot-");
+        n.journal_cap = native::DEFAULT_JOURNAL;
         n
     }
 }

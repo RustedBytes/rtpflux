@@ -60,6 +60,7 @@ native_max_endpoints = 0      # endpoints per tenant on the native API (0: up to
 # pcm_dir = "/run/rtpflux/pcm"  # where external audio services listen (PCM streams)
 native_listen = []            # the native API over TCP too (needs native_tokens)
 native_tokens = {}            # tenant = "token" (16 characters or more), for native_listen
+native_event_journal = 65536  # native API events kept for replay from a cursor
 ```
 
 `listen` takes one or more `address:port` pairs. The ng protocol has no

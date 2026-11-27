@@ -462,6 +462,7 @@ fn start_native(
         return Ok((addrs, Vec::new()));
     }
     control.set_native_max_endpoints(c.native_max_endpoints);
+    control.set_native_journal(c.native_event_journal);
     if let Some(path) = &config.sessions.ledger {
         control
             .open_ledger(

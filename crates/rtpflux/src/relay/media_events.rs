@@ -104,7 +104,13 @@ pub struct MediaEvents {
     tx: SyncSender<MediaEvent>,
     dropped: Arc<AtomicU64>,
     wake: Arc<EventFd>,
+    /// What dropped events were about, as far as known (at most
+    /// [`MAX_LOST`]; taken only if the lock is free: never waited for).
+    lost: Arc<std::sync::Mutex<Vec<Subject>>>,
 }
+
+/// Subjects of dropped events remembered between two takes, at most.
+pub const MAX_LOST: usize = 256;
 
 impl MediaEvents {
     /// Hand `kind` about `subject` to the control thread; dropped and
@@ -115,8 +121,18 @@ impl MediaEvents {
             at_unix_ms: unix_ms(),
             kind,
         };
-        if self.tx.try_send(event).is_err() {
+        if let Err(e) = self.tx.try_send(event) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            let subject = match e {
+                std::sync::mpsc::TrySendError::Full(ev)
+                | std::sync::mpsc::TrySendError::Disconnected(ev) => ev.subject,
+            };
+            if let Ok(mut l) = self.lost.try_lock()
+                && l.len() < MAX_LOST
+                && !l.contains(&subject)
+            {
+                l.push(subject);
+            }
         } else {
             let _ = self.wake.write(1);
         }
@@ -128,6 +144,7 @@ impl MediaEvents {
 pub struct MediaEventInbox {
     rx: Receiver<MediaEvent>,
     dropped: Arc<AtomicU64>,
+    lost: Arc<std::sync::Mutex<Vec<Subject>>>,
     /// Events dropped as of the last [`MediaEventInbox::take`].
     seen_dropped: u64,
     /// Written once per event: wakes the control thread.
@@ -146,6 +163,15 @@ impl MediaEventInbox {
         (events, gap)
     }
 
+    /// What the events dropped since the last call were about, as far as
+    /// known (some may not be: count them with [`MediaEventInbox::take`]).
+    #[must_use]
+    pub fn take_lost(&self) -> Vec<Subject> {
+        self.lost
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut l| std::mem::take(&mut *l))
+    }
+
     /// Events dropped since the start.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -161,6 +187,7 @@ impl MediaEventInbox {
 pub fn channel() -> Result<(MediaEvents, MediaEventInbox), nix::Error> {
     let (tx, rx) = sync_channel(QUEUE);
     let dropped = Arc::new(AtomicU64::new(0));
+    let lost = Arc::new(std::sync::Mutex::new(Vec::new()));
     let wake = Arc::new(EventFd::from_flags(
         EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC,
     )?);
@@ -169,10 +196,12 @@ pub fn channel() -> Result<(MediaEvents, MediaEventInbox), nix::Error> {
             tx,
             dropped: Arc::clone(&dropped),
             wake: Arc::clone(&wake),
+            lost: Arc::clone(&lost),
         },
         MediaEventInbox {
             rx,
             dropped,
+            lost,
             seen_dropped: 0,
             wake,
         },

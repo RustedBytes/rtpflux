@@ -27,6 +27,8 @@ native_max_endpoints = 0
 # authenticates with a tenant's token (16 characters or more).
 native_listen = []
 native_tokens = {}
+# Native API events kept (in memory) for subscribers resuming from a cursor.
+native_event_journal = 65536
 
 # Media interfaces. `direction=<name>` in ng commands selects them.
 # `advertise` is the address written into SDP; it defaults to `address`

@@ -1525,3 +1525,202 @@ fn renegotiation_both_ways_and_topology_cas() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The events a subscriber has not read: (type, endpoint, event id).
+fn events_of(api: &mut Client, wait: Duration) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    while let Ok(Some(e)) = api.next_event(wait) {
+        out.push((
+            e["event"].as_str().unwrap_or("").to_owned(),
+            e["endpoint_id"].as_str().unwrap_or("").to_owned(),
+            e["event_id"].as_str().unwrap_or("").to_owned(),
+        ));
+    }
+    out
+}
+
+/// Resuming from a cursor: what happened meanwhile, in order, then live;
+/// a cursor of another run is a gap (`boot_changed`); the inventory's
+/// watermark is a cursor (no race between a snapshot and a subscription).
+#[test]
+fn events_resume_from_a_cursor() {
+    let dir = temp_dir("resume");
+    let (daemon, sock) = relay(&dir, 53_700, 1);
+    let mut api = Client::connect(&sock).unwrap();
+    let c0 = api.call("events.subscribe", json!({})).unwrap()["cursor"].clone();
+    let (p1, p2) = (endpoint(), endpoint());
+    let mk = |api: &mut Client, p: &UdpSocket| {
+        api.call(
+            "endpoint.create",
+            json!({"remote_sdp": sdp(p, 1, "sendrecv"), "options": opts()}),
+        )
+        .unwrap()["endpoint_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let e1 = mk(&mut api, &p1);
+    drop(api);
+    // Meanwhile, nobody listening.
+    let mut other = Client::connect(&sock).unwrap();
+    let e2 = mk(&mut other, &p2);
+    other
+        .call("endpoint.destroy", json!({"endpoint_id": e1}))
+        .unwrap();
+    // Back from the cursor: all of it, in order, each once.
+    let mut api = Client::connect(&sock).unwrap();
+    let r = api.call("events.subscribe", json!({"cursor": c0})).unwrap();
+    assert_eq!(r["resumed"], true);
+    let got = events_of(&mut api, Duration::from_millis(300));
+    let kinds: Vec<(&str, &str)> = got
+        .iter()
+        .map(|(k, e, _)| (k.as_str(), e.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("endpoint.ready", e1.as_str()),
+            ("endpoint.ready", e2.as_str()),
+            ("endpoint.destroyed", e1.as_str())
+        ],
+        "{got:?}"
+    );
+    assert!(got.iter().all(|(_, _, id)| id.starts_with("boot-")));
+    // Another run's cursor: a gap, said so.
+    let mut stale = Client::connect(&sock).unwrap();
+    let r = stale
+        .call("events.subscribe", json!({"cursor": "boot-0000:5"}))
+        .unwrap();
+    assert_eq!(r["resumed"], false);
+    let gap = stale.wait_event("gap", WAIT).unwrap().unwrap();
+    assert_eq!(gap["reason"], "boot_changed");
+    // Snapshot, then subscribe from its watermark: only what follows.
+    let snap = api
+        .call("inventory.list", json!({"kind": "endpoints"}))
+        .unwrap();
+    let w = &snap["watermark"];
+    let cursor = format!("{}:{}", w["boot_id"].as_str().unwrap(), w["global_seq"]);
+    let mut fresh = Client::connect(&sock).unwrap();
+    fresh
+        .call("events.subscribe", json!({"cursor": cursor}))
+        .unwrap();
+    other
+        .call("endpoint.destroy", json!({"endpoint_id": e2}))
+        .unwrap();
+    let got = events_of(&mut fresh, Duration::from_millis(300));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, "endpoint.destroyed");
+    drop((api, other, stale, fresh));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A subscriber that does not read: its queue overflows, it is told so
+/// with the cursor to resume from, and resuming from it gets every event
+/// it missed (at least once: deduplicated by event id, none lost). With a
+/// small journal, a cursor older than it is `retention_expired`.
+#[test]
+fn an_overflowing_subscriber_resumes_without_loss() {
+    let dir = temp_dir("overflow");
+    let sock = dir.join("api.sock");
+    let config = Config::from_toml(&format!(
+        r#"
+        [control]
+        listen = ["127.0.0.1:0"]
+        native_socket = "{}"
+        native_event_journal = 2500
+        [[interface]]
+        name = "lo"
+        address = "127.0.0.1"
+        [ports]
+        min = 53900
+        max = 53963
+        [sessions]
+        max = 12
+        [runtime]
+        workers = 1
+        "#,
+        sock.display()
+    ))
+    .unwrap();
+    let daemon = Daemon::start(&config).unwrap();
+    let mut slow = Client::connect(&sock).unwrap();
+    slow.call("events.subscribe", json!({"types": ["endpoint.destroyed"]}))
+        .unwrap();
+    let mut api = Client::connect(&sock).unwrap();
+    let rounds = 3000;
+    for _ in 0..rounds {
+        let ep = api
+            .call("endpoint.create", json!({"codecs": ["PCMU"]}))
+            .unwrap();
+        api.call(
+            "endpoint.destroy",
+            json!({"endpoint_id": ep["endpoint_id"]}),
+        )
+        .unwrap();
+    }
+    // The slow one reads now: some events, then a gap with its cursor.
+    let mut seen = std::collections::HashSet::new();
+    let mut resume = None;
+    while let Ok(Some(e)) = slow.next_event(Duration::from_millis(500)) {
+        if e["event"] == "gap" {
+            assert_eq!(e["reason"], "overflow");
+            resume = e["resume_cursor"].as_str().map(str::to_owned);
+            break;
+        }
+        seen.insert(e["event_id"].as_str().unwrap().to_owned());
+    }
+    let resume =
+        resume.unwrap_or_else(|| panic!("an overflow gap with a cursor (seen {})", seen.len()));
+    let mut again = Client::connect(&sock).unwrap();
+    again
+        .call(
+            "events.subscribe",
+            json!({"types": ["endpoint.destroyed"], "cursor": resume}),
+        )
+        .unwrap();
+    // (Replayed in pages of the queue: resume again from each gap.)
+    let mut resume_from = None;
+    loop {
+        match again.next_event(Duration::from_millis(500)) {
+            Ok(Some(e)) if e["event"] == "gap" => {
+                resume_from = e["resume_cursor"].as_str().map(str::to_owned);
+                break;
+            }
+            Ok(Some(e)) => {
+                seen.insert(e["event_id"].as_str().unwrap().to_owned());
+            }
+            _ => break,
+        }
+    }
+    while let Some(c) = resume_from.take() {
+        let mut more = Client::connect(&sock).unwrap();
+        more.call(
+            "events.subscribe",
+            json!({"types": ["endpoint.destroyed"], "cursor": c}),
+        )
+        .unwrap();
+        while let Ok(Some(e)) = more.next_event(Duration::from_millis(500)) {
+            if e["event"] == "gap" {
+                resume_from = e["resume_cursor"].as_str().map(str::to_owned);
+                break;
+            }
+            seen.insert(e["event_id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(seen.len(), rounds, "every destroy, once");
+    // Older than the journal keeps: retention_expired.
+    let mut old = Client::connect(&sock).unwrap();
+    let boot = resume.split(':').next().unwrap().to_owned();
+    let r = old
+        .call("events.subscribe", json!({"cursor": format!("{boot}:1")}))
+        .unwrap();
+    assert_eq!(r["resumed"], false);
+    assert_eq!(
+        old.wait_event("gap", WAIT).unwrap().unwrap()["reason"],
+        "retention_expired"
+    );
+    drop((slow, api, again, old));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

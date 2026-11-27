@@ -454,6 +454,7 @@ subscriber sees only its own tenant's events.
 | `endpoint.failed` | `reason` (`dtls`, or `media` with a `detail`: a media worker could not take the endpoint's socket) |
 | `endpoint.timeout` | |
 | `endpoint.destroyed` | `reason`: `request`, `lease`, `timeout`, `ended` (ng deleted it) |
+| `endpoint.events_lost` | Some of its media events were lost before the journal: what it awaited is indeterminate |
 | `bridge.changed` | `bridged_to` (or `null`), `reason`: `attached`, `detached`, `replaced`, `peer_destroyed` |
 | `ice.connected`, `dtls.ready` | |
 | `dtmf.detected` | `digit`, `code`, `duration_ms`, `rtp_timestamp`, `source`, `start_unix_ms`, `end_unix_ms` |
@@ -476,17 +477,41 @@ subscriber sees only its own tenant's events.
   40 ms after the key is released (plus the 40 ms jitter buffer). Keys
   shorter than 40 ms are not seen.
 
-**Delivery.** Events are delivered at most once, in order, with
-detectable gaps:
-- Each event carries `seq`, which counts up per endpoint, and
-  `global_seq`, which counts up across all events.
-- A subscriber whose queue (1024 events) is full misses events. When it
-  has room again it gets a `gap` event first.
-- When the relay's own queue of media events overflows, a `gap` event
-  with `source: "media"` says so.
-- After a gap, the client calls `endpoint.list` and `endpoint.query`.
-- A slow subscriber never holds up the relay: neither its media workers
-  nor its control thread wait for it.
+**Delivery.** Events can be replayed from a cursor, at least once, in
+order, with every loss said:
+- **Identity.** Each event carries `event_id` (`<boot_id>:<global_seq>`),
+  `boot_id`, `seq` (counts up per endpoint) and `global_seq` (counts up
+  across all events). A jump in the `global_seq` of a filtered
+  subscription is not a loss: other events are filtered out.
+- **The journal.** The relay keeps the last `[control]
+  native_event_journal` events (65,536 by default), in memory: they
+  outlive the client's connection, not a restart of the relay.
+- **Resuming.** `events.subscribe` with `cursor` (an `event_id`, the
+  previous subscription's `cursor`, or a page's watermark) first replays
+  what came after it, then goes on live. Its reply says `resumed: true`.
+- **What cannot be resumed** is said: a cursor older than the journal
+  gets a `gap` with `reason: "retention_expired"`, and one of another run
+  of the relay gets `reason: "boot_changed"` (`resumed: false`). The
+  client then reconciles with `inventory.list` and `recovery.report`.
+  Terminal results (recordings, playbacks) are also in the inventory and
+  `recording.query`.
+- **A subscriber that falls behind** (its queue holds 1024 events) misses
+  events. As soon as it has room, it gets a `gap` with `reason:
+  "overflow"`, `missed`, and `resume_cursor`. Subscribing again from
+  `resume_cursor` gets the missed events back, possibly some twice:
+  deduplicate by `event_id`.
+- **A snapshot without a race:** take `inventory.list`, then subscribe
+  from its watermark (`<boot_id>:<global_seq>`). Nothing between the two
+  is missed.
+- **Lost before the journal.** When the relay's own queue of media events
+  overflows, the events are lost before they reach the journal:
+  - the endpoints known to be affected get `endpoint.events_lost`, and
+    their snapshots say `events_indeterminate: true`, since a digit
+    collection or an announcement's end may be missing;
+  - a `gap` with `reason: "media_overflow"` lists them;
+  - the count is in `rtpflux_media_events_dropped_total`.
+- **No one waits.** A slow subscriber never holds up the relay: neither
+  its media workers nor its control thread wait for it.
 
 ## Example: two legs
 
