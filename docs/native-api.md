@@ -376,14 +376,71 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
 
 | Operation | Fields | Result |
 |---|---|---|
-| `playback.start` | `endpoint_id`, `file` or `blob_base64`, `repeat_times`, `start_pos`, `duration`, `repeat_duration` | `playback_id`, `duration_ms` |
-| `playback.stop` | `endpoint_id` | `stopped`, `playback_id` |
+| `playback.start` | `endpoint_id`, `file` or `blob_base64`, `repeat_times`, `start_pos`, `duration`, `repeat_duration`, `queue` (wait behind the current one), `stop_on` (`["dtmf", "speech"]`) | `playback_id`, `duration_ms`; queued: `queued`, `position` |
+| `playback.stop` | `endpoint_id` | `stopped`, `playback_id` (the queue goes too) |
 | `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording`, `recording_id` (starting again while it records gives the same id) |
 | `recording.query` | `recording_id` | Its `state` (`active`, `stopped`, `completed`, `failed`), `file`, `uploaded`, `detail`, start and end times |
 
 - An announcement that plays to its end gives `playback.completed`, with
   the `operation_id` of its `playback.start`. One that is stopped, or
   replaced by another, gives `playback.stopped` with the reason.
+- **Queues.** With `queue: true`, a playback waits behind the current
+  one, 16 at most, and starts when it completes. It gets its
+  `playback_id` at once.
+- **Interruption.** With `stop_on`, a key the endpoint presses (`dtmf`)
+  or speech it starts (`speech`, which needs a VAD detector: see
+  [Detectors](#ivr-keys-tones-detectors-and-sensitive-digits)) stops the
+  playback at once (`playback.stopped`, `reason: "dtmf"` or `"speech"`).
+  What was queued behind it goes too (`reason: "interrupted"`,
+  `queued: true`). A `playback.start` without `queue` replaces the
+  current playback and drops the queue (`reason: "replaced"`). The relay
+  does the stopping, without a round trip to the controller. Digit
+  collection and timeouts stay with the controller.
+
+## IVR: keys, tones, detectors and sensitive digits
+
+| Operation | Fields | Result |
+|---|---|---|
+| `dtmf.send` | `endpoint_id`, `digits` (1–64 of `0-9*#A-D`), `duration_ms` (40–5000, default 100), `pause_ms` (default 50), `volume` (0–63 dBm0 below, default 8), `mode` (`auto`, `rfc4733`, `inband`) | `keys`, `mode`, `duration_ms` (the digits are not echoed) |
+| `tone.start` | `endpoint_id`, `frequency_hz` (50–4000), `on_ms` (default 1000), `off_ms` (default 0), `repeat` (1–1000), `volume` | `duration_ms` |
+| `tone.stop` | `endpoint_id` | `stopped` |
+| `dtmf.policy` | `endpoint_id`, `policy` (`dedup`, `both`, `rfc4733`, `inband`) | `policy` |
+| `endpoint.sensitive` | `endpoint_id`, `sensitive` (`true`/`false`) | `sensitive`, `recording_paused` |
+
+- **Sending keys.** `dtmf.send` plays them as telephone events when the
+  endpoint negotiated them (`auto`, `rfc4733`), else as tones in its
+  audio (`inband`). Tones and keys are refused while an announcement
+  plays to the endpoint.
+- **Detectors** need no service: `stream.start` without `socket` runs the
+  endpoint's audio through the detectors only (`vad`, `dtmf`, both on by
+  default), on the PCM shards, and sends it nowhere. `stream.detect`
+  switches them at run time.
+- **Detection.** RFC 4733 keys are reported for an endpoint even when it
+  is not bridged to anyone (an IVR leg).
+- **DTMF sources.** With both an in-band detector and telephone events, a
+  press can be reported twice. `dtmf.policy` decides what reaches
+  `dtmf.detected`:
+  - `dedup` (the default): a key reported by one source within a second
+    of the same key from the other is dropped;
+  - `both`: every report;
+  - `rfc4733` or `inband`: one source only.
+- **Sensitive digits** (a PIN, a card number). While
+  `endpoint.sensitive` is on:
+  - the endpoint's `dtmf.detected` events carry `sensitive: true`. Only
+    subscribers that asked for them (`events.subscribe` with
+    `sensitive: true`) get the digit; the others get `digit` and `code`
+    as `null` and `redacted: true`, live and on replay;
+  - its recordings are paused, and resumed when it is turned off. One
+    the controller paused itself stays paused.
+
+  Digits are never logged, sensitive or not (`log` at any level).
+
+  Not covered:
+  - a PCM stream's external service hears in-band tones as audio;
+  - a bridged peer still hears in-band tones and gets the events (use
+    `ng`'s `block DTMF` if it must not);
+  - the in-memory event journal holds the digit, for the subscribers
+    entitled to it.
 - A finished recording gives `recording.completed` once its audio file is
   written (`file`), with `uploaded` saying whether the S3 upload worked
   (`null` without uploads). A recording whose conversion failed gives
@@ -398,8 +455,9 @@ pcm_dir`, and the relay connects to it.
 
 | Operation | Fields | Result |
 |---|---|---|
-| `stream.start` | `endpoint_id`, `socket` (a file name in `pcm_dir`), `rate` (8000, 16000, 24000 or 48000; default 16000), `inject` (default `true`), `protocol` (1 or 2, default 1) | `stream_id`, `rate`, `inject`, `protocol` |
+| `stream.start` | `endpoint_id`, `socket` (a file name in `pcm_dir`; none: detectors only), `rate` (8000, 16000, 24000 or 48000; default 16000), `inject` (default `true`), `protocol` (1 or 2, default 1), `vad`, `dtmf` (detectors, default on) | `stream_id`, `rate`, `inject`, `protocol`, `service`, `detect` |
 | `stream.flush` | `stream_id` | `flushed`: the audio queued for the endpoint is dropped (barge-in), and a new generation begins |
+| `stream.detect` | `stream_id`, `vad`, `dtmf` (`true`/`false`) | `detect` |
 | `stream.stop` | `stream_id` | `stopped` |
 
 **Frames.** Each frame on the socket is a 32-octet header followed by its
@@ -529,7 +587,9 @@ stream. In-band key presses of participants give `dtmf.detected`.
 - `types`;
 - `endpoint_ids`, `session_ids`;
 - `all_parties`: also events about ng parties, which are not endpoints;
-  these carry `call_id` and `tag` instead of `endpoint_id`.
+  these carry `call_id` and `tag` instead of `endpoint_id`;
+- `sensitive`: sensitive digits as they are, not redacted (see
+  [IVR](#ivr-keys-tones-detectors-and-sensitive-digits)).
 
 The reply has `subscription_id` and the current `global_seq`. Events then
 arrive on the same connection, between replies, until the connection
@@ -552,9 +612,9 @@ subscriber sees only its own tenant's events.
 | `endpoint.events_lost` | Some of its media events were lost before the journal: what it awaited is indeterminate |
 | `bridge.changed` | `bridged_to` (or `null`), `reason`: `attached`, `detached`, `replaced`, `peer_destroyed` |
 | `ice.connected`, `dtls.ready` | |
-| `dtmf.detected` | `digit`, `code`, `duration_ms`, `rtp_timestamp`, `source`, `start_unix_ms`, `end_unix_ms` |
+| `dtmf.detected` | `digit`, `code`, `duration_ms`, `rtp_timestamp`, `source`, `start_unix_ms`, `end_unix_ms`; `sensitive`, or `redacted` with `digit` and `code` `null` |
 | `playback.completed` | `playback_id` |
-| `playback.stopped` | `playback_id`, `reason` (`request`, `replaced`) |
+| `playback.stopped` | `playback_id`, `reason` (`request`, `replaced`, `dtmf`, `speech`, `interrupted`, `failed`), `queued` |
 | `recording.completed`, `recording.failed` | `file`, `uploaded`, `section`; a recording whose file the worker cannot open fails at once, with `reason: "recording"` and a `detail` |
 | `speech.started`, `speech.ended` | (an endpoint with a PCM stream) |
 | `stream.mark` | `stream_id`, `mark`, `generation`, `played_ms`, `flushed`, `boundary` (`rtp_sent`) |

@@ -35,7 +35,7 @@ mod slots;
 mod subscribe;
 mod tones;
 mod uring;
-pub use tones::{ToneMode, Tones};
+pub use tones::{SILENCE, SINE, ToneMode, Tones};
 
 use super::offload::{Dir, OffloadMsg};
 use super::{

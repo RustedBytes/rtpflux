@@ -42,6 +42,7 @@ mod error;
 mod features;
 mod ice;
 mod inventory;
+mod ivr;
 mod keys;
 pub mod ledger;
 mod legacy;
@@ -675,6 +676,7 @@ impl Control {
         self.native_media_events();
         self.native_flush_gaps();
         self.ownership_prune();
+        self.ivr_prune();
         let ended = self.relay.take_ended();
         if ended.is_empty() {
             return;

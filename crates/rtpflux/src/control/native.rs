@@ -55,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 32] = [
+pub const OPERATIONS: [&str; 38] = [
     "hello",
     "ownership.claim",
     "endpoint.create",
@@ -76,10 +76,16 @@ pub const OPERATIONS: [&str; 32] = [
     "bridge.detach",
     "playback.start",
     "playback.stop",
+    "dtmf.send",
+    "dtmf.policy",
+    "tone.start",
+    "tone.stop",
+    "endpoint.sensitive",
     "recording.start",
     "recording.stop",
     "stream.start",
     "stream.flush",
+    "stream.detect",
     "stream.stop",
     "mixer.create",
     "mixer.add",
@@ -314,6 +320,8 @@ struct Filter {
     types: Vec<String>,
     /// Events of `ng` parties too (not only endpoints).
     all_parties: bool,
+    /// Sensitive digits as they are (others get them redacted).
+    sensitive: bool,
 }
 
 impl Filter {
@@ -433,6 +441,9 @@ pub struct Native {
     pub(super) ledger: super::ledger::Ledger,
     /// Ownership fencing (`[ha]`).
     pub(super) ha: Option<super::ownership::Ownership>,
+    /// Endpoints' IVR state: DTMF policy, sensitive digits, playback
+    /// queues.
+    pub(super) ivr: HashMap<String, super::ivr::Ivr>,
     /// Under `[ha]`: resource id (an endpoint's, `mixer_id:N`,
     /// `stream_id:N`) → the (tenant, group) owning it.
     pub(super) owned: HashMap<String, (String, String)>,
@@ -733,12 +744,20 @@ impl Native {
             .and_then(Json::as_str)
             .map(str::to_owned);
         let mut encoded: Option<Vec<u8>> = None;
+        let mut redacted: Option<Vec<u8>> = None;
+        let sensitive = super::ivr::is_sensitive(&event);
         let boot = self.boot_id.clone();
         self.subscribers.retain_mut(|(_, s)| {
             if tenant.as_deref().is_some_and(|t| t != s.tenant) || !s.filter.wants(&event) {
                 return true;
             }
-            let bytes = encoded.get_or_insert_with(|| frame_json(&event)).clone();
+            let bytes = if sensitive && !s.filter.sensitive {
+                redacted
+                    .get_or_insert_with(|| frame_json(&super::ivr::redact(&event)))
+                    .clone()
+            } else {
+                encoded.get_or_insert_with(|| frame_json(&event)).clone()
+            };
             s.deliver(&boot, seq, bytes)
         });
     }
@@ -1048,6 +1067,11 @@ impl Control {
             "endpoint.apply_answer" => self.native_apply_answer(req),
             "endpoint.prepare" => self.native_prepare(req),
             "ownership.claim" => self.native_claim(req),
+            "dtmf.send" => self.native_dtmf_send(req),
+            "dtmf.policy" => self.native_dtmf_policy(req),
+            "tone.start" => self.native_tone(req, true),
+            "tone.stop" => self.native_tone(req, false),
+            "endpoint.sensitive" => self.native_sensitive(req),
             "endpoint.commit" => self.native_commit(req),
             "endpoint.abort" => self.native_abort(req),
             "endpoint.destroy" => self.native_destroy(req),
@@ -1066,7 +1090,7 @@ impl Control {
             "recording.start" => self.native_record(req, true),
             "recording.stop" => self.native_record(req, false),
             "stream.start" => self.native_stream_start(req),
-            "stream.flush" | "stream.stop" => self.native_stream(req),
+            "stream.flush" | "stream.detect" | "stream.stop" => self.native_stream(req),
             "mixer.create" => self.native_mixer_create(req),
             "mixer.add" | "mixer.remove" | "mixer.set" | "mixer.destroy" => self.native_mixer(req),
             "events.subscribe" => self.native_subscribe(req, origin),
@@ -1138,8 +1162,8 @@ impl Control {
             "versions": VERSIONS,
             "boot_id": self.native.boot_id,
             "server": format!("rtpflux {}", env!("CARGO_PKG_VERSION")),
-            "operations": OPERATIONS,
-            "events": EVENTS,
+            "operations": OPERATIONS.as_slice(),
+            "events": EVENTS.as_slice(),
             "capabilities": {
                 "codecs": ["PCMU", "PCMA", "G722", "G729", "CN", "opus", "AMR", "AMR-WB", "telephone-event"],
                 "transports": ["RTP/AVP", "RTP/AVPF", "RTP/SAVP", "RTP/SAVPF", "UDP/TLS/RTP/SAVP", "UDP/TLS/RTP/SAVPF"],
@@ -1199,7 +1223,13 @@ impl Control {
     }
 
     /// Publish `event` of type `ty` about endpoint `id`, with `data`.
-    fn endpoint_event(&mut self, id: &str, ty: &str, operation_id: Option<&str>, data: Json) {
+    pub(super) fn endpoint_event(
+        &mut self,
+        id: &str,
+        ty: &str,
+        operation_id: Option<&str>,
+        data: Json,
+    ) {
         let Some(ep) = self.native.endpoints.get_mut(id) else {
             return;
         };
@@ -1768,6 +1798,102 @@ impl Control {
     }
 
     fn native_play(&mut self, req: &Request<'_>, start: bool) -> Result<Json, NativeError> {
+        if start {
+            self.native_play_as(req, None)
+        } else {
+            let ep = self.endpoint(req)?;
+            self.drop_queue(&ep.id, "request");
+            self.play_inner(req, false, None)
+        }
+    }
+
+    /// `playback.start`, with the playback's id when it was queued.
+    /// `queue: true` waits behind the current playback ([`QUEUE_MAX`] at
+    /// most); `stop_on` (`dtmf`, `speech`) stops it, and drops the queue,
+    /// when the endpoint presses a key or starts speaking.
+    ///
+    /// [`QUEUE_MAX`]: super::ivr::QUEUE_MAX
+    pub(super) fn native_play_as(
+        &mut self,
+        req: &Request<'_>,
+        id: Option<String>,
+    ) -> Result<Json, NativeError> {
+        let ep = self.endpoint(req)?;
+        let mut stop_on = Vec::new();
+        if let Some(v) = req.body.get("stop_on") {
+            for k in v.as_array().into_iter().flatten() {
+                match k.as_str() {
+                    Some(k @ ("dtmf" | "speech")) => stop_on.push(k.to_owned()),
+                    _ => return Err(NativeError::invalid("stop_on: [\"dtmf\", \"speech\"]")),
+                }
+            }
+        }
+        let queue = req.body.get("queue").and_then(Json::as_bool) == Some(true);
+        if queue && ep.playback.is_some() {
+            let ivr = self.native.ivr.entry(ep.id.clone()).or_default();
+            if ivr.queue.len() >= super::ivr::QUEUE_MAX {
+                return Err(NativeError::new(
+                    Code::Exhausted,
+                    "the playback queue is full",
+                ));
+            }
+            let id = random_id("pb-");
+            let mut body = req.body.clone();
+            body.remove("queue");
+            ivr.queue.push_back(super::ivr::Queued {
+                id: id.clone(),
+                body,
+                operation_id: req.operation_id.map(str::to_owned),
+            });
+            return Ok(json!({"playback_id": id, "queued": true, "position": ivr.queue.len()}));
+        }
+        let from_queue = id.is_some();
+        let r = self.play_inner(req, true, id)?;
+        if !from_queue && !queue {
+            self.drop_queue(&ep.id, "replaced");
+        }
+        self.native.ivr.entry(ep.id).or_default().stop_on = stop_on;
+        Ok(r)
+    }
+
+    /// Stop the endpoint's playback, reporting `reason`.
+    pub(super) fn stop_playback(&mut self, id: &str, reason: &str) {
+        let Some(ep) = self.native.endpoints.get(id).cloned() else {
+            return;
+        };
+        let Some((old, op)) = ep.playback.clone() else {
+            return;
+        };
+        let entries = vec![
+            (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
+            (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
+        ];
+        if let Err(e) = self.ng_run(b"stop media", entries) {
+            log::debug!(
+                "native: endpoint {id}: stopping its playback: {}",
+                e.message
+            );
+        }
+        if let Some(e) = self.native.endpoints.get_mut(id) {
+            e.playback = None;
+        }
+        if let Some(i) = self.native.ivr.get_mut(id) {
+            i.stop_on.clear();
+        }
+        self.endpoint_event(
+            id,
+            "playback.stopped",
+            op.as_deref(),
+            json!({"playback_id": old, "reason": reason}),
+        );
+    }
+
+    fn play_inner(
+        &mut self,
+        req: &Request<'_>,
+        start: bool,
+        preset: Option<String>,
+    ) -> Result<Json, NativeError> {
         let ep = self.endpoint(req)?;
         let mut entries = if start { options(req)? } else { Vec::new() };
         entries.push((b"call-id".to_vec(), bytes(ep.session.as_bytes())));
@@ -1779,6 +1905,9 @@ impl Control {
             self.ng_run(b"stop media", entries)?;
             if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
                 e.playback = None;
+            }
+            if let Some(i) = self.native.ivr.get_mut(&ep.id) {
+                i.stop_on.clear();
             }
             self.endpoint_event(
                 &ep.id,
@@ -1808,7 +1937,7 @@ impl Control {
                 .map(|(_, v)| to_json(v)),
             _ => None,
         };
-        let id = random_id("pb-");
+        let id = preset.unwrap_or_else(|| random_id("pb-"));
         // A playback it replaces stops.
         if let Some((old, op)) = ep.playback.clone() {
             self.endpoint_event(
@@ -1914,6 +2043,11 @@ impl Control {
                 .get("all_parties")
                 .and_then(Json::as_bool)
                 .unwrap_or(false),
+            sensitive: req
+                .body
+                .get("sensitive")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
         };
         self.native.next_subscription += 1;
         let id = self.native.next_subscription;
@@ -1957,7 +2091,12 @@ impl Control {
                         .get("tenant")
                         .and_then(Json::as_str)
                         .is_none_or(|t| t == sub.tenant);
-                    if mine && sub.filter.wants(e) && !sub.deliver(&boot, *seq, frame_json(e)) {
+                    let bytes = if super::ivr::is_sensitive(e) && !sub.filter.sensitive {
+                        frame_json(&super::ivr::redact(e))
+                    } else {
+                        frame_json(e)
+                    };
+                    if mine && sub.filter.wants(e) && !sub.deliver(&boot, *seq, bytes) {
                         break;
                     }
                 }
@@ -2138,6 +2277,10 @@ impl Control {
                 op.as_deref(),
                 json!({"playback_id": pb}),
             );
+            if let Some(i) = self.native.ivr.get_mut(&id) {
+                i.stop_on.clear();
+            }
+            self.play_next(&id);
             return;
         }
         let (ty, data) = match &e.kind {
@@ -2195,6 +2338,12 @@ impl Control {
                        "recording_id": self.recording_ended(&e.subject, file.as_ref(), *uploaded, None)}),
             ),
         };
+        self.route_event(e, ty, data);
+    }
+
+    /// Deliver a media event to the endpoint, or the `ng` party, it is
+    /// about.
+    fn route_event(&mut self, e: &MediaEvent, ty: &str, data: Json) {
         // Who it is about: an endpoint, or an `ng` party.
         let party = match &e.subject {
             Subject::Leg(call, leg) => self.party_on_leg(*call, *leg),
@@ -2223,7 +2372,11 @@ impl Control {
             .get(&id)
             .is_some_and(|ep| ep.session.as_bytes() == call.as_slice())
         {
+            if !self.ivr_admit(&id, ty, &mut data, e.at_unix_ms) {
+                return;
+            }
             self.endpoint_event(&id, ty, None, data);
+            self.ivr_interrupt(&id, ty);
         } else {
             self.native.publish(json!({
                 "event": ty,
@@ -2645,16 +2798,24 @@ impl Control {
     /// service's audio to the endpoint (a G.711 endpoint's).
     fn native_stream_start(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
         let ep = self.endpoint(req)?;
-        let Some(dir) = self.native.pcm_dir.clone() else {
-            return Err(NativeError::new(
-                Code::Unsupported,
-                "PCM streams are not configured ([control] pcm_dir)",
-            ));
+        // A service's socket in pcm_dir; none: detectors only.
+        let name = req.str("socket");
+        let socket = match name {
+            Some(name) => {
+                let Some(dir) = self.native.pcm_dir.clone() else {
+                    return Err(NativeError::new(
+                        Code::Unsupported,
+                        "PCM streams are not configured ([control] pcm_dir)",
+                    ));
+                };
+                if !valid_name(name) || name.contains('/') || name.starts_with('.') {
+                    return Err(NativeError::invalid("socket: a file name in pcm_dir"));
+                }
+                Some(dir.join(name))
+            }
+            None => None,
         };
-        let name = req.need("socket")?;
-        if !valid_name(name) || name.contains('/') || name.starts_with('.') {
-            return Err(NativeError::invalid("socket: a file name in pcm_dir"));
-        }
+        let detect = detectors(req, crate::pcm::stream::VAD | crate::pcm::stream::DTMF)?;
         let rate = u32::try_from(req.u64("rate")?.unwrap_or(16_000)).unwrap_or(0);
         if !crate::pcm::frame::valid_rate(rate) {
             return Err(NativeError::invalid("rate: 8000, 16000, 24000 or 48000"));
@@ -2665,16 +2826,18 @@ impl Control {
                 "the endpoint has a stream already",
             ));
         }
-        let want_inject = req
-            .body
-            .get("inject")
-            .and_then(Json::as_bool)
-            .unwrap_or(true);
+        let want_inject = socket.is_some()
+            && req
+                .body
+                .get("inject")
+                .and_then(Json::as_bool)
+                .unwrap_or(true);
         let protocol = match req.u64("protocol")?.unwrap_or(1) {
             1 => 1,
             2 => 2,
             _ => return Err(NativeError::invalid("protocol: 1 or 2")),
         };
+        let socket_given = socket.is_some();
         let (leg, pt, codec, clock) = self.endpoint_audio(&ep)?;
         let inject = match crate::pcm::stream::encoder_for(codec) {
             Some(_) if want_inject => Some((pt, codec)),
@@ -2696,7 +2859,8 @@ impl Control {
         let id = self.native.next_stream;
         let spec = crate::pcm::stream::Spec {
             id,
-            socket: dir.join(name),
+            socket,
+            detect,
             rate,
             pt,
             codec,
@@ -2706,8 +2870,12 @@ impl Control {
             events: self.relay.media_event_sender(),
             subject: Subject::Leg(leg.0, leg.1),
         };
-        let (end, handle) = crate::pcm::stream::start(&spec)
-            .map_err(|e| NativeError::new(Code::Invalid, format!("socket {name}: {e}")))?;
+        let (end, handle) = crate::pcm::stream::start(&spec).map_err(|e| {
+            NativeError::new(
+                Code::Invalid,
+                format!("socket {}: {e}", name.unwrap_or("(none)")),
+            )
+        })?;
         if !self.relay.pcm_stream(leg, Some(end)).map_err(Error::from)? {
             handle.stop();
             return Err(NativeError::new(
@@ -2718,7 +2886,10 @@ impl Control {
         self.native.streams.insert(id, (ep.id.clone(), handle));
         log::info!("native: stream {id} on endpoint {} ({rate} Hz)", ep.id);
         self.confirm(&[&ep])?;
-        Ok(json!({"stream_id": id, "rate": rate, "inject": inject.is_some(), "protocol": protocol}))
+        Ok(
+            json!({"stream_id": id, "rate": rate, "inject": inject.is_some(), "protocol": protocol,
+            "service": socket_given, "detect": detect_json(detect)}),
+        )
     }
 
     /// `stream.flush` (barge-in: the audio queued for the endpoint goes)
@@ -2736,6 +2907,11 @@ impl Control {
             handle.flush();
             return Ok(json!({"flushed": true}));
         }
+        if req.op == "stream.detect" {
+            let d = detectors(req, handle.detectors())?;
+            handle.detect(d);
+            return Ok(json!({"detect": detect_json(d)}));
+        }
         handle.stop();
         self.native.streams.remove(&id);
         if let Some((leg, _)) = self
@@ -2749,6 +2925,26 @@ impl Control {
         }
         Ok(json!({"stopped": true}))
     }
+}
+
+/// The detectors a request asks for (`vad`, `dtmf`), from `current`.
+fn detectors(req: &Request<'_>, current: u8) -> Result<u8, NativeError> {
+    use crate::pcm::stream::{DTMF, VAD};
+    let mut d = current;
+    for (key, bit) in [("vad", VAD), ("dtmf", DTMF)] {
+        match req.body.get(key) {
+            None => {}
+            Some(Json::Bool(true)) => d |= bit,
+            Some(Json::Bool(false)) => d &= !bit,
+            Some(_) => return Err(NativeError::invalid(format!("{key}: true or false"))),
+        }
+    }
+    Ok(d)
+}
+
+fn detect_json(d: u8) -> Json {
+    use crate::pcm::stream::{DTMF, VAD};
+    json!({"vad": d & VAD != 0, "dtmf": d & DTMF != 0})
 }
 
 /// A PCM stream's mark or flush, on the wire.

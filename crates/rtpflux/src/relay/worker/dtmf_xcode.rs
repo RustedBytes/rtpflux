@@ -91,7 +91,17 @@ impl Worker {
         (at, len): (usize, usize),
         now: u64,
     ) -> bool {
-        if leg.is_rtcp() || matches!(decision, Decision::Drop(_)) {
+        // An authentic packet with nowhere to go (an endpoint not bridged
+        // yet, listening to an IVR) still has its keys reported.
+        if leg.is_rtcp()
+            || matches!(
+                decision,
+                Decision::Drop(
+                    rtpflux_core::relay::DropReason::NoLeg
+                        | rtpflux_core::relay::DropReason::WrongSource
+                )
+            )
+        {
             return false;
         }
         if let Some(Some(d)) = self.dtmf.get_mut(leg) {
@@ -100,6 +110,9 @@ impl Worker {
                 let finished = d.take_unsent();
                 self.report_dtmf(leg, finished);
             }
+        }
+        if matches!(decision, Decision::Drop(_)) {
+            return false;
         }
         // DTMF security first: what it lets through (or rewrites) may be
         // transcoded then.

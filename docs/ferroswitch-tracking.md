@@ -49,7 +49,7 @@ the evidence, and what is left. Updated with every step.
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | done |
 | 7. Fencing epochs issued by an ownership authority | P0-HA | done |
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | done |
-| 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | planned |
+| 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | done |
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | planned |
 | 11. Media graph, conference recovery | P2 | planned |
 | 12. Benchmarks against the baseline | all | planned |
@@ -391,3 +391,61 @@ Residual gaps:
 - A hung service cannot block a shard: every read and write is
   non-blocking. Only the hello is written blocking, at `stream.start`,
   with a 100 ms timeout.
+
+## Step 9: detectors, DTMF send, tones, playback queues, sensitive digits
+
+- `control/ivr.rs` composes what the relay already had:
+  - the worker's tone engine (RFC 4733 events or in-band tones; a sine
+    code for cadenced tones);
+  - file and blob playback;
+  - recording pause;
+  - the PCM shards' VAD and in-band DTMF.
+- New operations:
+  - `dtmf.send`, `tone.start`, `tone.stop`;
+  - `dtmf.policy` (`dedup` by default, `both`, `rfc4733`, `inband`);
+  - `endpoint.sensitive`;
+  - `stream.detect`, with `stream.start` taking no `socket` for
+    detectors only (no `pcm_dir` needed).
+- `playback.start` gains `queue` and `stop_on` (`dtmf`, `speech`).
+  Interruption happens in the relay; digit collection and timeouts stay
+  with the controller.
+- Sensitive digits. Every output path, and what covers it:
+
+  | Path | Coverage |
+  |---|---|
+  | Logs | The worker logged every key at `info`; it now logs that a key was pressed, at `debug`, without the digit, sensitive or not |
+  | Events | Subscribers without `sensitive: true` get `digit`/`code` `null` and `redacted: true`, live and on cursor replay |
+  | Recordings | Paused while sensitive, resumed after (only those it paused) |
+  | Bridged peer | Not covered (documented; `ng` `block DTMF` exists) |
+  | PCM service | Not covered: it hears the tones as audio (documented) |
+  | Event journal | In memory only; holds the digit for entitled subscribers |
+- Bug fixed: RFC 4733 keys from an endpoint not bridged to anyone (an IVR
+  leg) were never reported, because the worker skipped every dropped
+  packet. It now observes authentic packets dropped only for lack of a
+  destination, and still ignores unknown legs and wrong sources.
+
+Evidence (`tests/ivr.rs`):
+- `keys_and_tones_to_an_endpoint`:
+  - events with telephone-event, tones with `inband`;
+  - digits are not echoed;
+  - bad digits are refused;
+  - a cadenced tone plays and `tone.stop` silences it.
+- `detectors_policies_and_sensitive_digits`:
+  - a detector with no service or `pcm_dir`, VAD off: no speech events;
+  - one press, sent both in-band and as events, is reported once under
+    `dedup`, twice under `both`, once (`rfc4733`) under `rfc4733`;
+  - sensitive mode with a recording running: the recording pauses, the
+    trusted subscriber sees the digit, the plain one sees it redacted,
+    a cursor replay is redacted, and turning it off resumes;
+  - `stream.detect` turns VAD on and speech is detected.
+- `playback_queues_and_barge_in`:
+  - a queued playback starts after the first completes;
+  - a key stops a `stop_on: ["dtmf"]` playback and drops the queue
+    behind it.
+
+Residual gaps:
+- The test checks a recording's pause through the operation's reply and
+  the relay's recording state, not by inspecting the pcap. A
+  worker-confirmed pause boundary is step 10.
+- Tones and `dtmf.send` have no completion event; their reply gives the
+  duration.

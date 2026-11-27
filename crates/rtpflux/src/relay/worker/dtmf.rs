@@ -44,10 +44,8 @@ impl DtmfLeg {
     pub(super) fn finished(&mut self, f: Finished, slot: Slot) {
         let duration_ms = u32::try_from(u64::from(f.duration) * 1000 / u64::from(self.rate.max(1)))
             .unwrap_or(u32::MAX);
-        match rtpflux_core::dtmf::digit(f.code) {
-            Some(d) => log::info!("dtmf: slot {slot}: '{d}' ({duration_ms} ms)"),
-            None => log::info!("dtmf: slot {slot}: event {} ({duration_ms} ms)", f.code),
-        }
+        // Never the key: digits may be a PIN or a card number.
+        log::debug!("dtmf: slot {slot}: a key ({duration_ms} ms)");
         let event = DtmfEvent {
             code: f.code,
             ts: f.ts,

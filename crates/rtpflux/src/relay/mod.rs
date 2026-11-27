@@ -50,7 +50,7 @@ pub mod play;
 pub mod stream;
 pub mod taps;
 pub mod xcode;
-pub use worker::{Blocked, Blocks, Playing, QueryReply, ToneMode, Tones};
+pub use worker::{Blocked, Blocks, Playing, QueryReply, SILENCE, SINE, ToneMode, Tones};
 use worker::{Command, Event, LegInit, Media, Worker};
 
 /// `runtime.receive = "io_uring"`: each worker's provided buffers, as many

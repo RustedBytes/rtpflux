@@ -169,7 +169,9 @@ impl RtpCopy {
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub id: u32,
-    pub socket: std::path::PathBuf,
+    /// The service's socket; `None`: detectors only (VAD, in-band DTMF),
+    /// nothing sent anywhere.
+    pub socket: Option<std::path::PathBuf>,
     pub rate: u32,
     /// The payload type of the endpoint's audio (other packets, telephone
     /// events say, are not audio).
@@ -179,6 +181,8 @@ pub struct Spec {
     pub inject: Option<(Pt, Codec)>,
     /// 1, or 2 (flush generations).
     pub protocol: u8,
+    /// The detectors on at the start ([`VAD`], [`DTMF`]).
+    pub detect: u8,
     pub events: MediaEvents,
     pub subject: Subject,
 }
@@ -202,12 +206,19 @@ pub struct WorkerEnd {
     pub dropped: Arc<AtomicU64>,
 }
 
-/// The control side's handle on a stream: flush it, stop it.
+/// A detector of [`Spec::detect`]: voice activity.
+pub const VAD: u8 = 1;
+/// A detector of [`Spec::detect`]: in-band DTMF.
+pub const DTMF: u8 = 2;
+
+/// The control side's handle on a stream: flush it, switch its detectors,
+/// stop it.
 #[derive(Debug, Clone)]
 pub struct Handle {
     pub id: u32,
     flushes: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    detect: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Handle {
@@ -220,6 +231,17 @@ impl Handle {
     /// End the stream: its shard lets it go and closes its socket.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Switch the detectors ([`VAD`], [`DTMF`]); taken at the next tick.
+    pub fn detect(&self, detectors: u8) {
+        self.detect.store(detectors, Ordering::Relaxed);
+    }
+
+    /// The detectors on.
+    #[must_use]
+    pub fn detectors(&self) -> u8 {
+        self.detect.load(Ordering::Relaxed)
     }
 }
 
@@ -236,22 +258,10 @@ pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
             "rate or protocol",
         ));
     }
-    let mut sock = UnixStream::connect(&spec.socket)?;
-    sock.set_write_timeout(Some(Duration::from_millis(100)))?;
-    // Hello: the stream's id, rate and protocol.
-    let hello = Header {
-        version: spec.protocol,
-        kind: Kind::Hello,
-        discontinuity: false,
-        stream: spec.id,
-        seq: 0,
-        timestamp_ms: 0,
-        rate: spec.rate,
-        samples: 0,
-        generation: 0,
+    let sock = match &spec.socket {
+        Some(path) => Some(connect(spec, path)?),
+        None => None,
     };
-    sock.write_all(&hello.encode())?;
-    sock.set_nonblocking(true)?;
     let Some(receive) =
         super::receive::Receive::new(spec.codec, spec.clock, spec.rate, spec.pt.get())
     else {
@@ -268,7 +278,12 @@ pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
     let flushes = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
-    let (inject, worker_inject) = inject_for(spec)?;
+    let (inject, worker_inject) = if sock.is_some() {
+        inject_for(spec)?
+    } else {
+        (None, None)
+    };
+    let detect = Arc::new(std::sync::atomic::AtomicU8::new(spec.detect));
     let stream = Stream {
         spec: spec.clone(),
         sock,
@@ -300,6 +315,7 @@ pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
         flushes: Arc::clone(&flushes),
         dropped: Arc::clone(&dropped),
         stop: Arc::clone(&stop),
+        detect: Arc::clone(&detect),
         ended: false,
     };
     super::shard::submit(Box::new(stream))?;
@@ -316,8 +332,30 @@ pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
             id: spec.id,
             flushes,
             stop,
+            detect,
         },
     ))
+}
+
+/// The service's socket, said hello to (the stream's id, rate and
+/// protocol), then non-blocking.
+fn connect(spec: &Spec, path: &std::path::Path) -> std::io::Result<UnixStream> {
+    let mut sock = UnixStream::connect(path)?;
+    sock.set_write_timeout(Some(Duration::from_millis(100)))?;
+    let hello = Header {
+        version: spec.protocol,
+        kind: Kind::Hello,
+        discontinuity: false,
+        stream: spec.id,
+        seq: 0,
+        timestamp_ms: 0,
+        rate: spec.rate,
+        samples: 0,
+        generation: 0,
+    };
+    sock.write_all(&hello.encode())?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
 }
 
 /// The service's side of a stream that injects audio: the shard's, and
@@ -386,7 +424,8 @@ struct Inject {
 /// A stream, as its shard holds it.
 pub struct Stream {
     spec: Spec,
-    sock: UnixStream,
+    /// The service's socket (`None`: detectors only).
+    sock: Option<UnixStream>,
     receive: super::receive::Receive,
     vad: Vad,
     keys: Option<super::inband::Keys>,
@@ -410,6 +449,7 @@ pub struct Stream {
     flushes: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    detect: Arc<std::sync::atomic::AtomicU8>,
     ended: bool,
 }
 
@@ -475,14 +515,18 @@ impl Stream {
         self.fresh.clear();
         let elapsed = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(0);
         self.receive.pull(elapsed, &mut self.fresh);
+        let detect = self.detect.load(Ordering::Relaxed);
         for chunk in self.fresh.chunks(self.to.hz() as usize / 50) {
+            if detect & VAD == 0 {
+                break;
+            }
             match self.vad.frame(chunk) {
                 VadEvent::SpeechStarted => self.emit(MediaEventKind::SpeechStarted),
                 VadEvent::SpeechEnded => self.emit(MediaEventKind::SpeechEnded),
                 VadEvent::None => {}
             }
         }
-        if let Some(k) = &mut self.keys {
+        if let Some(k) = self.keys.as_mut().filter(|_| detect & DTMF != 0) {
             self.ended_keys.clear();
             k.feed(&self.fresh, &mut self.ended_keys);
             for key in &self.ended_keys {
@@ -497,8 +541,11 @@ impl Stream {
                 );
             }
         }
-        self.out.pending.extend_from_slice(&self.fresh);
-        self.frames_out();
+        // Detectors only: nothing to send.
+        if self.sock.is_some() {
+            self.out.pending.extend_from_slice(&self.fresh);
+            self.frames_out();
+        }
     }
 
     /// The header of a frame to the service.
@@ -552,8 +599,11 @@ impl Stream {
 
     /// Write what the service can take now; `false` when it is gone.
     fn write_out(&mut self) -> bool {
+        let Some(sock) = &mut self.sock else {
+            return true;
+        };
         while !self.out.buf.is_empty() {
-            match self.sock.write(&self.out.buf) {
+            match sock.write(&self.out.buf) {
                 Ok(0) => return false,
                 Ok(n) => {
                     self.out.buf.drain(..n);
@@ -590,7 +640,7 @@ impl Stream {
                 });
             }
         }
-        if self.spec.protocol == 2 {
+        if self.spec.protocol == 2 && self.sock.is_some() {
             // The acknowledgment: the new generation, and the audio sent
             // before it.
             let ack = self.header(
@@ -679,7 +729,10 @@ impl Stream {
                 Err(()) => return false,
             }
             // Not a whole frame yet: more from the socket.
-            match self.sock.read(&mut self.rbuf[self.rlen..]) {
+            let Some(sock) = &mut self.sock else {
+                break;
+            };
+            match sock.read(&mut self.rbuf[self.rlen..]) {
                 Ok(0) => return false,
                 Ok(n) => self.rlen += n,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
