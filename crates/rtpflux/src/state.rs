@@ -81,6 +81,9 @@ pub struct SavedNative {
     /// Recordings and what became of them.
     #[serde(default)]
     pub recordings: Vec<crate::control::native::Recording>,
+    /// Under `[ha]`: (resource id, tenant, ownership group).
+    #[serde(default)]
+    pub owned: Vec<(String, String, String)>,
 }
 
 /// A destroyed endpoint, remembered.

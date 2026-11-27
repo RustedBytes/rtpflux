@@ -86,6 +86,13 @@ strict_source = false
 ledger_retention = 86400
 ledger_quota = 100000
 
+# Exclusive controller ownership of the native API (fencing epochs signed
+# by an ownership authority); see docs/native-api.md.
+[ha]
+enabled = false
+# state = "/var/lib/rtpflux/ownership.json"
+# authority_keys = { k1 = "a secret of 32 characters or more" }
+
 # Threads and buffers, all allocated once at start-up.
 [runtime]
 # Media worker threads, one session shard each; 0 = one per CPU.

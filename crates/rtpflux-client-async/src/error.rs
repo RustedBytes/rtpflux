@@ -21,6 +21,10 @@ pub enum ErrorCode {
     /// The operation began before a restart of the relay and its outcome
     /// was not recorded: reconcile before trying again with a new key.
     UnknownOutcome,
+    /// Under the relay's `[ha]`: the request does not prove the current
+    /// ownership epoch (and owner token) of what it touches. Nothing was
+    /// done; claim the group again from the authority.
+    Fenced,
     /// A code this client does not know.
     Other(String),
 }
@@ -41,6 +45,7 @@ impl ErrorCode {
             "unavailable" => ErrorCode::Unavailable,
             "expired" => ErrorCode::Expired,
             "unknown_outcome" => ErrorCode::UnknownOutcome,
+            "fenced" => ErrorCode::Fenced,
             other => ErrorCode::Other(other.to_owned()),
         }
     }

@@ -177,6 +177,7 @@ gives).
 | `endpoint.list` | | `endpoints` (snapshots), `destroyed` (recent tombstones), `global_seq` |
 | `endpoint.lookup` | `external_id` | The live endpoint's snapshot (`state_of_id: "live"`), or the destroyed one's id, generation and reason (`state_of_id: "destroyed"`) while its tombstone is kept |
 | `endpoint.renew` | `endpoint_id`, `lease_ms` (optional) | `lease_ms` |
+| `ownership.claim` | `group`, `epoch`, `owner`, `lease_expires_unix_ms`, `key_id`, `signature` (see [Exclusive ownership](#exclusive-ownership-ha)) | `group`, `epoch`, `owner`, `lease_expires_unix_ms`, `previous_epoch`, `drained` |
 
 `options` are ng options for the operation (see
 [Options](control-protocol.md#options)), as JSON:
@@ -257,6 +258,78 @@ resynchronise. What does not come back:
 - PCM streams and mixers, which the client starts again;
 - DTLS associations: browser endpoints need a new handshake, as in
   [Operations](operations.md#restarts).
+
+### Exclusive ownership (`[ha]`)
+
+With several controllers, only one may change a call at a time, and one
+that lost a call (a partition, a pause) must not change it afterwards.
+Under `[ha]`, the relay enforces that with **fencing epochs**. The
+epochs are issued by the controllers' **ownership authority**, never by a
+controller.
+
+**Groups and grants.** The authority grants an ownership group (a call,
+say) to one controller at a time, each grant at a higher epoch. It signs
+the grant with a key it shares with the relay:
+
+```text
+signature = hex(HMAC-SHA256(key, "rtpflux-ownership-v1\n<tenant>\n<group>\n<epoch>\n<owner>\n<lease_expires_unix_ms>"))
+token     = hex(HMAC-SHA256(key, "rtpflux-ownership-token-v1\n<tenant>\n<group>\n<epoch>\n<owner>"))
+```
+
+The controller sends the grant as `ownership.claim`. The relay accepts it
+only when:
+- the signature verifies with the named key (constant-time comparison);
+- the lease is still running;
+- the epoch is not below the group's highest so far. The same epoch is
+  accepted only for the same owner, as a renewal that never shortens the
+  lease.
+
+The relay syncs the claim to disk (`[ha] state`) before acknowledging it.
+When the epoch rises, the reply says whether the media workers confirmed
+the previous owner's commands applied (`drained`). In any case nothing
+the previous owner sent can land after the new owner's commands: both go
+through the one control thread, and each worker applies its commands in
+order.
+
+**Every mutation** carries `"ownership": {"group", "epoch", "token"}`.
+The token is only the owner's, so an old controller cannot guess its way
+in by sending a higher epoch. A mutation is refused with `fenced`, and
+nothing is done, unless:
+- the epoch is the group's current one;
+- the lease is running;
+- the token is the current owner's;
+- every resource it touches (`endpoint_id`, `peer_endpoint_id`,
+  `mixer_id`, `stream_id`) belongs to a group it proves.
+
+A resource belongs to the group its creation proved (`endpoint.create`,
+`mixer.create`, `stream.start`). A bridge across groups (calls) also needs
+`"peer_ownership"` for the peer's group. Resources made before `[ha]` was
+enabled belong to no group, and no one can change them.
+
+Reads, `events.*` and `ownership.claim` itself need no proof. A refusal
+for ownership happens before the ledger, so it is never recorded and a
+retry with a fresh claim runs normally.
+
+**Fail closed.** With no claim, a lease that has run out, or a claims file
+that cannot be written, mutations are refused (`fenced`, or `unavailable`
+for the claim). Media already established keeps flowing.
+
+**After a restart** the relay remembers the epochs and which group owns
+each restored endpoint, so a stale controller is still refused.
+
+**Pruning.** A group whose lease is over and that owns nothing is
+forgotten. The highest epoch forgotten becomes the tenant's floor: a
+grant at or below it, for a group the relay does not know, is refused,
+whatever its lease. **The authority must therefore issue epochs from one
+rising sequence per tenant**, across all groups.
+
+**`ng`.** In this mode, an `ng` command cannot change a call that holds
+native endpoints (`call-id` or `to-call-id`). `ping`, `list`, `query` and
+`statistics` still answer. `ng` calls without native endpoints are not
+affected: isolate the `ng` port from controllers that must be fenced.
+
+**Tenants.** Grants are signed for a tenant, and a connection
+authenticated as another tenant cannot use them.
 
 ## Bridges
 

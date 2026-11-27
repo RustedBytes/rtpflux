@@ -47,7 +47,7 @@ the evidence, and what is left. Updated with every step.
 | 4. Replayable critical events with cursors | P0 | done |
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | done |
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | done |
-| 7. Fencing epochs issued by an ownership authority | P0-HA | planned |
+| 7. Fencing epochs issued by an ownership authority | P0-HA | done |
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | planned |
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | planned |
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | planned |
@@ -259,3 +259,58 @@ here; not changed.
 
 Not covered yet: attended transfer (`Replaces`), early media (183), and
 UPDATE. These are left for step 11's media graph work, or later.
+
+## Step 7: P0-HA fencing
+
+Design: grants are HMAC-SHA256 signatures from an ownership authority.
+The relay keeps the highest epoch per tenant/group, synced to disk. Every
+mutation must prove three things: the epoch, a running lease, and the
+owner's token, a second signature issued to the owner alone. Each touched
+resource must belong to a proven group. See docs/native-api.md
+"Exclusive ownership".
+
+Requirement placed on Ferroswitch: one rising epoch sequence per tenant,
+across groups. That lets the relay prune old groups safely, through a
+per-tenant floor.
+
+Bug found while testing: proofs carried only `{group, epoch}`. A stale
+controller could have guessed the next epoch. Proofs now carry the owner
+token.
+
+Evidence:
+- `control/ownership.rs` unit tests:
+  - epochs only rise;
+  - same epoch for another owner: conflict;
+  - a renewal never shortens the lease;
+  - forged signature, unknown key, or another tenant's signature:
+    refused;
+  - an expired lease is refused;
+  - a guessed epoch without the token is refused;
+  - claims survive a restart;
+  - pruning raises the floor, and an old grant with a running lease
+    cannot come back;
+  - a corrupt file is an error, and the relay does not start.
+- `tests/ha.rs` `fencing_by_authority_epochs`, end to end:
+  - with no claim, mutations are refused;
+  - a forged grant is refused;
+  - another group's proof does not cover an endpoint;
+  - after a handoff the stale controller is refused, even with a
+    matching generation;
+  - a guessed epoch is refused;
+  - self-promotion is refused (an old grant, or the same epoch);
+  - a bridge across calls needs `peer_ownership` at the current epoch;
+  - another tenant cannot use a grant;
+  - an `ng` delete on a native call is refused, while `query` works;
+  - after a restart the stale controller is still refused and the
+    current owner continues;
+  - an expired lease fails closed until it is renewed;
+  - a replayed expired grant is refused.
+
+Residual gaps:
+- The async SDK knows `fenced`, but its typed requests have no
+  `ownership` field yet; use `MediaClient::call` in HA mode.
+- Mixer and stream membership check only the ids named in a request.
+  `mixer.add` names the endpoint, so it is covered; pending worker
+  operations are covered by the control-thread ordering argument above.
+- Partition is modelled as a stale controller (an old epoch, or no
+  token). There is no network-level partition test.

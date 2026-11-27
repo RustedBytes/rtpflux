@@ -200,6 +200,28 @@ ledger_quota = 100000                        # operation keys kept per tenant
   cannot open its ledger does not start. See
   [Operation keys and the ledger](native-api.md#operation-keys-and-the-ledger).
 
+## `[ha]`: exclusive controller ownership
+
+```toml
+[ha]
+enabled = false
+state = "/var/lib/rtpflux/ownership.json"    # accepted claims, synced
+authority_keys = { k1 = "…" }                # key id → HMAC-SHA256 secret
+```
+
+- **`enabled`**: fencing of the native API. Every mutation must prove
+  three things for the groups of the resources it touches: the current
+  ownership epoch, a running lease, and the owner's token. Grants come
+  from an ownership authority that signs them with one of
+  `authority_keys`. `ng` cannot change a call holding native endpoints;
+  it can still read it.
+- **`state`**: the highest epoch accepted per group, synced before a claim
+  is acknowledged. A relay that cannot read it does not start.
+- **`authority_keys`**: each at least 32 characters. Several keys allow
+  rotation: a claim names its `key_id`.
+
+See [Exclusive ownership](native-api.md#exclusive-ownership-ha).
+
 ## `[runtime]`: threads and buffers
 
 Everything here is allocated once at start-up; nothing grows while calls

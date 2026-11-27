@@ -333,6 +333,12 @@ pub enum StartError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    /// The ownership claims (`[ha] state`) cannot be read: without the
+    /// epochs it accepted, an old controller could come back.
+    Ownership {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     /// The native API's socket cannot be made.
     Native {
         path: std::path::PathBuf,
@@ -353,6 +359,9 @@ impl std::fmt::Display for StartError {
             StartError::Ledger { path, source } => {
                 write!(f, "sessions.ledger: {}: {source}", path.display())
             }
+            StartError::Ownership { path, source } => {
+                write!(f, "ha.state: {}: {source}", path.display())
+            }
             StartError::Native { path, source } => {
                 write!(f, "control.native_socket: {}: {source}", path.display())
             }
@@ -367,7 +376,8 @@ impl std::error::Error for StartError {
             StartError::Listen { source, .. }
             | StartError::Thread { source, .. }
             | StartError::Native { source, .. }
-            | StartError::Ledger { source, .. } => Some(source),
+            | StartError::Ledger { source, .. }
+            | StartError::Ownership { source, .. } => Some(source),
             StartError::Link { source, .. } => Some(source),
             StartError::WebUiLogin(e) => Some(e),
         }
@@ -475,6 +485,19 @@ fn start_native(
                 source,
             })?;
         log::info!("native: operation ledger in {}", path.display());
+    }
+    if let (true, Some(path)) = (config.ha.enabled, &config.ha.state) {
+        control
+            .open_ownership(path, &config.ha.authority_keys)
+            .map_err(|source| StartError::Ownership {
+                path: path.clone(),
+                source,
+            })?;
+        log::info!(
+            "native: ownership fencing on ({} authority keys), claims in {}",
+            config.ha.authority_keys.len(),
+            path.display()
+        );
     }
     control.set_pcm_dir(c.pcm_dir.clone());
     let link = control.native_link().map_err(|source| StartError::Link {

@@ -274,6 +274,12 @@ impl Control {
     pub(super) fn saved_native_extra(&self, saved: &mut crate::state::SavedNative) {
         let n = &self.native;
         saved.boot_id = Some(n.boot_id.clone());
+        saved.owned = n
+            .owned
+            .iter()
+            .filter(|(id, _)| n.endpoints.contains_key(*id))
+            .map(|(id, (t, g))| (id.clone(), t.clone(), g.clone()))
+            .collect();
         saved.streams = n
             .streams
             .iter()
@@ -294,6 +300,11 @@ impl Control {
     pub(super) fn restore_native_extra(&mut self, saved: &crate::state::SavedNative) {
         let n = &mut self.native;
         n.previous_boot.clone_from(&saved.boot_id);
+        // Restored endpoints keep their group (streams and mixers are not
+        // restored).
+        for (id, t, g) in &saved.owned {
+            n.owned.insert(id.clone(), (t.clone(), g.clone()));
+        }
         for (id, tenant, ep) in &saved.streams {
             n.lost
                 .push(json!({"kind": "stream", "stream_id": id, "tenant": tenant,

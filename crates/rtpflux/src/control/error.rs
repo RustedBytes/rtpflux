@@ -36,6 +36,9 @@ pub enum RequestError {
     TooLarge,
     /// A publish whose offer or answer cannot be made.
     BadPublish,
+    /// Under `[ha]`, a command that would change a session holding native
+    /// endpoints: only their owner, through the native API, may.
+    Protected,
     /// `play media` without `file` or `blob`.
     PlayNeedsFile,
     /// A `file` that is not UTF-8.
@@ -107,6 +110,9 @@ impl fmt::Display for RequestError {
             }
             RequestError::TooLarge => f.write_str("request too large"),
             RequestError::BadPublish => f.write_str("publish: bad request"),
+            RequestError::Protected => f.write_str(
+                "the call's endpoints are owned through the native API ([ha]): ng cannot change it",
+            ),
             RequestError::PlayNeedsFile => f.write_str("play media needs file or blob"),
             RequestError::FileNotUtf8 => f.write_str("file: not UTF-8"),
             RequestError::PlayNeedsListener => {

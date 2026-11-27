@@ -40,6 +40,25 @@ pub struct Config {
     pub recording: Recording,
     #[serde(default)]
     pub ice: Ice,
+    #[serde(default)]
+    pub ha: Ha,
+}
+
+/// `[ha]`: exclusive controller ownership (fencing). When enabled, every
+/// native mutation must prove a current ownership epoch for the resources
+/// it touches. Epochs are issued and signed by an ownership authority (the
+/// controller's, not a controller), and `ng` cannot change a session that
+/// holds native endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Ha {
+    pub enabled: bool,
+    /// Where the accepted claims are kept (synced before a claim is
+    /// acknowledged).
+    pub state: Option<PathBuf>,
+    /// The authority's keys: key id → HMAC-SHA256 secret (32 characters
+    /// or more). Several allow rotating them.
+    pub authority_keys: std::collections::BTreeMap<String, String>,
 }
 
 /// The relay's ICE agent towards endpoints that use ICE.
@@ -531,6 +550,9 @@ pub enum Problem {
     /// `sessions.ledger` without `sessions.state_file`, or a retention or
     /// quota of 0.
     Ledger,
+    /// `ha.enabled` without `ha.state`, without a key, or with a key
+    /// shorter than 32 characters.
+    Ha,
     NoInterface,
     IcePacing,
     /// `ice.stun_server` that is not host:port.
@@ -609,6 +631,9 @@ impl fmt::Display for Problem {
             Problem::NoControlListen => {
                 f.write_str("control.listen: at least one endpoint is required")
             }
+            Problem::Ha => f.write_str(
+                "ha: needs ha.state, and ha.authority_keys with each key of 32 characters or more",
+            ),
             Problem::Ledger => f.write_str(
                 "sessions.ledger: needs sessions.state_file, and a ledger_retention and ledger_quota above 0",
             ),
@@ -789,6 +814,13 @@ impl Config {
                 || self.sessions.ledger_quota == 0)
         {
             problems.push(Problem::Ledger);
+        }
+        if self.ha.enabled
+            && (self.ha.state.is_none()
+                || self.ha.authority_keys.is_empty()
+                || self.ha.authority_keys.values().any(|k| k.len() < 32))
+        {
+            problems.push(Problem::Ha);
         }
         if (!self.control.native_listen.is_empty() && self.control.native_tokens.is_empty())
             || self.control.native_tokens.values().any(|t| t.len() < 16)

@@ -55,8 +55,9 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 31] = [
+pub const OPERATIONS: [&str; 32] = [
     "hello",
+    "ownership.claim",
     "endpoint.create",
     "endpoint.apply_answer",
     "endpoint.prepare",
@@ -132,6 +133,9 @@ pub enum Code {
     /// The operation began before a restart and its outcome was never
     /// recorded: it may or may not have taken effect.
     UnknownOutcome,
+    /// Under `[ha]`: the request does not prove the current ownership
+    /// epoch of what it touches (or no lease is running). Nothing was done.
+    Fenced,
 }
 
 impl Code {
@@ -149,6 +153,7 @@ impl Code {
             Code::Unavailable => "unavailable",
             Code::Expired => "expired",
             Code::UnknownOutcome => "unknown_outcome",
+            Code::Fenced => "fenced",
         }
     }
 }
@@ -425,6 +430,11 @@ pub struct Native {
     pub(super) external_tombs: HashMap<(String, String), String>,
     /// What became of keyed operations (durable with `[sessions] ledger`).
     pub(super) ledger: super::ledger::Ledger,
+    /// Ownership fencing (`[ha]`).
+    pub(super) ha: Option<super::ownership::Ownership>,
+    /// Under `[ha]`: resource id (an endpoint's, `mixer_id:N`,
+    /// `stream_id:N`) → the (tenant, group) owning it.
+    pub(super) owned: HashMap<String, (String, String)>,
     subscribers: Vec<(u64, Subscriber)>,
     next_subscription: u64,
     /// This run's id (`boot-` and 32 hex digits), and the previous run's.
@@ -811,6 +821,12 @@ impl Control {
         if let Err(e) = Self::precheck(&req) {
             return serde_json::to_vec(&reply(req.operation_id, Err(e))).unwrap_or_default();
         }
+        // Under `[ha]`: refused unless it proves the current epoch of what
+        // it touches (definitely not executed, never recorded).
+        if let Err(e) = self.fence(&req) {
+            log::debug!("native {}: {}", req.op, e.message);
+            return serde_json::to_vec(&reply(req.operation_id, Err(e))).unwrap_or_default();
+        }
         let key = body
             .get("idempotency_key")
             .and_then(Json::as_str)
@@ -824,6 +840,7 @@ impl Control {
             }
             reply(req.operation_id, outcome)
         };
+        self.record_owned(&req, &r);
         let out = serde_json::to_vec(&r).unwrap_or_default();
         if mutates(req.op) {
             self.native.topology_epoch += 1;
@@ -1029,6 +1046,7 @@ impl Control {
             "endpoint.create" => self.native_create(req),
             "endpoint.apply_answer" => self.native_apply_answer(req),
             "endpoint.prepare" => self.native_prepare(req),
+            "ownership.claim" => self.native_claim(req),
             "endpoint.commit" => self.native_commit(req),
             "endpoint.abort" => self.native_abort(req),
             "endpoint.destroy" => self.native_destroy(req),
@@ -1142,6 +1160,7 @@ impl Control {
                 "state_commit": if self.native.ledger.durable() { "synced_before_reply" } else { "periodic" },
                 "events": "replayable_within_journal",
                 "event_journal": self.native.journal_cap,
+                "fencing": if self.native.ha.is_some() { "authority_epochs" } else { "none" },
             },
             "limits": {
                 "retention_ms": RETENTION.as_millis(),
@@ -2935,7 +2954,7 @@ type EndpointAudio = (
 
 /// Whether operation `op` changes anything (only such operations are
 /// recorded in the ledger).
-fn mutates(op: &str) -> bool {
+pub(super) fn mutates(op: &str) -> bool {
     !matches!(
         op,
         "hello"
@@ -2952,7 +2971,7 @@ fn mutates(op: &str) -> bool {
 }
 
 /// The resources a result names (their ids).
-fn resource_refs(result: &Json) -> Vec<String> {
+pub(super) fn resource_refs(result: &Json) -> Vec<String> {
     [
         "endpoint_id",
         "bridged_to",

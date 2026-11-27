@@ -49,6 +49,7 @@ mod media;
 pub mod native;
 mod offer;
 mod opts;
+pub mod ownership;
 mod parties;
 mod pending;
 mod persist;
@@ -673,6 +674,7 @@ impl Control {
         self.native_reconcile("ended");
         self.native_media_events();
         self.native_flush_gaps();
+        self.ownership_prune();
         let ended = self.relay.take_ended();
         if ended.is_empty() {
             return;
@@ -864,7 +866,11 @@ impl Control {
         let call_id = String::from_utf8_lossy(msg.body.get_bytes(b"call-id").unwrap_or_default())
             .into_owned();
         self.warnings.clear();
-        let outcome = self.dispatch(command, &msg.body);
+        let outcome = if self.ng_protected(command, &msg.body) {
+            Err(Error::Request(RequestError::Protected))
+        } else {
+            self.dispatch(command, &msg.body)
+        };
         // Endpoints of the native API an `ng` command ended.
         self.native_reconcile("ended");
         self.link_gauges();
