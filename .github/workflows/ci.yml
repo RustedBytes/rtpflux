@@ -142,6 +142,34 @@ jobs:
       - name: xdp-e2e
         run: ./scripts/xdp-e2e.sh
 
+  ferroswitch:
+    name: ferrosip sip-ua B2BUA + async SDK + rtpflux
+    runs-on: ubuntu-24.04
+    env:
+      # The same read-only token as the integration job; without it the
+      # test is skipped.
+      FERROSIP_TOKEN: ${{ secrets.FERROSIP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      # rustup reads rust-toolchain.toml.
+      - run: rustup toolchain install
+      - id: ferrosip
+        run: echo "rev=$(grep -o 'rev = "[0-9a-f]*"' integration/ferroswitch/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      # sip-ua's commit (pinned in Cargo.toml and Cargo.lock), served to
+      # cargo from a local clone (FERROSIP_REPO).
+      - if: env.FERROSIP_TOKEN != ''
+        uses: actions/checkout@v7
+        with:
+          repository: RustedBytes/ferrosip
+          ref: ${{ steps.ferrosip.outputs.rev }}
+          path: ferrosip-mirror
+          token: ${{ secrets.FERROSIP_TOKEN }}
+          fetch-depth: 0
+      - run: integration/ferroswitch/run.sh
+        env:
+          FERROSIP_REPO: ${{ env.FERROSIP_TOKEN != '' && format('{0}/ferrosip-mirror', github.workspace) || '' }}
+          REQUIRE_FERROSIP: ${{ env.FERROSIP_TOKEN != '' && '1' || '' }}
+
   integration:
     name: Kamailio, FreeSWITCH, ferrosip and ZRTP integration
     runs-on: ubuntu-24.04

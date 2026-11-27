@@ -46,7 +46,7 @@ the evidence, and what is left. Updated with every step.
 | 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | done |
 | 4. Replayable critical events with cursors | P0 | done |
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | done |
-| 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | planned |
+| 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | done |
 | 7. Fencing epochs issued by an ownership authority | P0-HA | planned |
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | planned |
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | planned |
@@ -220,3 +220,42 @@ Evidence:
     deadline.
 - `rtpflux/tests/native.rs` `fragmented_and_oversized_frames`: a request
   written one octet at a time, and a frame over 1 MiB.
+
+## Step 6: cross-repository test
+
+`integration/ferroswitch` is a crate outside the workspace, so the
+workspace builds without the private repository. Its pieces:
+- `sip-ua` from ferrosip, pinned by `rev` 60b20fc in its Cargo.toml and
+  Cargo.lock;
+- a B2BUA on simulated SIP engines;
+- an in-process rtpflux with a durable ledger, driven through
+  `rtpflux-client-async`;
+- real RTP between UDP sockets.
+
+The B2BUA creates one endpoint per leg. The relay answers each side's
+re-offers itself, and the B2BUA bridges the legs.
+
+The CI job `ferroswitch` checks ferrosip out at the pinned rev using the
+`FERROSIP_TOKEN` secret. It runs with `REQUIRE_FERROSIP=1`, and is skipped
+without the token.
+
+Evidence (`tests/b2bua.rs`, 4 tests):
+
+| Test | What it covers |
+|---|---|
+| `early_offer_hold_resume_and_bye` | media both ways; the callee's sendonly/sendrecv re-offers are answered recvonly/sendrecv on the same relay port; media both ways after the resume |
+| `delayed_offer_and_bye_from_the_caller` | the relay offers in the 2xx, and the caller's answer arrives in the ACK |
+| `a_refused_renegotiation_is_rolled_back` | a PCMA re-offer to the caller is refused; `endpoint.abort` leaves the revision unchanged; media flows |
+| `blind_transfer_to_a_third_party` | REFER; the target is bridged to the callee, the referrer's leg is released |
+
+Every test ends with the checks after BYE: each endpoint is destroyed
+and reported by event, the inventory is empty, and the recovery report
+lists no unknown operations.
+
+Deviation found: the relay does not refuse a re-offer with an unknown
+codec, or with no media. It passes them through, as rtpengine does. A
+softswitch that must refuse those has to check the SDP itself. Recorded
+here; not changed.
+
+Not covered yet: attended transfer (`Replaces`), early media (183), and
+UPDATE. These are left for step 11's media graph work, or later.

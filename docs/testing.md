@@ -135,6 +135,28 @@ checked secure end to end. See [Integration](integration.md#the-test-bench).
 integration/run.sh
 ```
 
+`integration/ferroswitch/run.sh` tests a softswitch's view of the native
+API. ferrosip's `sip-ua` engines (caller, B2BUA, callee, transfer target)
+run on a deterministic simulated SIP network. The B2BUA anchors each leg
+in an in-process rtpflux through `rtpflux-client-async`, and real RTP
+crosses the relay. Scenarios:
+- an early and a delayed offer;
+- hold and resume (answered by the relay on the same port);
+- a renegotiation the remote side refuses (rolled back with
+  `endpoint.abort`, media unchanged);
+- a blind transfer;
+- after every BYE: an empty inventory, an `endpoint.destroyed` event for
+  each endpoint, and no unknown operations.
+
+`sip-ua` is a git dependency pinned by `rev` (ferrosip is private: SSH,
+or `FERROSIP_REPO` for a mirror or a local clone). Without access the test
+is skipped, unless `REQUIRE_FERROSIP=1`.
+
+```sh
+integration/ferroswitch/run.sh
+FERROSIP_REPO=../ferrosip integration/ferroswitch/run.sh
+```
+
 ## 5. The kernel fast path
 
 These need root; see [XDP fast path](xdp.md#testing-it).

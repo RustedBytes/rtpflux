@@ -1,0 +1,4 @@
+# ferrosip is private: fetch it with git itself, so SSH keys and
+# url.<base>.insteadOf (run.sh, FERROSIP_REPO) apply.
+[net]
+git-fetch-with-cli = true

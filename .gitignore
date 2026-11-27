@@ -7,6 +7,7 @@
 # Integration bench logs (integration/run.sh)
 /integration/out/
 /integration/ferrosip-src/
+/integration/ferroswitch/target/
 
 # Python bytecode (scripts/, examples/scenarios/)
 __pycache__/
