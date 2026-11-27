@@ -9,9 +9,14 @@ which stays exactly as it is. Both run on the same handlers, so an
 endpoint is also a party that ng commands such as `query` can see. The
 design is in [ADR 0001](adr/0001-native-control-api.md).
 
-A Rust client is in the workspace:
-[`rtpflux-client`](https://github.com/RustedBytes/rtpflux/tree/main/crates/rtpflux-client).
-Its `fixtures/` directory holds example sessions, request by request.
+Two Rust clients are in the workspace:
+- [`rtpflux-client-async`](https://github.com/RustedBytes/rtpflux/tree/main/crates/rtpflux-client-async),
+  on Tokio, is for a softswitch's call control. It has typed requests and
+  replies, a pool of connections, bounded queues, deadlines, cancellation,
+  reconnect, and events on a connection of their own.
+- [`rtpflux-client`](https://github.com/RustedBytes/rtpflux/tree/main/crates/rtpflux-client)
+  is blocking, for tools and prototypes. Its `fixtures/` directory holds
+  example sessions, request by request.
 
 ## Connecting
 

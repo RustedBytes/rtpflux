@@ -25,6 +25,13 @@ if let Some(ev) = c.wait_event("dtmf.detected", Duration::from_secs(10))? {
 Over TCP, `Client::connect_tcp(addr, token)` connects and authenticates
 with a tenant's token.
 
+This client blocks. Use it for tools, tests and prototypes; a softswitch's
+call control should use the async client, `rtpflux-client-async`. Each
+request waits at most `DEFAULT_REQUEST_TIMEOUT` (10 s), which
+`set_request_timeout` changes. A request that times out retires the
+connection: its reply may still come and would be taken for the next
+request's, so connect again.
+
 `call` returns the operation's `result`, or `ClientError::Refused` with the
 relay's error code (`not_found`, `conflict`, …). Events that arrive while
 waiting for a reply are kept for `next_event` and `wait_event`.

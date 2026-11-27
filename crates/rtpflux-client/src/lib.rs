@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 
 /// The protocol version this client speaks.
 pub const VERSION: u64 = 1;
+/// How long a request waits for its reply, unless set otherwise.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The largest message, either way.
 pub const MAX_MESSAGE: usize = 1 << 20;
 
@@ -85,6 +88,11 @@ pub struct Client {
     events: VecDeque<Value>,
     /// The tenant named in every request, if set.
     tenant: Option<String>,
+    /// How long a request waits for its reply (`None`: no limit).
+    request_timeout: Option<Duration>,
+    /// A request timed out: its reply may still come and be taken for the
+    /// next one's, so the connection is not used again.
+    poisoned: bool,
 }
 
 /// The connection: a Unix socket or TCP.
@@ -150,6 +158,8 @@ impl Client {
             next_operation: 0,
             events: VecDeque::new(),
             tenant: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            poisoned: false,
         })
     }
 
@@ -170,9 +180,19 @@ impl Client {
             next_operation: 0,
             events: VecDeque::new(),
             tenant: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            poisoned: false,
         };
         c.call("auth", json!({ "token": token }))?;
         Ok(c)
+    }
+
+    /// How long each request waits for its reply ([`DEFAULT_REQUEST_TIMEOUT`]
+    /// unless set; `None`: no limit). A request that times out leaves the
+    /// connection unusable (its late reply would be taken for the next
+    /// request's): connect again.
+    pub fn set_request_timeout(&mut self, timeout: Option<Duration>) {
+        self.request_timeout = timeout;
     }
 
     /// Name `tenant` in every request from now on.
@@ -187,10 +207,27 @@ impl Client {
     ///
     /// When the connection fails or the reply is not the protocol.
     pub fn raw(&mut self, request: &Value) -> Result<Value, ClientError> {
-        self.stream.set_read_timeout(None)?;
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "an earlier request timed out: connect again".into(),
+            ));
+        }
+        self.stream.set_read_timeout(self.request_timeout)?;
         self.stream.write_all(&frame(request)?)?;
         loop {
-            let m = self.read_message()?;
+            let m = match self.read_message() {
+                Ok(m) => m,
+                Err(ClientError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.poisoned = true;
+                    return Err(ClientError::Io(std::io::ErrorKind::TimedOut.into()));
+                }
+                Err(e) => return Err(e),
+            };
             if m.get("event").is_some() {
                 self.events.push_back(m);
             } else {
@@ -335,6 +372,32 @@ mod tests {
             }
         }
         assert!(n > 10);
+    }
+
+    /// A relay that never answers: the request times out, and the
+    /// connection is not used again (a late reply would be misread).
+    #[test]
+    fn a_request_times_out_and_the_connection_is_retired() {
+        let dir = std::env::temp_dir().join(format!("rtpflux-client-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mute.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut c = Client::connect(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        c.set_request_timeout(Some(Duration::from_millis(100)));
+        let started = Instant::now();
+        let e = c.call("hello", Value::Null).unwrap_err();
+        assert!(
+            matches!(&e, ClientError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut),
+            "{e}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            c.call("hello", Value::Null),
+            Err(ClientError::Protocol(_))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

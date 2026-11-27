@@ -103,6 +103,7 @@ threads or clocks:
 | [`rtpflux-uring`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-uring/README.md) | `io_uring` multishot UDP receive for the media workers, with its benchmark | `std` |
 | [`rtpflux`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux/README.md) | The daemon: configuration, sockets, threads, DTLS, recordings, state file and Redis, metrics, web UI | `std` |
 | [`rtpflux-client`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-client/README.md) | A client of the native control API, for a softswitch | `std`, only `serde_json` |
+| [`rtpflux-client-async`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-client-async/README.md) | The async (Tokio) client of the native API, for production call control: typed requests, a connection pool, deadlines, reconnect, events on their own connection | `std`, `tokio` |
 | [`rtpflux-bench`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-bench/README.md) | The load generator used by the benchmarks | `std` |
 
 Each crate's README explains why it is separate and what is in it.
