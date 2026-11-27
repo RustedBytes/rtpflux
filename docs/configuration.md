@@ -234,6 +234,7 @@ batch = 32             # packets per receive/send system call (1 to 64)
 ring_capacity = 4096   # packet slots per worker (a power of two)
 packet_buffer = 2048   # bytes per packet buffer (1500 to 65535)
 receive = "io_uring"   # or "recvmmsg"
+pcm_shards = 0         # threads serving every PCM stream; 0 = one per CPU, at most 4
 ```
 
 The defaults suit most systems. A smaller `workers` value leaves CPUs for
@@ -250,6 +251,9 @@ other services on the same host.
   does not allow it: in a container, see
   [Getting started](getting-started.md#5b-or-run-it-in-a-container). It costs the buffers' memory (9 MB per worker with the
   defaults).
+- `pcm_shards`: the threads that serve PCM streams (`stream.start`).
+  Each serves many streams, and a stream stays on one, so there are no
+  threads per stream. See [PCM streams](native-api.md#pcm-streams).
 - `recvmmsg`: epoll says which sockets have datagrams, and each is read in
   batches of up to `batch`, one system call per socket per batch. With
   many calls, each socket has a packet or two at a time, so that is about

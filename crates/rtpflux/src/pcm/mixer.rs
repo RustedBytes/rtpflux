@@ -234,6 +234,7 @@ impl MixerHandle {
             fork: fork_tx,
             inject: Some((inject_rx, p.pt, p.clock)),
             played: Arc::new(AtomicU64::new(0)),
+            consumed: Arc::new(AtomicU64::new(0)),
             flushes: Arc::new(AtomicU64::new(0)),
             dropped,
         })

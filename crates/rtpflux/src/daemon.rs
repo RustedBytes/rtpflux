@@ -500,6 +500,7 @@ fn start_native(
         );
     }
     control.set_pcm_dir(c.pcm_dir.clone());
+    crate::pcm::shard::configure(config.runtime.pcm_shards);
     let link = control.native_link().map_err(|source| StartError::Link {
         what: "the native API",
         source,

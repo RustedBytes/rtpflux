@@ -1,46 +1,63 @@
-//! A PCM stream's two threads, between a media worker and an external
-//! audio service's Unix socket (see [`super::frame`] for the frames).
+//! A PCM stream, between a media worker and an external audio service's
+//! Unix socket (see [`super::frame`] for the frames).
 //!
 //! The worker does no signal processing for a stream: it copies what the
 //! endpoint sends (RTP payloads) into a bounded queue ([`FORK_QUEUE`]),
-//! dropping and counting when it is full, and plays 20 ms G.711 frames it
-//! takes from another ([`INJECT_QUEUE`]), as it plays an announcement.
-//! Everything else happens here, on the stream's own threads:
+//! dropping and counting when it is full, and plays 20 ms frames it takes
+//! from another ([`INJECT_QUEUE`]), as it plays an announcement.
 //!
-//! - **To the service** (the *fork* thread): a jitter buffer (40 ms target
-//!   delay, reordering and duplicates handled), the endpoint's decoder,
-//!   loss concealment, resampling to the stream's rate, voice activity
-//!   detection (`speech.started`/`speech.ended` events), then 20 ms audio
-//!   frames. A service that reads too slowly loses frames (never more than
-//!   [`WRITE_TIMEOUT`] of waiting each), told by a gap frame.
-//! - **From the service** (the *inject* thread): its audio frames,
-//!   resampled to 8 kHz and encoded in G.711, into the worker's queue: a
-//!   full queue blocks this thread only, which stops reading the socket
-//!   (the service's writes then wait: backpressure, bounded memory). A
-//!   flush (`stream.flush`, or a flush frame) drops what is queued
-//!   (barge-in). A mark is answered (`stream.mark`) once the audio before
-//!   it has played.
+//! Everything else runs on a **PCM shard** ([`super::shard`]): a few
+//! threads, each serving many streams through one epoll loop, a stream
+//! always on the same shard. There are no threads per stream. Every 20 ms a
+//! shard ticks each of its streams; when a service's socket is readable
+//! it reads that service.
+//!
+//! - **To the service**: a jitter buffer (40 ms target delay, reordering
+//!   and duplicates handled), the endpoint's decoder, loss concealment,
+//!   resampling to the stream's rate, voice activity detection
+//!   (`speech.started`/`speech.ended`) and in-band DTMF, then 20 ms audio
+//!   frames into a bounded write buffer ([`WRITE_BUFFER`]). A service that
+//!   reads too slowly loses frames, which a gap frame reports. Nothing
+//!   ever waits for it.
+//! - **From the service**: its audio, resampled and encoded in the
+//!   endpoint's codec, into the worker's queue. When that queue is full
+//!   the shard stops reading the socket (backpressure, bounded memory):
+//!   the service's writes wait, other streams do not. A flush
+//!   (`stream.flush`, or a flush frame) starts a new **generation**.
+//!   Everything queued is dropped, and frames made before the flush are
+//!   dropped by the worker even if they were already on their way. Marks
+//!   still waiting are answered as flushed, and the flush is reported
+//!   (`stream.flushed`; with protocol 2, a flush frame to the service).
+//!   With protocol 2, late audio of an older generation is dropped and
+//!   counted, and a late mark is answered as flushed. A mark is answered (`stream.mark`) once the audio before it
+//!   has been sent to the endpoint as RTP.
 
-use super::frame::{self, FrameError, HEADER, Header, Kind};
+use super::frame::{self, HEADER, Header, Kind};
 use crate::relay::media_events::{MediaEventKind, MediaEvents, Subject};
 use rtpflux_core::dsp::Rate;
 use rtpflux_core::dsp::resample::Resampler;
 use rtpflux_core::dsp::vad::{Vad, VadEvent};
 use rtpflux_core::rtp::Pt;
 use rtpflux_core::sdp::Codec;
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
-/// RTP packets the worker queues for the fork thread, at most.
+/// RTP packets the worker queues for the stream, at most.
 pub const FORK_QUEUE: usize = 64;
 /// 20 ms frames queued for the worker to play, at most (100 ms).
 pub const INJECT_QUEUE: usize = 5;
-/// The longest a write to the service may wait.
-pub const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+/// Octets waiting to be written to a service, at most (12 frames: 240 ms
+/// of audio): beyond, frames are dropped and counted (a gap frame says
+/// how many), and the shard never waits for a slow service.
+pub const WRITE_BUFFER: usize = 12 * frame::MAX_FRAME;
+/// Frames taken from one service per wake-up, at most: a busy service
+/// does not starve the others of its shard.
+const READS_PER_PASS: usize = 8;
 /// The largest RTP payload copied.
 pub const MAX_PAYLOAD: usize = 1500;
 /// The largest encoded 20 ms payload (G.711 and G.722 take 160 octets,
@@ -53,6 +70,9 @@ pub const OPUS_INPUT_RATE: u32 = 16_000;
 #[derive(Clone, Copy)]
 pub struct Encoded {
     len: u16,
+    /// The stream's flush count when it was made: the worker drops it if
+    /// a flush came since.
+    flush: u64,
     data: [u8; MAX_ENCODED],
 }
 
@@ -63,6 +83,7 @@ impl Encoded {
         let n = p.len().min(MAX_ENCODED);
         let mut e = Encoded {
             len: u16::try_from(n).unwrap_or(0),
+            flush: 0,
             data: [0; MAX_ENCODED],
         };
         e.data[..n].copy_from_slice(&p[..n]);
@@ -73,6 +94,19 @@ impl Encoded {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.data[..usize::from(self.len)]
+    }
+
+    /// Made after `n` flushes.
+    #[must_use]
+    pub fn after_flushes(mut self, n: u64) -> Self {
+        self.flush = n;
+        self
+    }
+
+    /// The flushes before it was made.
+    #[must_use]
+    pub fn flushes(&self) -> u64 {
+        self.flush
     }
 }
 
@@ -129,8 +163,9 @@ impl RtpCopy {
 }
 
 /// What a stream is: its id, its service's socket, its rate, the codec the
-/// endpoint sends (and its RTP clock), the G.711 payload type it is sent
-/// (`None`: nothing injected), and where its events go.
+/// endpoint sends (and its RTP clock), the payload type and codec it is
+/// sent (`None`: nothing injected), the frame protocol's version, and
+/// where its events go.
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub id: u32,
@@ -142,6 +177,8 @@ pub struct Spec {
     pub codec: Codec,
     pub clock: u32,
     pub inject: Option<(Pt, Codec)>,
+    /// 1, or 2 (flush generations).
+    pub protocol: u8,
     pub events: MediaEvents,
     pub subject: Subject,
 }
@@ -149,14 +186,17 @@ pub struct Spec {
 /// What the worker holds of a stream.
 #[derive(Debug)]
 pub struct WorkerEnd {
-    /// What the endpoint sends, for the fork thread.
+    /// What the endpoint sends, for the stream.
     pub fork: SyncSender<RtpCopy>,
     /// 20 ms payloads to play to the endpoint, their payload type and RTP
     /// clock.
     pub inject: Option<(Receiver<Encoded>, Pt, u32)>,
-    /// Frames played (counted by the worker).
+    /// Frames sent to the endpoint (counted by the worker).
     pub played: Arc<AtomicU64>,
-    /// Flushes asked for (the worker drops its queue when it changes).
+    /// Frames taken off the inject queue: sent, or dropped by a flush.
+    pub consumed: Arc<AtomicU64>,
+    /// Flushes asked for: the worker drops its queue when it changes, and
+    /// any frame made before the latest.
     pub flushes: Arc<AtomicU64>,
     /// Packets dropped because the fork queue was full.
     pub dropped: Arc<AtomicU64>,
@@ -171,89 +211,104 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Drop the audio queued for the endpoint (barge-in).
+    /// Drop the audio queued for the endpoint (barge-in): a new
+    /// generation.
     pub fn flush(&self) {
         self.flushes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// End the stream: its threads stop, and its socket is closed.
+    /// End the stream: its shard lets it go and closes its socket.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-/// Connect to the service and start the stream's threads.
+/// Connect to the service, say hello, and hand the stream to its shard.
 ///
 /// # Errors
 ///
-/// When the service's socket cannot be connected to, or a thread cannot
-/// start, or the rate is not one a stream may use.
+/// When the service's socket cannot be connected to, the rate, protocol or
+/// codec is not one a stream may use, or the shards cannot start.
 pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
-    if !frame::valid_rate(spec.rate) {
-        return Err(std::io::Error::new(ErrorKind::InvalidInput, "rate"));
+    if !frame::valid_rate(spec.rate) || !matches!(spec.protocol, 1 | 2) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "rate or protocol",
+        ));
     }
-    let sock = UnixStream::connect(&spec.socket)?;
-    sock.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    sock.set_read_timeout(Some(Duration::from_millis(20)))?;
-    let writer = Arc::new(Mutex::new(sock.try_clone()?));
+    let mut sock = UnixStream::connect(&spec.socket)?;
+    sock.set_write_timeout(Some(Duration::from_millis(100)))?;
+    // Hello: the stream's id, rate and protocol.
+    let hello = Header {
+        version: spec.protocol,
+        kind: Kind::Hello,
+        discontinuity: false,
+        stream: spec.id,
+        seq: 0,
+        timestamp_ms: 0,
+        rate: spec.rate,
+        samples: 0,
+        generation: 0,
+    };
+    sock.write_all(&hello.encode())?;
+    sock.set_nonblocking(true)?;
+    let Some(receive) =
+        super::receive::Receive::new(spec.codec, spec.clock, spec.rate, spec.pt.get())
+    else {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the endpoint's codec is not decoded",
+        ));
+    };
+    let to = Rate::from_hz(spec.rate)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "rate"))?;
     let (fork_tx, fork_rx) = sync_channel(FORK_QUEUE);
     let played = Arc::new(AtomicU64::new(0));
+    let consumed = Arc::new(AtomicU64::new(0));
     let flushes = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
-    // Hello: the stream's id and rate.
-    {
-        let h = Header {
-            kind: Kind::Hello,
-            discontinuity: false,
-            stream: spec.id,
+    let (inject, worker_inject) = inject_for(spec)?;
+    let stream = Stream {
+        spec: spec.clone(),
+        sock,
+        receive,
+        vad: Vad::new(to),
+        keys: super::inband::Keys::new(spec.rate),
+        ended_keys: Vec::new(),
+        fresh: Vec::with_capacity(4 * 960),
+        to,
+        out: Outgoing {
+            pending: Vec::with_capacity(4 * 960),
             seq: 0,
             timestamp_ms: 0,
-            rate: spec.rate,
-            samples: 0,
-        };
-        writer
-            .lock()
-            .map_err(|_| std::io::Error::other("lock"))?
-            .write_all(&h.encode())?;
-    }
-    let inject = if let Some((pt, codec)) = spec.inject {
-        let (encoder, enc_rate) = encoder_for(codec)
-            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "codec"))?;
-        let (tx, rx) = sync_channel(INJECT_QUEUE);
-        let (s, played, flushes, stop) = (
-            spec.clone(),
-            Arc::clone(&played),
-            Arc::clone(&flushes),
-            Arc::clone(&stop),
-        );
-        let reader = sock.try_clone()?;
-        std::thread::Builder::new()
-            .name("rtpflux-pcm-in".to_owned())
-            .spawn(move || {
-                inject_loop(
-                    &s,
-                    reader,
-                    &tx,
-                    (encoder, enc_rate),
-                    (&played, &flushes, &stop),
-                );
-            })?;
-        Some((rx, pt, spec.clock))
-    } else {
-        None
+            discontinuity: true,
+            missed: 0,
+            frame: Vec::with_capacity(frame::MAX_FRAME),
+            buf: Vec::with_capacity(WRITE_BUFFER + frame::MAX_FRAME),
+        },
+        fork: fork_rx,
+        reported_drops: 0,
+        begun: Instant::now(),
+        inject,
+        rbuf: vec![0u8; 2 * frame::MAX_FRAME],
+        rlen: 0,
+        seen_flushes: 0,
+        stale: 0,
+        played: Arc::clone(&played),
+        consumed: Arc::clone(&consumed),
+        flushes: Arc::clone(&flushes),
+        dropped: Arc::clone(&dropped),
+        stop: Arc::clone(&stop),
+        ended: false,
     };
-    {
-        let (s, stop, dropped) = (spec.clone(), Arc::clone(&stop), Arc::clone(&dropped));
-        std::thread::Builder::new()
-            .name("rtpflux-pcm-out".to_owned())
-            .spawn(move || fork_loop(&s, &fork_rx, &writer, &stop, &dropped))?;
-    }
+    super::shard::submit(Box::new(stream))?;
     Ok((
         WorkerEnd {
             fork: fork_tx,
-            inject,
+            inject: worker_inject,
             played,
+            consumed,
             flushes: Arc::clone(&flushes),
             dropped,
         },
@@ -265,146 +320,174 @@ pub fn start(spec: &Spec) -> std::io::Result<(WorkerEnd, Handle)> {
     ))
 }
 
-/// Decoded, concealed and resampled audio, cut into 20 ms frames.
+/// The service's side of a stream that injects audio: the shard's, and
+/// the worker's queue with its payload type and clock.
+type Injection = (Option<Inject>, Option<(Receiver<Encoded>, Pt, u32)>);
+
+fn inject_for(spec: &Spec) -> std::io::Result<Injection> {
+    Ok(if let Some((pt, codec)) = spec.inject {
+        let (encoder, enc_rate) = encoder_for(codec)
+            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "codec"))?;
+        let (tx, rx) = sync_channel(INJECT_QUEUE);
+        let inject = Inject {
+            tx,
+            encoder,
+            enc_rate,
+            frame: (enc_rate / 50) as usize,
+            resampler: None,
+            pending: Vec::with_capacity(4 * 960),
+            narrow: vec![0i16; 2 * 960],
+            samples: Vec::with_capacity(frame::MAX_SAMPLES),
+            ready: None,
+            queued: 0,
+            marks: VecDeque::new(),
+        };
+        (Some(inject), Some((rx, pt, spec.clock)))
+    } else {
+        (None, None)
+    })
+}
+
+/// Decoded, concealed and resampled audio, cut into 20 ms frames, and the
+/// frames waiting to be written.
 struct Outgoing {
-    rate: u32,
     pending: Vec<i16>,
     seq: u32,
     timestamp_ms: u64,
     discontinuity: bool,
     /// Frames the service missed since the last one it got.
     missed: u32,
-    out: Vec<u8>,
+    frame: Vec<u8>,
+    /// Octets not yet written ([`WRITE_BUFFER`] at most, but for control
+    /// frames).
+    buf: Vec<u8>,
 }
 
-impl Outgoing {
-    /// Send the whole 20 ms frames of `pending`.
-    fn flush_frames(&mut self, id: u32, writer: &Mutex<UnixStream>) -> bool {
-        let per = (self.rate / 50) as usize;
-        while self.pending.len() >= per {
-            let samples = u16::try_from(per).unwrap_or(0);
-            let mut ok = true;
-            if let Ok(mut w) = writer.lock() {
-                if self.missed > 0 {
-                    let gap = Header {
-                        kind: Kind::Gap,
-                        discontinuity: true,
-                        stream: id,
-                        seq: self.missed,
-                        timestamp_ms: self.timestamp_ms,
-                        rate: self.rate,
-                        samples: 0,
-                    };
-                    if w.write_all(&gap.encode()).is_ok() {
-                        self.missed = 0;
-                    }
-                }
-                let h = Header {
-                    kind: Kind::Audio,
-                    discontinuity: self.discontinuity,
-                    stream: id,
-                    seq: self.seq,
-                    timestamp_ms: self.timestamp_ms,
-                    rate: self.rate,
-                    samples,
-                };
-                frame::audio(&h, &self.pending[..per], &mut self.out);
-                match w.write_all(&self.out) {
-                    Ok(()) => {
-                        self.discontinuity = false;
-                        self.seq = self.seq.wrapping_add(1);
-                    }
-                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                        // Too slow: this frame is lost, the next says so.
-                        self.missed += 1;
-                        self.discontinuity = true;
-                    }
-                    Err(_) => ok = false,
-                }
-            }
-            self.timestamp_ms += 20;
-            self.pending.drain(..per);
-            if !ok {
-                return false;
-            }
-        }
-        true
+/// The service's audio on its way to the endpoint.
+struct Inject {
+    tx: SyncSender<Encoded>,
+    encoder: crate::codec::Encoder,
+    enc_rate: u32,
+    /// Samples in 20 ms at `enc_rate`.
+    frame: usize,
+    resampler: Option<(u32, Resampler)>,
+    pending: Vec<i16>,
+    narrow: Vec<i16>,
+    samples: Vec<i16>,
+    /// A frame waiting for room in the worker's queue: nothing more is read
+    /// meanwhile.
+    ready: Option<Encoded>,
+    /// Frames put in the worker's queue.
+    queued: u64,
+    /// (mark id, frames queued before it, its generation).
+    marks: VecDeque<(u32, u64, u64)>,
+}
+
+/// A stream, as its shard holds it.
+pub struct Stream {
+    spec: Spec,
+    sock: UnixStream,
+    receive: super::receive::Receive,
+    vad: Vad,
+    keys: Option<super::inband::Keys>,
+    ended_keys: Vec<super::inband::Key>,
+    fresh: Vec<i16>,
+    to: Rate,
+    out: Outgoing,
+    fork: Receiver<RtpCopy>,
+    reported_drops: u64,
+    begun: Instant,
+    inject: Option<Inject>,
+    /// What was read of the service's frames, not taken yet.
+    rbuf: Vec<u8>,
+    rlen: usize,
+    /// Flushes taken: the current generation.
+    seen_flushes: u64,
+    /// Late frames of an older generation, dropped.
+    stale: u64,
+    played: Arc<AtomicU64>,
+    consumed: Arc<AtomicU64>,
+    flushes: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    ended: bool,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stream")
+            .field("id", &self.spec.id)
+            .field("generation", &self.seen_flushes)
+            .finish_non_exhaustive()
     }
 }
 
-/// To the service: jitter buffer, decoding, concealment, resampling
-/// ([`super::receive`]), VAD.
-fn fork_loop(
-    spec: &Spec,
-    rx: &Receiver<RtpCopy>,
-    writer: &Mutex<UnixStream>,
-    stop: &AtomicBool,
-    dropped: &AtomicU64,
-) {
-    let Some(mut receive) =
-        super::receive::Receive::new(spec.codec, spec.clock, spec.rate, spec.pt.get())
-    else {
-        log::warn!("pcm {}: the endpoint's codec is not decoded", spec.id);
-        return;
-    };
-    let Ok(to) = Rate::from_hz(spec.rate) else {
-        return;
-    };
-    let mut vad = Vad::new(to);
-    let mut keys = super::inband::Keys::new(spec.rate);
-    let mut ended = Vec::new();
-    let mut out = Outgoing {
-        rate: spec.rate,
-        pending: Vec::with_capacity(4 * 960),
-        seq: 0,
-        timestamp_ms: 0,
-        discontinuity: true,
-        missed: 0,
-        out: Vec::with_capacity(frame::MAX_FRAME),
-    };
-    let mut fresh = Vec::with_capacity(4 * 960);
-    let start = Instant::now();
-    let mut next_tick = start;
-    let mut reported_drops = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        let wait = next_tick.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(wait) {
-            Ok(p) => {
-                receive.push(&p);
-                continue;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+impl Stream {
+    pub(super) fn id(&self) -> u32 {
+        self.spec.id
+    }
+
+    /// Whether the shard should read the service now: not while a frame
+    /// waits for room in the worker's queue (backpressure).
+    pub(super) fn wants_read(&self) -> bool {
+        self.inject.as_ref().is_none_or(|i| i.ready.is_none())
+    }
+
+    /// Late frames dropped so far (an older generation's).
+    #[must_use]
+    pub fn stale(&self) -> u64 {
+        self.stale
+    }
+
+    fn emit(&self, kind: MediaEventKind) {
+        self.spec.events.emit(self.spec.subject.clone(), kind);
+    }
+
+    fn played_ms(&self) -> u64 {
+        self.played.load(Ordering::Relaxed).saturating_mul(20)
+    }
+
+    /// Every 20 ms: the endpoint's audio to the service, the service's to
+    /// the worker, marks, writes. `false`: the stream ended.
+    pub(super) fn tick(&mut self) -> bool {
+        if self.stop.load(Ordering::Relaxed) {
+            return false;
         }
-        next_tick += Duration::from_millis(20);
-        let drops = dropped.load(Ordering::Relaxed);
-        if drops != reported_drops || receive.restarted {
-            out.discontinuity = true;
-            reported_drops = drops;
-            receive.restarted = false;
+        self.take_flush();
+        self.fork_tick();
+        self.pump();
+        self.answer_marks();
+        self.write_out()
+    }
+
+    /// The endpoint's audio of the last 20 ms, decoded and analysed, into
+    /// frames for the service.
+    fn fork_tick(&mut self) {
+        while let Ok(p) = self.fork.try_recv() {
+            self.receive.push(&p);
         }
-        fresh.clear();
-        receive.pull(
-            u64::try_from(start.elapsed().as_millis()).unwrap_or(0),
-            &mut fresh,
-        );
-        for chunk in fresh.chunks(to.hz() as usize / 50) {
-            match vad.frame(chunk) {
-                VadEvent::SpeechStarted => spec
-                    .events
-                    .emit(spec.subject.clone(), MediaEventKind::SpeechStarted),
-                VadEvent::SpeechEnded => spec
-                    .events
-                    .emit(spec.subject.clone(), MediaEventKind::SpeechEnded),
+        let drops = self.dropped.load(Ordering::Relaxed);
+        if drops != self.reported_drops || self.receive.restarted {
+            self.out.discontinuity = true;
+            self.reported_drops = drops;
+            self.receive.restarted = false;
+        }
+        self.fresh.clear();
+        let elapsed = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(0);
+        self.receive.pull(elapsed, &mut self.fresh);
+        for chunk in self.fresh.chunks(self.to.hz() as usize / 50) {
+            match self.vad.frame(chunk) {
+                VadEvent::SpeechStarted => self.emit(MediaEventKind::SpeechStarted),
+                VadEvent::SpeechEnded => self.emit(MediaEventKind::SpeechEnded),
                 VadEvent::None => {}
             }
         }
-        if let Some(k) = &mut keys {
-            ended.clear();
-            k.feed(&fresh, &mut ended);
-            for key in &ended {
-                spec.events.emit(
-                    spec.subject.clone(),
+        if let Some(k) = &mut self.keys {
+            self.ended_keys.clear();
+            k.feed(&self.fresh, &mut self.ended_keys);
+            for key in &self.ended_keys {
+                self.spec.events.emit(
+                    self.spec.subject.clone(),
                     MediaEventKind::Dtmf {
                         code: key.code,
                         duration_ms: key.duration_ms,
@@ -414,179 +497,308 @@ fn fork_loop(
                 );
             }
         }
-        out.pending.extend_from_slice(&fresh);
-        if !out.flush_frames(spec.id, writer) {
-            break;
+        self.out.pending.extend_from_slice(&self.fresh);
+        self.frames_out();
+    }
+
+    /// The header of a frame to the service.
+    fn header(&self, kind: Kind, seq: u32, timestamp_ms: u64, samples: u16) -> Header {
+        Header {
+            version: self.spec.protocol,
+            kind,
+            discontinuity: kind != Kind::Audio || self.out.discontinuity,
+            stream: self.spec.id,
+            seq,
+            timestamp_ms,
+            rate: self.spec.rate,
+            samples,
+            generation: (self.seen_flushes & 0xff) as u8,
         }
     }
-    stop.store(true, Ordering::Relaxed);
-    spec.events.emit(
-        spec.subject.clone(),
-        MediaEventKind::StreamEnded { stream: spec.id },
-    );
-}
 
-/// Read one frame from the service: its header and payload (into
-/// `payload`). `Ok(None)`: nothing yet.
-fn read_frame(
-    sock: &mut UnixStream,
-    head: &mut [u8; HEADER],
-    payload: &mut Vec<u8>,
-    stop: &AtomicBool,
-) -> std::io::Result<Option<Header>> {
-    let mut got = 0;
-    while got < HEADER {
-        if stop.load(Ordering::Relaxed) {
-            return Err(ErrorKind::Interrupted.into());
+    /// The whole 20 ms frames of `out.pending`, into the write buffer; a
+    /// frame without room is lost (and the next gap frame says so).
+    fn frames_out(&mut self) {
+        let per = (self.spec.rate / 50) as usize;
+        while self.out.pending.len() >= per {
+            let samples = u16::try_from(per).unwrap_or(0);
+            if self.out.buf.len() + HEADER + 2 * per > WRITE_BUFFER {
+                self.out.missed += 1;
+                self.out.discontinuity = true;
+            } else {
+                self.gap_out();
+                let h = self.header(Kind::Audio, self.out.seq, self.out.timestamp_ms, samples);
+                frame::audio(&h, &self.out.pending[..per], &mut self.out.frame);
+                self.out.buf.extend_from_slice(&self.out.frame);
+                self.out.discontinuity = false;
+                self.out.seq = self.out.seq.wrapping_add(1);
+            }
+            self.out.timestamp_ms += 20;
+            self.out.pending.drain(..per);
         }
-        match sock.read(&mut head[got..]) {
-            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if got == 0 {
-                    return Ok(None);
+        // Said as soon as there is room, even if no audio follows.
+        self.gap_out();
+    }
+
+    /// The frames the service missed, told (once the write buffer has
+    /// room for the gap frame).
+    fn gap_out(&mut self) {
+        if self.out.missed > 0 && self.out.buf.len() + HEADER <= WRITE_BUFFER {
+            let gap = self.header(Kind::Gap, self.out.missed, self.out.timestamp_ms, 0);
+            self.out.buf.extend_from_slice(&gap.encode());
+            self.out.missed = 0;
+        }
+    }
+
+    /// Write what the service can take now; `false` when it is gone.
+    fn write_out(&mut self) -> bool {
+        while !self.out.buf.is_empty() {
+            match self.sock.write(&self.out.buf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    self.out.buf.drain(..n);
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return false,
             }
-            Err(e) => return Err(e),
         }
+        true
     }
-    let h = Header::parse(head)
-        .map_err(|e: FrameError| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    payload.resize(h.payload_len(), 0);
-    let mut got = 0;
-    while got < payload.len() {
-        if stop.load(Ordering::Relaxed) {
-            return Err(ErrorKind::Interrupted.into());
-        }
-        match sock.read(&mut payload[got..]) {
-            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(Some(h))
-}
 
-/// From the service: resampling to the encoder's rate, encoding in the
-/// endpoint's codec, into the worker's queue.
-#[allow(clippy::too_many_lines)] // One loop: read, convert, queue, marks.
-fn inject_loop(
-    spec: &Spec,
-    mut sock: UnixStream,
-    tx: &SyncSender<Encoded>,
-    (mut encoder, enc_rate): (crate::codec::Encoder, u32),
-    (played, flushes, stop): (&AtomicU64, &AtomicU64, &AtomicBool),
-) {
-    let mut head = [0u8; HEADER];
-    let mut payload = Vec::with_capacity(frame::MAX_FRAME);
-    let mut samples = Vec::with_capacity(frame::MAX_SAMPLES);
-    let frame = (enc_rate / 50) as usize;
-    let mut narrow = vec![0i16; 2 * 960];
-    let mut pending: Vec<i16> = Vec::with_capacity(4 * frame);
-    let mut payload_out = [0u8; MAX_ENCODED];
-    let mut resampler: Option<(u32, Resampler)> = None;
-    let mut queued = 0u64;
-    let mut seen_flushes = flushes.load(Ordering::Relaxed);
-    // (mark id, frames queued before it).
-    let mut marks: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
-    let mut ready: Option<Encoded> = None;
-    while !stop.load(Ordering::Relaxed) {
-        // A flush: what is not queued yet goes; the worker drops its queue.
-        let f = flushes.load(Ordering::Relaxed);
-        if f != seen_flushes {
-            seen_flushes = f;
-            pending.clear();
-            ready = None;
-            // The frames the worker drops never play: count them played.
-            queued = played.load(Ordering::Relaxed).max(queued);
+    /// A flush asked for since the last look (by the API, or the service):
+    /// a new generation. What waits goes, marks waiting are answered as
+    /// flushed, and the flush is reported.
+    fn take_flush(&mut self) {
+        let f = self.flushes.load(Ordering::Relaxed);
+        if f == self.seen_flushes {
+            return;
         }
-        // Marks whose audio has played.
-        let done = played.load(Ordering::Relaxed);
-        while marks.front().is_some_and(|&(_, at)| at <= done) {
-            if let Some((id, _)) = marks.pop_front() {
-                spec.events.emit(
-                    spec.subject.clone(),
-                    MediaEventKind::StreamMark {
-                        stream: spec.id,
-                        mark: id,
-                    },
-                );
+        self.seen_flushes = f;
+        let played_ms = self.played_ms();
+        if let Some(i) = &mut self.inject {
+            i.pending.clear();
+            i.ready = None;
+            let marks: Vec<(u32, u64, u64)> = i.marks.drain(..).collect();
+            for (mark, _, generation) in marks {
+                self.emit(MediaEventKind::StreamMark {
+                    stream: self.spec.id,
+                    mark,
+                    generation,
+                    played_ms,
+                    flushed: true,
+                });
             }
         }
-        // A frame waiting for room in the worker's queue: nothing more is
-        // read meanwhile (the service waits).
-        if let Some(frame) = ready.take() {
-            match tx.try_send(frame) {
-                Ok(()) => queued += 1,
+        if self.spec.protocol == 2 {
+            // The acknowledgment: the new generation, and the audio sent
+            // before it.
+            let ack = self.header(
+                Kind::Flush,
+                u32::try_from(f & 0xffff_ffff).unwrap_or(0),
+                played_ms,
+                0,
+            );
+            self.out.buf.extend_from_slice(&ack.encode());
+        }
+        self.emit(MediaEventKind::StreamFlushed {
+            stream: self.spec.id,
+            generation: f,
+            played_ms,
+        });
+    }
+
+    /// The service's pending audio, encoded, into the worker's queue until
+    /// it is full.
+    fn pump(&mut self) {
+        let flushes = self.seen_flushes;
+        let Some(i) = &mut self.inject else {
+            return;
+        };
+        loop {
+            let frame = match i.ready.take() {
+                Some(f) => f,
+                None if i.pending.len() >= i.frame => {
+                    let mut out = [0u8; MAX_ENCODED];
+                    let n = i.encoder.encode(&i.pending[..i.frame], &mut out);
+                    i.pending.drain(..i.frame);
+                    match n {
+                        Some(n) => Encoded::new(&out[..n]).after_flushes(flushes),
+                        None => continue,
+                    }
+                }
+                None => return,
+            };
+            match i.tx.try_send(frame) {
+                Ok(()) => i.queued += 1,
                 Err(TrySendError::Full(f)) => {
-                    ready = Some(f);
-                    std::thread::sleep(Duration::from_millis(5));
+                    i.ready = Some(f);
+                    return;
                 }
-                Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Disconnected(_)) => return,
             }
-            continue;
         }
-        if pending.len() >= frame {
-            let n = encoder.encode(&pending[..frame], &mut payload_out);
-            pending.drain(..frame);
-            if let Some(n) = n {
-                ready = Some(Encoded::new(&payload_out[..n]));
+    }
+
+    /// Marks whose audio the worker has taken.
+    fn answer_marks(&mut self) {
+        let done = self.consumed.load(Ordering::Relaxed);
+        let played_ms = self.played_ms();
+        let Some(i) = &mut self.inject else {
+            return;
+        };
+        let mut answered = Vec::new();
+        while i.marks.front().is_some_and(|&(_, at, _)| at <= done) {
+            if let Some(m) = i.marks.pop_front() {
+                answered.push(m);
             }
-            continue;
         }
-        let h = match read_frame(&mut sock, &mut head, &mut payload, stop) {
-            Ok(Some(h)) => h,
-            Ok(None) => continue,
-            Err(e) => {
-                if e.kind() != ErrorKind::Interrupted && e.kind() != ErrorKind::UnexpectedEof {
-                    log::debug!("pcm {}: {e}", spec.id);
-                }
+        for (mark, _, generation) in answered {
+            self.emit(MediaEventKind::StreamMark {
+                stream: self.spec.id,
+                mark,
+                generation,
+                played_ms,
+                flushed: false,
+            });
+        }
+    }
+
+    /// Read what the service sent, a few frames at most, while the worker
+    /// has room; `false` when the service is gone or broke the protocol.
+    pub(super) fn read(&mut self) -> bool {
+        self.take_flush();
+        for _ in 0..READS_PER_PASS {
+            self.pump();
+            if !self.wants_read() {
                 break;
             }
+            match self.take_frame() {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(()) => return false,
+            }
+            // Not a whole frame yet: more from the socket.
+            match self.sock.read(&mut self.rbuf[self.rlen..]) {
+                Ok(0) => return false,
+                Ok(n) => self.rlen += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => {
+                    log::debug!("pcm {}: {e}", self.spec.id);
+                    return false;
+                }
+            }
+        }
+        self.pump();
+        self.answer_marks();
+        self.write_out()
+    }
+
+    /// Take one whole frame from what was read: `Ok(false)` when there is
+    /// none yet, `Err` when the service broke the protocol.
+    fn take_frame(&mut self) -> Result<bool, ()> {
+        if self.rlen < HEADER {
+            return Ok(false);
+        }
+        let h = Header::parse(&self.rbuf[..HEADER]).map_err(|e| {
+            log::debug!("pcm {}: {e}", self.spec.id);
+        })?;
+        let need = HEADER + h.payload_len();
+        if self.rlen < need {
+            return Ok(false);
+        }
+        self.frame_in(&h, need);
+        self.rbuf.copy_within(need..self.rlen, 0);
+        self.rlen -= need;
+        Ok(true)
+    }
+
+    /// A frame from the service (its payload at `rbuf[HEADER..end]`).
+    fn frame_in(&mut self, h: &Header, end: usize) {
+        if h.kind == Kind::Flush {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            self.take_flush();
+            return;
+        }
+        // Protocol 2: a frame of an older generation is late audio of what
+        // was flushed.
+        let current = (self.seen_flushes & 0xff) as u8;
+        if self.spec.protocol == 2
+            && matches!(h.kind, Kind::Audio | Kind::Mark)
+            && h.generation != current
+        {
+            self.stale += 1;
+            // Its mark is answered: flushed, never to play.
+            if h.kind == Kind::Mark {
+                self.emit(MediaEventKind::StreamMark {
+                    stream: self.spec.id,
+                    mark: h.seq,
+                    generation: u64::from(h.generation),
+                    played_ms: self.played_ms(),
+                    flushed: true,
+                });
+            }
+            return;
+        }
+        let Some(i) = &mut self.inject else {
+            return;
         };
         match h.kind {
             Kind::Audio => {
-                samples.clear();
-                samples.extend(
-                    payload
+                i.samples.clear();
+                i.samples.extend(
+                    self.rbuf[HEADER..end]
                         .as_chunks::<2>()
                         .0
                         .iter()
                         .map(|b| i16::from_le_bytes(*b)),
                 );
-                if h.rate == enc_rate {
-                    pending.extend_from_slice(&samples);
-                    continue;
+                if h.rate == i.enc_rate {
+                    i.pending.extend_from_slice(&i.samples);
+                    return;
                 }
-                let r = match &mut resampler {
+                let r = match &mut i.resampler {
                     Some((rate, r)) if *rate == h.rate => r,
                     slot => {
-                        let Ok(r) = Resampler::new(h.rate, enc_rate) else {
-                            continue;
+                        let Ok(r) = Resampler::new(h.rate, i.enc_rate) else {
+                            return;
                         };
                         &mut slot.insert((h.rate, r)).1
                     }
                 };
-                let n = r.process(&samples, &mut narrow);
-                pending.extend_from_slice(&narrow[..n]);
+                let n = r.process(&i.samples, &mut i.narrow);
+                i.pending.extend_from_slice(&i.narrow[..n]);
             }
             Kind::Mark => {
-                if marks.len() < MAX_MARKS {
+                if i.marks.len() < MAX_MARKS {
                     // After the frames queued and those still to come of
                     // what was sent before it.
-                    let partial = u64::from(!pending.is_empty());
-                    let at = queued + (pending.len() / frame) as u64 + partial;
-                    marks.push_back((h.seq, at));
+                    let waiting = u64::from(i.ready.is_some());
+                    let partial = u64::from(!i.pending.len().is_multiple_of(i.frame));
+                    let at = i.queued + waiting + (i.pending.len() / i.frame) as u64 + partial;
+                    i.marks.push_back((h.seq, at, self.seen_flushes));
                 }
             }
-            Kind::Flush => {
-                flushes.fetch_add(1, Ordering::Relaxed);
-            }
-            Kind::Hello | Kind::Gap => {}
+            Kind::Hello | Kind::Gap | Kind::Flush => {}
         }
     }
-    stop.store(true, Ordering::Relaxed);
+
+    /// The stream is over (stopped, its service gone, or its call ended):
+    /// said once.
+    pub(super) fn end(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        self.stop.store(true, Ordering::Relaxed);
+        if self.stale > 0 {
+            log::debug!("pcm {}: {} late frames dropped", self.spec.id, self.stale);
+        }
+        self.emit(MediaEventKind::StreamEnded {
+            stream: self.spec.id,
+        });
+    }
 }
 
 #[cfg(test)]

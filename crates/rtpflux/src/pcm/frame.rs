@@ -8,9 +8,9 @@
 //! | Octets | Field |
 //! |---|---|
 //! | 0–3 | `RFPC` |
-//! | 4 | version, 1 |
+//! | 4 | version: 1, or 2 when the stream was started with `protocol: 2` |
 //! | 5 | kind: 1 hello, 2 audio, 3 mark, 4 flush, 5 gap |
-//! | 6–7 | flags: bit 0 discontinuity (audio after a gap or a flush) |
+//! | 6–7 | flags: bit 0 discontinuity (audio after a gap or a flush); version 2: bits 8–15 the flush generation (mod 256) |
 //! | 8–11 | stream id (the relay's, from `stream.start`) |
 //! | 12–15 | sequence number, per direction, from 0 |
 //! | 16–23 | media timestamp: milliseconds of audio since the stream began, per direction |
@@ -25,6 +25,21 @@
 //! been played to the endpoint. A gap (relay to service) says how many
 //! frames the relay dropped, in its sequence field, because the service
 //! read too slowly.
+//!
+//! **Version 2** (negotiated: `stream.start` with `protocol: 2`; the
+//! relay's hello then says version 2) adds **flush generations**. Each
+//! flush, asked by the service (a flush frame) or through the API
+//! (`stream.flush`), starts a new generation, and the relay acknowledges
+//! it with a flush frame to the service:
+//! - its sequence field is the new generation;
+//! - its media timestamp is the milliseconds of the service's audio sent
+//!   to the endpoint (as RTP) before it.
+//!
+//! From then on the relay takes only audio and marks tagged with the new
+//! generation (flags bits 8–15). Anything older is late audio of what was
+//! flushed: it is dropped and counted, never played, and a late mark is
+//! answered as flushed. Marks still waiting
+//! when a flush comes are answered at once, as flushed.
 
 /// The header's length.
 pub const HEADER: usize = 32;
@@ -46,6 +61,8 @@ pub enum Kind {
 /// A frame's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
+    /// 1 or 2.
+    pub version: u8,
     pub kind: Kind,
     pub discontinuity: bool,
     pub stream: u32,
@@ -53,6 +70,8 @@ pub struct Header {
     pub timestamp_ms: u64,
     pub rate: u32,
     pub samples: u16,
+    /// Version 2: the flush generation (mod 256).
+    pub generation: u8,
 }
 
 /// Why a header is refused.
@@ -101,7 +120,8 @@ impl Header {
         if &b[..4] != b"RFPC" {
             return Err(FrameError::Magic);
         }
-        if b[4] != 1 {
+        let version = b[4];
+        if !matches!(version, 1 | 2) {
             return Err(FrameError::Version);
         }
         let kind = match b[5] {
@@ -116,6 +136,12 @@ impl Header {
         let mut ts = [0u8; 8];
         ts.copy_from_slice(&b[16..24]);
         let h = Header {
+            version,
+            generation: if version == 2 {
+                flags.to_le_bytes()[1]
+            } else {
+                0
+            },
             kind,
             discontinuity: flags & 1 != 0,
             stream: u32_at(8),
@@ -151,9 +177,15 @@ impl Header {
     pub fn encode(&self) -> [u8; HEADER] {
         let mut b = [0u8; HEADER];
         b[..4].copy_from_slice(b"RFPC");
-        b[4] = 1;
+        b[4] = self.version;
         b[5] = self.kind as u8;
-        b[6..8].copy_from_slice(&u16::from(self.discontinuity).to_le_bytes());
+        let generation = if self.version == 2 {
+            self.generation
+        } else {
+            0
+        };
+        b[6] = u8::from(self.discontinuity);
+        b[7] = generation;
         b[8..12].copy_from_slice(&self.stream.to_le_bytes());
         b[12..16].copy_from_slice(&self.seq.to_le_bytes());
         b[16..24].copy_from_slice(&self.timestamp_ms.to_le_bytes());
@@ -180,6 +212,8 @@ mod tests {
 
     fn h(kind: Kind, rate: u32, samples: u16) -> Header {
         Header {
+            version: 1,
+            generation: 0,
             kind,
             discontinuity: true,
             stream: 7,
@@ -198,6 +232,18 @@ mod tests {
         }
         let m = h(Kind::Mark, 0, 0);
         assert_eq!(Header::parse(&m.encode()), Ok(m));
+        // Version 2 carries the generation; version 1 never does.
+        let g = Header {
+            version: 2,
+            generation: 201,
+            ..h(Kind::Audio, 16000, 320)
+        };
+        assert_eq!(Header::parse(&g.encode()), Ok(g));
+        let v1 = Header {
+            generation: 201,
+            ..h(Kind::Audio, 16000, 320)
+        };
+        assert_eq!(Header::parse(&v1.encode()).unwrap().generation, 0);
     }
 
     #[test]
@@ -209,7 +255,7 @@ mod tests {
         b[0] = b'X';
         assert_eq!(Header::parse(&b), Err(FrameError::Magic));
         let mut b = good;
-        b[4] = 2;
+        b[4] = 3;
         assert_eq!(Header::parse(&b), Err(FrameError::Version));
         let mut b = good;
         b[5] = 9;

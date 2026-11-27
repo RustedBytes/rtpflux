@@ -48,7 +48,7 @@ the evidence, and what is left. Updated with every step.
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | done |
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | done |
 | 7. Fencing epochs issued by an ownership authority | P0-HA | done |
-| 8. PCM on shared I/O and DSP shards; flush generations | P1 | planned |
+| 8. PCM on shared I/O and DSP shards; flush generations | P1 | done |
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | planned |
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | planned |
 | 11. Media graph, conference recovery | P2 | planned |
@@ -314,3 +314,80 @@ Residual gaps:
   operations are covered by the control-thread ordering argument above.
 - Partition is modelled as a stale controller (an old epoch, or no
   token). There is no network-level partition test.
+
+## Step 8: PCM on shared shards; flush generations
+
+- PCM streams no longer have two OS threads each. A few shard threads
+  (`[runtime] pcm_shards`; default one per CPU, at most 4) serve every
+  stream. A stream stays on one shard, and every 20 ms the shard runs
+  each stream once: the DSP towards the service, the service's audio
+  towards the worker, marks, and non-blocking writes.
+- Buffers are bounded:
+  - a 240 ms write buffer per stream (overflow is dropped and counted,
+    reported by a gap frame);
+  - the worker's 100 ms inject queue (when it is full, the shard stops
+    reading that service);
+  - at most 8 frames read per stream per tick (fairness).
+- The relay workers are untouched apart from flush handling.
+- The I/O design was chosen by measurement. `tests/pcm.rs` `load` (100
+  streams, both ways, 5 s, release build), share of one core:
+
+  | Engine | Threads | CPU |
+  |---|---|---|
+  | Baseline: threads per stream | 200 | 12.6%, 11.6% |
+  | Shards with an epoll loop on readability | 4 | 18.4% |
+  | Shards driven by the 20 ms tick (kept) | 4 | 10.8%, 9.4%, 9.2% |
+
+  The epoll variant lost: its interest changed twice per tick for every
+  stream whose service wrote ahead. The baseline also took about 250 s
+  to shut down after the load run; the shards stop at once.
+- Flush generations, an opt-in protocol version 2 (`stream.start
+  protocol: 2`; version 1 services keep working):
+  - a flush starts a new generation and is acknowledged with a flush
+    frame (the generation, and `played_ms`) and a `stream.flushed`
+    event;
+  - stale audio and marks are dropped and counted, and a late mark is
+    answered as flushed;
+  - every injected frame carries the flush count it was made under, and
+    the worker drops it if a flush came since. This closes a race in
+    which a frame encoded just before a flush was queued just after it.
+  - marks carry `generation`, `played_ms` and `boundary: "rtp_sent"`.
+    RTP sent is stated explicitly not to be audible playout.
+- Bugs fixed on the way:
+  - marks pending at a flush could wait forever: the worker drained its
+    queue without counting, while mark positions counted every frame.
+    The worker now counts frames consumed (played or dropped).
+  - a gap frame was written only ahead of the next audio frame, so a
+    service that fell behind at the end of speech was never told.
+
+Evidence:
+- `tests/pcm.rs` `flush_generations`:
+  - the hello says version 2;
+  - a flush during a long answer: the old generation stops at once, the
+    ack and `stream.flushed` agree on `played_ms`;
+  - a mark that waited behind the answer is answered as flushed;
+  - late generation-0 TTS plays nothing, and its mark is answered as
+    flushed;
+  - generation 1 plays, and its mark has `rtp_sent` and its generation;
+  - a service flush racing a mark: the mark is flushed and the ack has
+    generation 2.
+- `tests/pcm.rs` `many_streams_share_two_threads`, 8 streams on 2
+  threads:
+  - while one service floods the relay, another's mark is answered in
+    under a second;
+  - the services that read get their audio;
+  - a service that does not read gets a gap frame;
+  - a service that disconnects ends its stream, and a new stream on the
+    same endpoint works;
+  - there are still 2 threads.
+- The existing `audio_streams_to_and_from_a_service` passes unchanged.
+- `frame.rs` unit tests: version 2 round trips, and version 1 never
+  carries a generation.
+
+Residual gaps:
+- A shard serves its streams in turn within the tick; a stream's DSP is
+  not split further.
+- Mixers keep their own thread per mixer (not per participant).
+- A hung service cannot block a shard: every read and write is
+  non-blocking. Only the hello is written blocking, at `stream.start`,
+  with a 100 ms timeout.

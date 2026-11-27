@@ -45,10 +45,24 @@ pub enum MediaEventKind {
     /// stream's detector).
     SpeechStarted,
     SpeechEnded,
-    /// A PCM stream's mark: the audio before it has played.
+    /// A PCM stream's mark: the audio before it was sent to the endpoint
+    /// as RTP (`flushed`: it never will be, a flush dropped it). `generation`
+    /// is the flush generation the mark was made in, `played_ms` the
+    /// service's audio sent as RTP so far. RTP sent is not audible playout:
+    /// the endpoint's own jitter buffer adds its delay.
     StreamMark {
         stream: u32,
         mark: u32,
+        generation: u64,
+        played_ms: u64,
+        flushed: bool,
+    },
+    /// A PCM stream was flushed: generation `generation` begins; the
+    /// service's audio sent as RTP before it was `played_ms`.
+    StreamFlushed {
+        stream: u32,
+        generation: u64,
+        played_ms: u64,
     },
     /// Something a worker was asked to do failed: what (`recording`,
     /// `media`), and why.

@@ -398,8 +398,8 @@ pcm_dir`, and the relay connects to it.
 
 | Operation | Fields | Result |
 |---|---|---|
-| `stream.start` | `endpoint_id`, `socket` (a file name in `pcm_dir`), `rate` (8000, 16000, 24000 or 48000; default 16000), `inject` (default `true`) | `stream_id`, `rate`, `inject` |
-| `stream.flush` | `stream_id` | `flushed`: the audio queued for the endpoint is dropped (barge-in) |
+| `stream.start` | `endpoint_id`, `socket` (a file name in `pcm_dir`), `rate` (8000, 16000, 24000 or 48000; default 16000), `inject` (default `true`), `protocol` (1 or 2, default 1) | `stream_id`, `rate`, `inject`, `protocol` |
+| `stream.flush` | `stream_id` | `flushed`: the audio queued for the endpoint is dropped (barge-in), and a new generation begins |
 | `stream.stop` | `stream_id` | `stopped` |
 
 **Frames.** Each frame on the socket is a 32-octet header followed by its
@@ -408,9 +408,9 @@ payload. Integers and samples are little-endian.
 | Octets | Field |
 |---|---|
 | 0–3 | `RFPC` |
-| 4 | version, 1 |
+| 4 | version: 1, or 2 with `protocol: 2` |
 | 5 | kind: 1 hello, 2 audio, 3 mark, 4 flush, 5 gap |
-| 6–7 | flags: bit 0, a discontinuity (after a gap or a flush) |
+| 6–7 | flags: bit 0, a discontinuity (after a gap or a flush); version 2: bits 8–15, the flush generation (mod 256) |
 | 8–11 | the stream id |
 | 12–15 | sequence number, per direction (for a mark: its id; for a gap: frames missed) |
 | 16–23 | media timestamp, in milliseconds of audio since the stream began |
@@ -429,9 +429,11 @@ audio goes through:
 
 A voice activity detector on the same audio gives `speech.started` and
 `speech.ended`. Key presses in the audio give `dtmf.detected` with
-`source: "inband"`. A service that reads too slowly misses frames; each
-write waits at most 100 ms. The next frame it gets is marked as a
-discontinuity, preceded by a gap frame giving the count.
+`source: "inband"`. The relay never waits for a service. One that reads
+too slowly misses frames: up to 240 ms waits in the relay's write
+buffer, beyond that frames are dropped. A gap frame gives the count as
+soon as there is room, and the next audio frame is marked as a
+discontinuity.
 
 **What the service sends** is audio frames of 10 or 20 ms at any of the
 four rates. The relay resamples them to the rate of the endpoint's codec,
@@ -443,17 +445,37 @@ rules:
   stops reading the socket, so the service's writes wait. Memory stays
   bounded.
 - **Flush:** a flush frame, or `stream.flush`, drops what is queued.
-  This is barge-in.
+  This is barge-in. Frames already on their way to the media worker
+  are dropped too: each frame carries the flush count it was made
+  under. Marks still waiting are answered as flushed. `stream.flushed`
+  reports the new `generation` and `played_ms`, the service's audio sent
+  as RTP before it.
 - **Marks:** a mark (kind 3, its id in the sequence field) is answered
-  with `stream.mark` once the audio sent before it has been played to
-  the endpoint, that is, sent in RTP. The relay knows what it sent, not
-  what the remote side has played out.
+  with `stream.mark` once the audio sent before it has been sent to the
+  endpoint as RTP (`boundary: "rtp_sent"`). The event has `generation`
+  and `played_ms`, and `flushed: true` when the audio never will be
+  sent. The relay knows what it sent, not what the remote side has
+  played out: the endpoint's own jitter buffer adds its delay.
+- **Protocol 2 (flush generations):** start the stream with
+  `protocol: 2` and the relay's hello says version 2. The service tags
+  every frame with the current generation (flags bits 8–15). Each flush
+  is acknowledged with a flush frame to the service: its sequence field
+  is the new generation, its media timestamp is `played_ms`. Audio and
+  marks of an older generation are late audio of what was flushed (TTS
+  still arriving after a barge-in, say). They are dropped and never
+  played, and a late mark is answered as flushed. Version 1 services are
+  unaffected.
 - **End:** the stream ends with `stream.ended` when the service closes
   the socket, or with `stream.stop`.
 
 The relay's media workers only copy packets for a stream and play the
-frames it sends back. The signal processing runs on the stream's own two
-threads.
+frames it sends back. The signal processing and the socket I/O run on a
+few shared **PCM shard** threads (`[runtime] pcm_shards`). There are no
+threads per stream. A stream stays on one shard, and every 20 ms the
+shard runs each of its streams once: at most a few frames are read from
+one service, so a busy one does not starve the others. With 100 streams
+both ways (`load` in `tests/pcm.rs`), 4 shard threads used 9.2–10.8% of
+a core, where two threads per stream (200 threads) used 11.6–12.6%.
 
 ## Conference mixers
 
@@ -535,7 +557,8 @@ subscriber sees only its own tenant's events.
 | `playback.stopped` | `playback_id`, `reason` (`request`, `replaced`) |
 | `recording.completed`, `recording.failed` | `file`, `uploaded`, `section`; a recording whose file the worker cannot open fails at once, with `reason: "recording"` and a `detail` |
 | `speech.started`, `speech.ended` | (an endpoint with a PCM stream) |
-| `stream.mark` | `stream_id`, `mark` |
+| `stream.mark` | `stream_id`, `mark`, `generation`, `played_ms`, `flushed`, `boundary` (`rtp_sent`) |
+| `stream.flushed` | `stream_id`, `generation`, `played_ms` |
 | `stream.ended` | `stream_id` |
 | `mixer.speaker` | `mixer_id` |
 | `gap` | `missed` (and `source: "media"` when the relay's own queue overflowed) |

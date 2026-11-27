@@ -141,13 +141,24 @@ impl Worker {
             return;
         };
         let (pt, per_ms) = (*pt, *clock / 1000);
-        // Barge-in: the frames queued go.
+        // Barge-in: the frames queued go, and any made before the latest
+        // flush that comes later (each counted consumed, for marks).
         let flushes = p.end.flushes.load(Ordering::Relaxed);
         if flushes != p.seen_flushes {
             p.seen_flushes = flushes;
-            while rx.try_recv().is_ok() {}
+            while rx.try_recv().is_ok() {
+                p.end.consumed.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        let frame = rx.try_recv().ok();
+        let frame = loop {
+            match rx.try_recv() {
+                Ok(f) if f.flushes() < flushes => {
+                    p.end.consumed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(f) => break Some(f),
+                Err(_) => break None,
+            }
+        };
         // Paced at 20 ms; after a stall, start again from now.
         p.next_ms = if now > p.next_ms + 100 {
             now + 20
@@ -171,6 +182,7 @@ impl Worker {
         };
         p.idle = 0;
         p.end.played.fetch_add(1, Ordering::Relaxed);
+        p.end.consumed.fetch_add(1, Ordering::Relaxed);
         let (call, other, first, hold) = (p.call, p.other, p.first, !p.holding);
         p.first = false;
         if hold {

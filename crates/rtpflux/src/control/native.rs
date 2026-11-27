@@ -91,7 +91,7 @@ pub const OPERATIONS: [&str; 32] = [
 ];
 
 /// The events of version 1.
-pub const EVENTS: [&str; 19] = [
+pub const EVENTS: [&str; 20] = [
     "endpoint.ready",
     "endpoint.failed",
     "endpoint.timeout",
@@ -109,6 +109,7 @@ pub const EVENTS: [&str; 19] = [
     "speech.started",
     "speech.ended",
     "stream.mark",
+    "stream.flushed",
     "stream.ended",
     "mixer.speaker",
 ];
@@ -2177,8 +2178,8 @@ impl Control {
             }
             MediaEventKind::SpeechStarted => ("speech.started", json!({})),
             MediaEventKind::SpeechEnded => ("speech.ended", json!({})),
-            MediaEventKind::StreamMark { stream, mark } => {
-                ("stream.mark", json!({"stream_id": stream, "mark": mark}))
+            k @ (MediaEventKind::StreamMark { .. } | MediaEventKind::StreamFlushed { .. }) => {
+                stream_event(k)
             }
             MediaEventKind::StreamEnded { stream } => {
                 self.native.streams.remove(stream);
@@ -2669,6 +2670,11 @@ impl Control {
             .get("inject")
             .and_then(Json::as_bool)
             .unwrap_or(true);
+        let protocol = match req.u64("protocol")?.unwrap_or(1) {
+            1 => 1,
+            2 => 2,
+            _ => return Err(NativeError::invalid("protocol: 1 or 2")),
+        };
         let (leg, pt, codec, clock) = self.endpoint_audio(&ep)?;
         let inject = match crate::pcm::stream::encoder_for(codec) {
             Some(_) if want_inject => Some((pt, codec)),
@@ -2696,6 +2702,7 @@ impl Control {
             codec,
             clock,
             inject,
+            protocol,
             events: self.relay.media_event_sender(),
             subject: Subject::Leg(leg.0, leg.1),
         };
@@ -2711,7 +2718,7 @@ impl Control {
         self.native.streams.insert(id, (ep.id.clone(), handle));
         log::info!("native: stream {id} on endpoint {} ({rate} Hz)", ep.id);
         self.confirm(&[&ep])?;
-        Ok(json!({"stream_id": id, "rate": rate, "inject": inject.is_some()}))
+        Ok(json!({"stream_id": id, "rate": rate, "inject": inject.is_some(), "protocol": protocol}))
     }
 
     /// `stream.flush` (barge-in: the audio queued for the endpoint goes)
@@ -2741,6 +2748,33 @@ impl Control {
             self.relay.pcm_stream(leg, None).map_err(Error::from)?;
         }
         Ok(json!({"stopped": true}))
+    }
+}
+
+/// A PCM stream's mark or flush, on the wire.
+fn stream_event(k: &MediaEventKind) -> (&'static str, Json) {
+    match k {
+        MediaEventKind::StreamMark {
+            stream,
+            mark,
+            generation,
+            played_ms,
+            flushed,
+        } => (
+            "stream.mark",
+            json!({"stream_id": stream, "mark": mark, "generation": generation,
+                   "played_ms": played_ms, "flushed": flushed, "boundary": "rtp_sent"}),
+        ),
+        MediaEventKind::StreamFlushed {
+            stream,
+            generation,
+            played_ms,
+        } => (
+            "stream.flushed",
+            json!({"stream_id": stream, "generation": generation, "played_ms": played_ms}),
+        ),
+        // Called with the two kinds above only.
+        _ => ("gap", json!({})),
     }
 }
 

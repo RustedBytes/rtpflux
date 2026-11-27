@@ -106,6 +106,9 @@ packet_buffer = 2048
 # How the media workers receive: "io_uring" (multishot receive on all their
 # sockets, Linux 6.0+; recvmmsg where the kernel lacks it) or "recvmmsg".
 receive = "io_uring"
+# Threads serving every PCM stream (stream.start); 0 = one per CPU, at
+# most 4.
+pcm_shards = 0
 
 # In-driver fast path for established plain RTP streams.
 [xdp]

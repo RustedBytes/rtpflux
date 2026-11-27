@@ -228,6 +228,8 @@ pub enum EventKind {
     SpeechStarted,
     SpeechEnded,
     StreamMark,
+    /// A PCM stream was flushed: a new generation begins.
+    StreamFlushed,
     StreamEnded,
     MixerSpeaker,
     /// Events were missed (`missed` in the data, or `reason:
@@ -258,6 +260,7 @@ impl EventKind {
             "speech.started" => EventKind::SpeechStarted,
             "speech.ended" => EventKind::SpeechEnded,
             "stream.mark" => EventKind::StreamMark,
+            "stream.flushed" => EventKind::StreamFlushed,
             "stream.ended" => EventKind::StreamEnded,
             "mixer.speaker" => EventKind::MixerSpeaker,
             "gap" => EventKind::Gap,

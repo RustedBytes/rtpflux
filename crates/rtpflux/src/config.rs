@@ -297,6 +297,9 @@ pub struct Runtime {
     /// worker; the default, with `recvmmsg` where the kernel lacks it) or
     /// `recvmmsg` (epoll, then batches per socket).
     pub receive: Receive,
+    /// Threads serving the PCM streams (`stream.start`), each with many
+    /// streams; 0 = one per CPU, at most 4.
+    pub pcm_shards: usize,
 }
 
 /// `runtime.receive`.
@@ -317,6 +320,7 @@ impl Default for Runtime {
             ring_capacity: 4_096,
             packet_buffer: 2_048,
             receive: Receive::IoUring,
+            pcm_shards: 0,
         }
     }
 }
