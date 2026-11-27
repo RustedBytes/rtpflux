@@ -63,7 +63,8 @@ requests are answered in order.
 | `v` | The protocol version: 1 |
 | `op` | The operation |
 | `operation_id` | Chosen by the client. Echoed in the reply and in the events the operation causes |
-| `idempotency_key` | Optional. A request with a key seen in the last 5 minutes (per tenant) gets the earlier outcome, marked `replayed: true`, and nothing runs again |
+| `idempotency_key` | Optional: the operation's stable key, per tenant. See [Operation keys and the ledger](#operation-keys-and-the-ledger) |
+| `first_attempt_unix_ms` | Optional, with `idempotency_key`: when the operation was first attempted. A key older than the ledger keeps is refused (`expired`), not run again |
 | `tenant` | Optional (default `default`). Endpoints, sessions and mixers belong to a tenant; another tenant gets `unauthorized` |
 | `endpoint_id` | The endpoint the operation is about |
 | `expected_generation`, `expected_revision` | Optional. The request fails with `conflict` when the endpoint's are different |
@@ -83,6 +84,12 @@ are:
 | `unauthorized` | Another tenant's resource |
 | `invalid` | A malformed request or SDP |
 | `internal` | Anything else |
+| `unavailable` | Durable storage failed. Nothing was done, unless the message says the operation was applied and only its record failed (`detail` names the resources) |
+| `expired` | The operation key's first attempt is older than the ledger keeps; it was not run again |
+| `unknown_outcome` | The operation began before a restart and its outcome was never recorded: it may or may not have taken effect. Reconcile before acting again |
+
+An error may carry `detail`, typed: the live or destroyed endpoint an
+`external_id` conflict is about, the resources of an unknown outcome.
 
 A reply means the change is applied in the control thread and queued to
 the media workers, which apply their commands in order. Operations that
@@ -94,6 +101,55 @@ is `timeout`; the change may still take effect, and `endpoint.query`
 tells.
 Operations that finish later report their end with an event: an
 announcement that played out, a recording, a stream.
+
+### Operation keys and the ledger
+
+A request that changes something and carries `idempotency_key` is
+recorded in the ledger:
+- A retry with the same key and the same intent gets the first reply,
+  marked `replayed: true`. Nothing runs again, whether the first attempt
+  succeeded or failed.
+- The same key with another intent is a `conflict`.
+
+**The intent** is the request's canonical JSON (keys sorted at every
+level) without the fields of a single attempt: `v`, `operation_id`,
+`idempotency_key`, `tenant`, `deadline_unix_ms`, `first_attempt_unix_ms`
+and `correlation_id`. Its SHA-256 is the fingerprint that is compared.
+
+**What is not recorded.** A request refused for its envelope (protocol
+version, tenant, a deadline already past) is definitely not executed. It
+is not recorded, so a retry runs normally.
+
+**In memory** (the default), the ledger keeps outcomes for 5 minutes, for
+the relay process's lifetime.
+
+**Durable** (`[sessions] ledger`, with a `state_file`):
+1. A keyed mutation is written as `pending`, synced to disk, before it
+   runs.
+2. It runs.
+3. Its resources' state is written, synced, to the state file.
+4. Its outcome is written, synced, to the ledger.
+5. Only then is it acknowledged.
+
+After a crash, an operation written as `pending` and never finished is
+`unknown_outcome`: retrying it does not run it again. Instead:
+1. Reconcile: `endpoint.lookup` by `external_id`, or `endpoint.list`.
+2. Make what is missing with a new key.
+
+The ledger keeps outcomes for `ledger_retention` (a day by default), and
+holds at most `ledger_quota` keys per tenant. A new key beyond the quota
+is refused (`exhausted`); nothing is evicted early. The file is created
+readable by the relay's user only: replies hold SDP, which may carry SRTP
+keys.
+
+**What the guarantee is not.** Without a ledger, state reaches the disk
+at most once a second, and Redis writes are best effort. `hello` says
+which applies (`guarantees`: `idempotency`, `state_commit`). A crash
+loses up to a second of unkeyed changes.
+
+| Operation | Fields | Result |
+|---|---|---|
+| `operation.query` | `idempotency_key`, `first_attempt_unix_ms` (optional) | `status`: `pending`, `applied`, `failed`, `unknown`, `expired` (older than kept), or `not_found`; and `op`, `resources`, `reply`, `at_unix_ms`, `durable` |
 
 ## Endpoints
 
@@ -111,7 +167,7 @@ gives).
 | Operation | Fields | Result |
 |---|---|---|
 | `hello` | | `versions`, `operations`, `events`, `capabilities` (codecs, transports, PCM streaming and its rates, mixer), `limits` |
-| `endpoint.create` | `remote_sdp` (the remote side's offer, which the relay answers), or `codecs` (the relay offers these: `PCMU`, `PCMA`, `G722`, `G729`, `opus`, `AMR`, `AMR-WB`, `telephone-event`, `CN`); `session_id`, `label`, `lease_ms`, `options` | `endpoint_id`, `session_id`, `generation`, `revision`, `state`, `sdp_type` (`answer` or `offer`), `sdp`, `warnings` |
+| `endpoint.create` | `remote_sdp` (the remote side's offer, which the relay answers), or `codecs` (the relay offers these: `PCMU`, `PCMA`, `G722`, `G729`, `opus`, `AMR`, `AMR-WB`, `telephone-event`, `CN`); `session_id`, `label`, `lease_ms`, `options`, `external_id`, `replaces_generation` | `endpoint_id`, `session_id`, `generation`, `revision`, `state`, `sdp_type` (`answer` or `offer`), `sdp`, `warnings` |
 | `endpoint.apply_answer` | `endpoint_id`, `sdp`, `options` | `revision`, `state` |
 | `endpoint.prepare` | `endpoint_id`; for a remote-offer endpoint `remote_sdp` (its re-INVITE); for a local one `codecs`, `options` | `pending_revision`, `sdp_type`, `sdp` |
 | `endpoint.commit` | `endpoint_id`, `revision`; for a local endpoint `sdp` (the answer) | `revision` |
@@ -119,6 +175,7 @@ gives).
 | `endpoint.destroy` | `endpoint_id` | `destroyed`, or `already: true` |
 | `endpoint.query` | `endpoint_id` | The endpoint's snapshot, and `media` (its streams, statistics, RTCP, DTMF, as ng `query` reports them) |
 | `endpoint.list` | | `endpoints` (snapshots), `destroyed` (recent tombstones), `global_seq` |
+| `endpoint.lookup` | `external_id` | The live endpoint's snapshot (`state_of_id: "live"`), or the destroyed one's id, generation and reason (`state_of_id: "destroyed"`) while its tombstone is kept |
 | `endpoint.renew` | `endpoint_id`, `lease_ms` (optional) | `lease_ms` |
 
 `options` are ng options for the operation (see
@@ -138,6 +195,18 @@ refused: `call-id`, `from-tag`, `to-tag`, `sdp`, `label`.
 - For a remote endpoint, its earlier offer is applied again.
 - A renegotiation that does not change the media keeps the ports, the
   keys and the bridge.
+
+**External ids.** `external_id` is the client's stable key for an
+endpoint, such as a call's UUID and leg. It is unique per tenant:
+- Creating a second endpoint under a live endpoint's external id is a
+  `conflict`, whose `detail` names the live endpoint.
+- Under a destroyed endpoint's external id, a new endpoint needs
+  `replaces_generation`: the destroyed one's generation. A retry of the
+  destroyed one's creation is therefore never taken for a new logical
+  endpoint.
+- External ids, tombstones and the counters ids are made from (endpoint
+  generations, stream and mixer ids) are saved with the state, so no id
+  is given twice across restarts.
 
 **Lifecycle.**
 - Destroying an endpoint frees everything it holds: ports, keys, its

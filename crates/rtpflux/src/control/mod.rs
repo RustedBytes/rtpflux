@@ -42,6 +42,7 @@ mod error;
 mod features;
 mod ice;
 mod keys;
+pub mod ledger;
 mod legacy;
 mod media;
 pub mod native;

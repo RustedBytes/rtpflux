@@ -328,6 +328,11 @@ pub enum StartError {
     },
     /// `[webui] user` and `password_hash` cannot be used.
     WebUiLogin(crate::webui::auth::CredentialsError),
+    /// The operation ledger cannot be opened.
+    Ledger {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     /// The native API's socket cannot be made.
     Native {
         path: std::path::PathBuf,
@@ -345,6 +350,9 @@ impl std::fmt::Display for StartError {
             StartError::Link { what, source } => write!(f, "cannot start {what}: {source}"),
             StartError::Thread { what, source } => write!(f, "cannot start {what}: {source}"),
             StartError::WebUiLogin(e) => write!(f, "webui.password_hash: {e}"),
+            StartError::Ledger { path, source } => {
+                write!(f, "sessions.ledger: {}: {source}", path.display())
+            }
             StartError::Native { path, source } => {
                 write!(f, "control.native_socket: {}: {source}", path.display())
             }
@@ -358,7 +366,8 @@ impl std::error::Error for StartError {
             StartError::Relay(e) => Some(e),
             StartError::Listen { source, .. }
             | StartError::Thread { source, .. }
-            | StartError::Native { source, .. } => Some(source),
+            | StartError::Native { source, .. }
+            | StartError::Ledger { source, .. } => Some(source),
             StartError::Link { source, .. } => Some(source),
             StartError::WebUiLogin(e) => Some(e),
         }
@@ -453,6 +462,19 @@ fn start_native(
         return Ok((addrs, Vec::new()));
     }
     control.set_native_max_endpoints(c.native_max_endpoints);
+    if let Some(path) = &config.sessions.ledger {
+        control
+            .open_ledger(
+                path,
+                config.sessions.ledger_retention.saturating_mul(1000),
+                config.sessions.ledger_quota,
+            )
+            .map_err(|source| StartError::Ledger {
+                path: path.clone(),
+                source,
+            })?;
+        log::info!("native: operation ledger in {}", path.display());
+    }
     control.set_pcm_dir(c.pcm_dir.clone());
     let link = control.native_link().map_err(|source| StartError::Link {
         what: "the native API",

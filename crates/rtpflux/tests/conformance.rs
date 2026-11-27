@@ -1491,6 +1491,7 @@ fn rtpflux_agrees_with_the_reference_model() {
                         labels: vec![],
                         copies: vec![],
                         endpoints: vec![],
+                        native: rtpflux::state::SavedNative::default(),
                     })
                 };
                 let (file, redis) = (snap(f[1]), snap(f[2]));

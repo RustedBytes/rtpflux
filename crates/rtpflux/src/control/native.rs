@@ -47,7 +47,6 @@ pub const VERSIONS: [u64; 1] = [1];
 /// remembered.
 pub const RETENTION: Duration = Duration::from_secs(300);
 /// Idempotency keys remembered at most (the oldest go first).
-const MAX_REMEMBERED: usize = 16_384;
 /// Tombstones kept at most (the oldest go first).
 const MAX_TOMBSTONES: usize = 65_536;
 /// Events a subscriber's queue holds.
@@ -56,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 26] = [
+pub const OPERATIONS: [&str; 28] = [
     "hello",
     "endpoint.create",
     "endpoint.apply_answer",
@@ -66,6 +65,8 @@ pub const OPERATIONS: [&str; 26] = [
     "endpoint.destroy",
     "endpoint.query",
     "endpoint.list",
+    "endpoint.lookup",
+    "operation.query",
     "endpoint.renew",
     "bridge.attach",
     "bridge.detach",
@@ -118,6 +119,15 @@ pub enum Code {
     Unauthorized,
     Invalid,
     Internal,
+    /// Durable storage failed: nothing was done (or, for an outcome that
+    /// could not be recorded, the message says it was applied).
+    Unavailable,
+    /// The operation key's first attempt is older than the ledger keeps:
+    /// its outcome is no longer known, so it is not run again.
+    Expired,
+    /// The operation began before a restart and its outcome was never
+    /// recorded: it may or may not have taken effect.
+    UnknownOutcome,
 }
 
 impl Code {
@@ -132,6 +142,9 @@ impl Code {
             Code::Unauthorized => "unauthorized",
             Code::Invalid => "invalid",
             Code::Internal => "internal",
+            Code::Unavailable => "unavailable",
+            Code::Expired => "expired",
+            Code::UnknownOutcome => "unknown_outcome",
         }
     }
 }
@@ -141,6 +154,8 @@ impl Code {
 pub struct NativeError {
     pub code: Code,
     pub message: String,
+    /// Typed details (the resource a conflict is about, say).
+    pub detail: Option<Json>,
 }
 
 impl NativeError {
@@ -148,11 +163,17 @@ impl NativeError {
         NativeError {
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(Code::Invalid, message)
+    }
+
+    fn with_detail(mut self, detail: Json) -> Self {
+        self.detail = Some(detail);
+        self
     }
 }
 
@@ -232,15 +253,18 @@ pub(super) struct Endpoint {
     /// The announcement playing to it: (playback id, operation id).
     pub(super) playback: Option<(String, Option<String>)>,
     pub(super) created_unix_ms: u64,
+    /// The client's stable key for it (unique per tenant).
+    pub(super) external_id: Option<String>,
 }
 
 /// An endpoint destroyed: by whom, its generation, and when.
 #[derive(Debug, Clone)]
-struct Tomb {
-    tenant: String,
-    generation: u64,
-    reason: &'static str,
-    at: Instant,
+pub(super) struct Tomb {
+    pub(super) tenant: String,
+    pub(super) generation: u64,
+    pub(super) reason: String,
+    pub(super) at_ms: u64,
+    pub(super) external_id: Option<String>,
 }
 
 /// What a subscriber wants.
@@ -302,11 +326,16 @@ pub struct Origin {
 #[derive(Debug, Default)]
 pub struct Native {
     pub(super) endpoints: HashMap<String, Endpoint>,
-    tombs: HashMap<String, Tomb>,
-    tomb_order: VecDeque<String>,
-    /// (tenant, idempotency key) → (when, reply).
-    remembered: HashMap<(String, String), (Instant, Json)>,
-    remembered_order: VecDeque<(String, String)>,
+    pub(super) tombs: HashMap<String, Tomb>,
+    pub(super) tomb_order: VecDeque<String>,
+    /// (tenant, external id) → the live endpoint's id.
+    pub(super) externals: HashMap<(String, String), String>,
+    /// (tenant, external id) → the destroyed endpoint's id: kept as long
+    /// as its tombstone, never evicted early (a new endpoint under the id
+    /// needs `replaces_generation`).
+    pub(super) external_tombs: HashMap<(String, String), String>,
+    /// What became of keyed operations (durable with `[sessions] ledger`).
+    pub(super) ledger: super::ledger::Ledger,
     subscribers: Vec<(u64, Subscriber)>,
     next_subscription: u64,
     /// The last event's number across all events.
@@ -473,56 +502,62 @@ impl Native {
     }
 
     /// Remember the destroyed endpoint `ep`.
-    fn bury(&mut self, ep: &Endpoint, reason: &'static str) {
-        if self.tomb_order.len() >= MAX_TOMBSTONES
-            && let Some(old) = self.tomb_order.pop_front()
-        {
-            self.tombs.remove(&old);
+    fn bury(&mut self, ep: &Endpoint, reason: &str) {
+        // Tombstones of external ids are not evicted early.
+        while self.tomb_order.len() >= MAX_TOMBSTONES {
+            let Some(old) = self.tomb_order.front() else {
+                break;
+            };
+            if self.tombs.get(old).is_some_and(|t| t.external_id.is_some()) {
+                break;
+            }
+            if let Some(old) = self.tomb_order.pop_front() {
+                self.tombs.remove(&old);
+            }
+        }
+        if let Some(x) = &ep.external_id {
+            let k = (ep.tenant.clone(), x.clone());
+            self.externals.remove(&k);
+            self.external_tombs.insert(k, ep.id.clone());
         }
         self.tombs.insert(
             ep.id.clone(),
             Tomb {
                 tenant: ep.tenant.clone(),
                 generation: ep.generation,
-                reason,
-                at: Instant::now(),
+                reason: reason.to_owned(),
+                at_ms: crate::relay::media_events::unix_ms(),
+                external_id: ep.external_id.clone(),
             },
         );
         self.tomb_order.push_back(ep.id.clone());
     }
 
-    /// Forget tombstones and idempotency keys older than [`RETENTION`].
-    fn expire(&mut self, now: Instant) {
-        while let Some(id) = self.tomb_order.front() {
-            match self.tombs.get(id) {
-                Some(t) if now.duration_since(t.at) < RETENTION => break,
-                _ => {
-                    if let Some(id) = self.tomb_order.pop_front() {
-                        self.tombs.remove(&id);
-                    }
-                }
-            }
-        }
-        while let Some(k) = self.remembered_order.front() {
-            match self.remembered.get(k) {
-                Some((at, _)) if now.duration_since(*at) < RETENTION => break,
-                _ => {
-                    if let Some(k) = self.remembered_order.pop_front() {
-                        self.remembered.remove(&k);
-                    }
-                }
-            }
-        }
+    /// How long tombstones are kept: as long as the ledger keeps outcomes
+    /// (at least [`RETENTION`]).
+    pub(super) fn tomb_retention_ms(&self) -> u64 {
+        self.ledger
+            .retention_ms
+            .max(u64::try_from(RETENTION.as_millis()).unwrap_or(u64::MAX))
     }
 
-    fn remember(&mut self, key: (String, String), reply: Json) {
-        if self.remembered_order.len() >= MAX_REMEMBERED
-            && let Some(old) = self.remembered_order.pop_front()
-        {
-            self.remembered.remove(&old);
+    /// Forget tombstones older than their retention.
+    fn expire(&mut self) {
+        let now = crate::relay::media_events::unix_ms();
+        let keep = self.tomb_retention_ms();
+        while let Some(id) = self.tomb_order.front() {
+            match self.tombs.get(id) {
+                Some(t) if now.saturating_sub(t.at_ms) < keep => break,
+                _ => {
+                    if let Some(id) = self.tomb_order.pop_front()
+                        && let Some(t) = self.tombs.remove(&id)
+                        && let Some(x) = t.external_id
+                    {
+                        self.external_tombs.remove(&(t.tenant, x));
+                    }
+                }
+            }
         }
-        self.remembered_order.push_back(key.clone());
-        self.remembered.insert(key, (Instant::now(), reply));
     }
 
     /// The endpoint `id` for `tenant`, or why not.
@@ -614,10 +649,11 @@ fn reply(operation_id: Option<&str>, outcome: Result<Json, NativeError>) -> Json
         }
         Err(e) => {
             r.insert("ok".to_owned(), json!(false));
-            r.insert(
-                "error".to_owned(),
-                json!({"code": e.code.as_str(), "message": e.message}),
-            );
+            let mut err = json!({"code": e.code.as_str(), "message": e.message});
+            if let (Some(d), Some(o)) = (e.detail, err.as_object_mut()) {
+                o.insert("detail".to_owned(), d);
+            }
+            r.insert("error".to_owned(), err);
         }
     }
     Json::Object(r)
@@ -627,8 +663,7 @@ impl Control {
     /// Run one native request (`message`: a JSON object) from `origin`;
     /// the reply, as JSON text.
     pub fn native_request(&mut self, message: &[u8], origin: &Origin) -> Vec<u8> {
-        let now = Instant::now();
-        self.native.expire(now);
+        self.native.expire();
         let parsed: Result<Json, _> = serde_json::from_slice(message);
         let Ok(Json::Object(body)) = parsed else {
             return serde_json::to_vec(&reply(
@@ -662,34 +697,25 @@ impl Control {
             ))
             .unwrap_or_default();
         }
-        // Retried: the reply it had, nothing run again.
-        let idem = body
+        // Refused before anything runs (definitely not executed): never
+        // recorded, so a retry runs normally.
+        if let Err(e) = Self::precheck(&req) {
+            return serde_json::to_vec(&reply(req.operation_id, Err(e))).unwrap_or_default();
+        }
+        let key = body
             .get("idempotency_key")
             .and_then(Json::as_str)
-            .map(|k| (req.tenant.to_owned(), k.to_owned()));
-        // Its outcome then, as the reply to this request (`replayed`).
-        if let Some(k) = &idem
-            && let Some((_, r)) = self.native.remembered.get(k)
-        {
-            let mut r = r.clone();
-            if let Some(o) = r.as_object_mut() {
-                match req.operation_id {
-                    Some(id) => o.insert("operation_id".to_owned(), json!(id)),
-                    None => o.remove("operation_id"),
-                };
-                o.insert("replayed".to_owned(), json!(true));
+            .filter(|_| mutates(req.op));
+        let r = if let Some(key) = key {
+            self.keyed(&req, origin, key)
+        } else {
+            let outcome = self.native_checked(&req, origin);
+            if let Err(e) = &outcome {
+                log::debug!("native {}: {}: {}", req.op, e.code.as_str(), e.message);
             }
-            return serde_json::to_vec(&r).unwrap_or_default();
-        }
-        let outcome = self.native_checked(&req, origin);
-        if let Err(e) = &outcome {
-            log::debug!("native {}: {}: {}", req.op, e.code.as_str(), e.message);
-        }
-        let r = reply(req.operation_id, outcome);
+            reply(req.operation_id, outcome)
+        };
         let out = serde_json::to_vec(&r).unwrap_or_default();
-        if let Some(k) = idem {
-            self.native.remember(k, r);
-        }
         // Endpoints whose media ended meanwhile (an `ng` delete, say).
         self.native_reconcile("ended");
         if !matches!(req.op, "hello" | "endpoint.query" | "endpoint.list") {
@@ -698,8 +724,9 @@ impl Control {
         out
     }
 
-    /// The checks every request passes, then the operation.
-    fn native_checked(&mut self, req: &Request<'_>, origin: &Origin) -> Result<Json, NativeError> {
+    /// The checks of a request's envelope (version, tenant, deadline): a
+    /// request they refuse is definitely not executed.
+    fn precheck(req: &Request<'_>) -> Result<(), NativeError> {
         if let Some(v) = req.u64("v")?
             && !VERSIONS.contains(&v)
         {
@@ -716,6 +743,141 @@ impl Control {
         {
             return Err(NativeError::new(Code::Timeout, "the deadline has passed"));
         }
+        Ok(())
+    }
+
+    /// The reply a keyed request gets from the ledger, if its key is known:
+    /// the first outcome (the same intent), a conflict (another), or an
+    /// unknown outcome.
+    fn earlier_outcome(&self, req: &Request<'_>, key: &str, fp: &str) -> Option<Json> {
+        use super::ledger::Status;
+        let fail = |e: NativeError| reply(req.operation_id, Err(e));
+        let e = self.native.ledger.get(req.tenant, key)?;
+        if e.fingerprint != fp || e.op != req.op {
+            return Some(fail(NativeError::new(
+                Code::Conflict,
+                format!("operation key {key} was used for another request"),
+            )));
+        }
+        Some(match (e.status, &e.reply) {
+            (Status::Applied | Status::Failed, Some(r)) => {
+                let mut r = r.clone();
+                if let Some(o) = r.as_object_mut() {
+                    match req.operation_id {
+                        Some(id) => o.insert("operation_id".to_owned(), json!(id)),
+                        None => o.remove("operation_id"),
+                    };
+                    o.insert("replayed".to_owned(), json!(true));
+                }
+                r
+            }
+            _ => fail(
+                NativeError::new(
+                    Code::UnknownOutcome,
+                    format!(
+                        "operation {key} began before a restart and its outcome was not recorded: \
+                         query the resources before trying again with a new key"
+                    ),
+                )
+                .with_detail(json!({"resources": e.resources})),
+            ),
+        })
+    }
+
+    /// A request with an operation key: its earlier outcome if the ledger
+    /// has it (the same intent), else run and recorded.
+    fn keyed(&mut self, req: &Request<'_>, origin: &Origin, key: &str) -> Json {
+        use super::ledger::{Entry, LedgerError, Status};
+        let now = crate::relay::media_events::unix_ms();
+        self.native.ledger.expire(now);
+        let fp = super::ledger::fingerprint(req.body);
+        let fail = |e: NativeError| reply(req.operation_id, Err(e));
+        if let Some(earlier) = self.earlier_outcome(req, key, &fp) {
+            return earlier;
+        }
+        // Not known: too old to be a first attempt?
+        if let Ok(Some(first)) = req.u64("first_attempt_unix_ms")
+            && now.saturating_sub(first) >= self.native.ledger.retention_ms
+        {
+            return fail(NativeError::new(
+                Code::Expired,
+                format!(
+                    "operation {key} was first attempted longer ago than the ledger keeps outcomes"
+                ),
+            ));
+        }
+        let pending = Entry {
+            op: req.op.to_owned(),
+            fingerprint: fp,
+            status: Status::Pending,
+            reply: None,
+            resources: Vec::new(),
+            at_ms: now,
+        };
+        match self.native.ledger.record(req.tenant, key, pending.clone()) {
+            Ok(()) => {}
+            Err(LedgerError::Quota) => {
+                return fail(NativeError::new(
+                    Code::Exhausted,
+                    "the tenant holds its quota of operation keys",
+                ));
+            }
+            Err(LedgerError::Storage(e)) => {
+                log::error!("ledger: {e}");
+                return fail(NativeError::new(
+                    Code::Unavailable,
+                    "durable storage failed: nothing was done",
+                ));
+            }
+        }
+        fault("after_pending");
+        let outcome = self.native_checked(req, origin);
+        fault("after_apply");
+        let status = match &outcome {
+            Ok(_) => Status::Applied,
+            // A change queued and not confirmed by the workers in time.
+            Err(e) if e.code == Code::Timeout => Status::Unknown,
+            Err(_) => Status::Failed,
+        };
+        let resources = outcome.as_ref().map_or_else(|_| Vec::new(), resource_refs);
+        let r = reply(req.operation_id, outcome);
+        // The resources' state on disk before the outcome is (durable mode).
+        if self.native.ledger.durable()
+            && status != Status::Failed
+            && let Err(e) = self.save_durable()
+        {
+            log::error!("state: {e}");
+            return fail(
+                NativeError::new(
+                    Code::Unavailable,
+                    format!("operation {key} was applied but its state could not be written: its outcome is unknown after a restart"),
+                )
+                .with_detail(json!({"resources": resources})),
+            );
+        }
+        fault("after_state");
+        let done = Entry {
+            status,
+            reply: Some(r.clone()),
+            resources: resources.clone(),
+            ..pending
+        };
+        if let Err(e) = self.native.ledger.record(req.tenant, key, done) {
+            log::error!("ledger: {e:?}");
+            return fail(
+                NativeError::new(
+                    Code::Unavailable,
+                    format!("operation {key} ran but its outcome could not be recorded durably"),
+                )
+                .with_detail(json!({"resources": resources, "reply": r})),
+            );
+        }
+        fault("after_outcome");
+        r
+    }
+
+    /// The checks every request passes, then the operation.
+    fn native_checked(&mut self, req: &Request<'_>, origin: &Origin) -> Result<Json, NativeError> {
         // The endpoint named, at the generation and revision expected.
         // (A destroyed endpoint's `endpoint.destroy` says it was.)
         if let Some(id) = req.str("endpoint_id")
@@ -749,6 +911,8 @@ impl Control {
             "endpoint.destroy" => self.native_destroy(req),
             "endpoint.query" => self.native_query(req),
             "endpoint.list" => Ok(self.native_list(req.tenant)),
+            "endpoint.lookup" => self.native_lookup(req),
+            "operation.query" => self.native_operation(req),
             "endpoint.renew" => self.native_renew(req),
             "bridge.attach" => self.native_attach(req),
             "bridge.detach" => self.native_detach(req),
@@ -844,6 +1008,13 @@ impl Control {
                 "mixer": true,
                 "mixer_max_participants": crate::pcm::mixer::MAX_PARTICIPANTS,
             },
+            "guarantees": {
+                "idempotency": if self.native.ledger.durable() { "durable" } else { "memory" },
+                "idempotency_retention_ms": self.native.ledger.retention_ms,
+                "operation_key_quota": self.native.ledger.quota,
+                "state_commit": if self.native.ledger.durable() { "synced_before_reply" } else { "periodic" },
+                "events": "at_most_once_with_gaps",
+            },
             "limits": {
                 "retention_ms": RETENTION.as_millis(),
                 "subscriber_queue": SUBSCRIBER_QUEUE,
@@ -871,6 +1042,7 @@ impl Control {
             "playback_id": ep.playback.as_ref().map(|p| &p.0),
             "event_seq": ep.seq,
             "created_unix_ms": ep.created_unix_ms,
+            "external_id": ep.external_id,
         })
     }
 
@@ -898,22 +1070,29 @@ impl Control {
         self.native.publish(ev);
     }
 
-    fn native_create(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
+    /// Refused when the tenant holds its quota of endpoints.
+    fn check_endpoint_quota(&self, tenant: &str) -> Result<(), NativeError> {
         let max = self.native.max_endpoints;
         if max > 0
             && self
                 .native
                 .endpoints
                 .values()
-                .filter(|e| e.tenant == req.tenant)
+                .filter(|e| e.tenant == tenant)
                 .count()
                 >= max
         {
             return Err(NativeError::new(
                 Code::Exhausted,
-                format!("tenant {}: {max} endpoints already", req.tenant),
+                format!("tenant {tenant}: {max} endpoints already"),
             ));
         }
+        Ok(())
+    }
+
+    fn native_create(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
+        self.check_endpoint_quota(req.tenant)?;
+        let external_id = self.check_external(req)?;
         let session = match req.str("session_id") {
             Some(s) if valid_name(s) => s.to_owned(),
             Some(_) => return Err(NativeError::invalid("session_id: not a name")),
@@ -978,8 +1157,17 @@ impl Control {
             remote_sdp: remote,
             playback: None,
             created_unix_ms: crate::relay::media_events::unix_ms(),
+            external_id: external_id.clone(),
         };
         self.native.endpoints.insert(id.clone(), ep);
+        if let Some(x) = external_id {
+            self.native
+                .external_tombs
+                .remove(&(req.tenant.to_owned(), x.clone()));
+            self.native
+                .externals
+                .insert((req.tenant.to_owned(), x), id.clone());
+        }
         log::info!(
             "native: endpoint {id} created in {session} ({})",
             kind.as_str()
@@ -1852,6 +2040,27 @@ impl Control {
         self.native.pcm_dir = dir;
     }
 
+    /// Keep the operation ledger in `path` (durable mode).
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be opened, read or written.
+    pub fn open_ledger(
+        &mut self,
+        path: &std::path::Path,
+        retention_ms: u64,
+        quota: usize,
+    ) -> std::io::Result<()> {
+        let l = super::ledger::Ledger::open(
+            path,
+            retention_ms,
+            quota,
+            crate::relay::media_events::unix_ms(),
+        )?;
+        self.native.ledger = l;
+        Ok(())
+    }
+
     /// Set the most endpoints one tenant may hold (0: no limit of its own).
     pub fn set_native_max_endpoints(&mut self, max: usize) {
         self.native.max_endpoints = max;
@@ -1882,6 +2091,7 @@ impl Control {
                 lease_ms: e.lease.map(|l| l.0),
                 remote_sdp: text(&e.remote_sdp),
                 created_unix_ms: e.created_unix_ms,
+                external_id: e.external_id.clone(),
             })
             .collect();
         v.sort_by_key(|e| e.generation);
@@ -1890,7 +2100,58 @@ impl Control {
 
     /// The saved endpoints back, those whose media came back; the others
     /// are gone (a tombstone each).
-    pub(super) fn restore_endpoints(&mut self, saved: &[crate::state::SavedEndpoint]) {
+    /// The counters and tombstones, to be saved.
+    pub(super) fn saved_native(&self) -> crate::state::SavedNative {
+        let n = &self.native;
+        crate::state::SavedNative {
+            generation_seq: n.generation_seq,
+            next_stream: n.next_stream,
+            next_mixer: n.next_mixer,
+            tombstones: n
+                .tomb_order
+                .iter()
+                .filter_map(|id| {
+                    let t = n.tombs.get(id)?;
+                    Some(crate::state::SavedTomb {
+                        id: id.clone(),
+                        tenant: t.tenant.clone(),
+                        generation: t.generation,
+                        reason: t.reason.clone(),
+                        at_unix_ms: t.at_ms,
+                        external_id: t.external_id.clone(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    pub(super) fn restore_endpoints(
+        &mut self,
+        saved: &[crate::state::SavedEndpoint],
+        native: &crate::state::SavedNative,
+    ) {
+        // Counters first: no id given again.
+        self.native.generation_seq = self.native.generation_seq.max(native.generation_seq);
+        self.native.next_stream = self.native.next_stream.max(native.next_stream);
+        self.native.next_mixer = self.native.next_mixer.max(native.next_mixer);
+        for t in &native.tombstones {
+            if let Some(x) = &t.external_id {
+                self.native
+                    .external_tombs
+                    .insert((t.tenant.clone(), x.clone()), t.id.clone());
+            }
+            self.native.tombs.insert(
+                t.id.clone(),
+                Tomb {
+                    tenant: t.tenant.clone(),
+                    generation: t.generation,
+                    reason: t.reason.clone(),
+                    at_ms: t.at_unix_ms,
+                    external_id: t.external_id.clone(),
+                },
+            );
+            self.native.tomb_order.push_back(t.id.clone());
+        }
         for e in saved {
             let kind = if e.kind == "remote_offer" {
                 Kind::RemoteOffer
@@ -1921,7 +2182,13 @@ impl Control {
                 remote_sdp: e.remote_sdp.as_ref().map(|s| s.as_bytes().to_vec()),
                 playback: None,
                 created_unix_ms: e.created_unix_ms,
+                external_id: e.external_id.clone(),
             };
+            if let Some(x) = &e.external_id {
+                self.native
+                    .externals
+                    .insert((e.tenant.clone(), x.clone()), e.id.clone());
+            }
             self.native.generation_seq = self.native.generation_seq.max(e.generation);
             self.native.endpoints.insert(e.id.clone(), ep);
         }
@@ -2275,6 +2542,181 @@ type EndpointAudio = (
     rtpflux_core::sdp::Codec,
     u32,
 );
+
+/// Whether operation `op` changes anything (only such operations are
+/// recorded in the ledger).
+fn mutates(op: &str) -> bool {
+    !matches!(
+        op,
+        "hello"
+            | "endpoint.query"
+            | "endpoint.list"
+            | "endpoint.lookup"
+            | "operation.query"
+            | "inventory.list"
+            | "recovery.report"
+            | "events.subscribe"
+            | "events.unsubscribe"
+    )
+}
+
+/// The resources a result names (their ids).
+fn resource_refs(result: &Json) -> Vec<String> {
+    [
+        "endpoint_id",
+        "bridged_to",
+        "mixer_id",
+        "stream_id",
+        "playback_id",
+        "recording_id",
+    ]
+    .iter()
+    .filter_map(|k| match result.get(k)? {
+        Json::String(s) => Some(s.clone()),
+        Json::Number(n) => Some(format!("{k}:{n}")),
+        _ => None,
+    })
+    .collect()
+}
+
+impl Control {
+    /// `operation.query`: what became of the operation `idempotency_key`.
+    fn native_operation(&self, req: &Request<'_>) -> Result<Json, NativeError> {
+        use super::ledger::Status;
+        let key = req.need("idempotency_key")?;
+        let Some(e) = self.native.ledger.get(req.tenant, key) else {
+            // Older than the ledger keeps: its outcome is gone.
+            let now = crate::relay::media_events::unix_ms();
+            let expired = req
+                .u64("first_attempt_unix_ms")?
+                .is_some_and(|first| now.saturating_sub(first) >= self.native.ledger.retention_ms);
+            return Ok(json!({
+                "status": if expired { "expired" } else { "not_found" },
+                "durable": self.native.ledger.durable(),
+                "retention_ms": self.native.ledger.retention_ms,
+            }));
+        };
+        let status = match e.status {
+            Status::Pending => "pending",
+            Status::Applied => "applied",
+            Status::Failed => "failed",
+            Status::Unknown => "unknown",
+        };
+        Ok(json!({
+            "status": status,
+            "op": e.op,
+            "resources": e.resources,
+            "reply": e.reply,
+            "at_unix_ms": e.at_ms,
+            "durable": self.native.ledger.durable(),
+        }))
+    }
+}
+
+/// External ids a tenant may hold, live and destroyed, at most.
+const MAX_EXTERNAL_IDS: usize = 262_144;
+
+impl Control {
+    /// The request's `external_id`, if any, once it may be used: not held
+    /// by a live endpoint, and, if a destroyed endpoint held it, named as
+    /// replaced (`replaces_generation`).
+    fn check_external(&self, req: &Request<'_>) -> Result<Option<String>, NativeError> {
+        let Some(x) = req.str("external_id") else {
+            return Ok(None);
+        };
+        if !valid_name(x) {
+            return Err(NativeError::invalid("external_id: not a name"));
+        }
+        let k = (req.tenant.to_owned(), x.to_owned());
+        if let Some(id) = self.native.externals.get(&k) {
+            let generation = self.native.endpoints.get(id).map(|e| e.generation);
+            return Err(NativeError::new(
+                Code::Conflict,
+                format!("external_id {x} is endpoint {id}'s"),
+            )
+            .with_detail(json!({"endpoint_id": id, "generation": generation, "state": "live"})));
+        }
+        if let Some(id) = self.native.external_tombs.get(&k)
+            && let Some(t) = self.native.tombs.get(id)
+            && req.u64("replaces_generation")? != Some(t.generation)
+        {
+            return Err(NativeError::new(
+                Code::Conflict,
+                format!(
+                    "external_id {x} was endpoint {id}'s, destroyed ({}): a new endpoint under it needs replaces_generation {}",
+                    t.reason, t.generation
+                ),
+            )
+            .with_detail(json!({"endpoint_id": id, "generation": t.generation,
+                "state": "destroyed", "reason": t.reason})));
+        }
+        let held = self
+            .native
+            .externals
+            .keys()
+            .chain(self.native.external_tombs.keys())
+            .filter(|(t, _)| t == req.tenant)
+            .count();
+        if held >= MAX_EXTERNAL_IDS {
+            return Err(NativeError::new(
+                Code::Exhausted,
+                "the tenant holds its quota of external ids",
+            ));
+        }
+        Ok(Some(x.to_owned()))
+    }
+
+    /// `endpoint.lookup`: the endpoint an `external_id` names, live or
+    /// destroyed (while its tombstone is kept).
+    fn native_lookup(&self, req: &Request<'_>) -> Result<Json, NativeError> {
+        let x = req.need("external_id")?;
+        let k = (req.tenant.to_owned(), x.to_owned());
+        if let Some(ep) = self
+            .native
+            .externals
+            .get(&k)
+            .and_then(|id| self.native.endpoints.get(id))
+        {
+            let mut snap = Self::endpoint_snapshot(ep);
+            if let Some(o) = snap.as_object_mut() {
+                o.insert("state_of_id".to_owned(), json!("live"));
+            }
+            return Ok(snap);
+        }
+        if let Some((id, t)) = self
+            .native
+            .external_tombs
+            .get(&k)
+            .and_then(|id| Some((id, self.native.tombs.get(id)?)))
+        {
+            return Ok(json!({
+                "endpoint_id": id,
+                "external_id": x,
+                "generation": t.generation,
+                "state_of_id": "destroyed",
+                "reason": t.reason,
+                "destroyed_unix_ms": t.at_ms,
+            }));
+        }
+        Err(NativeError::new(
+            Code::NotFound,
+            format!("external_id {x}: no endpoint (or its tombstone has expired)"),
+        ))
+    }
+}
+
+/// Tests only (feature `fault-injection`): die at `point` (SIGKILL: no
+/// cleanup, no state saved) when `RTPFLUX_FAULT` names it.
+#[cfg(feature = "fault-injection")]
+fn fault(point: &str) {
+    if std::env::var("RTPFLUX_FAULT").is_ok_and(|v| v == point) {
+        log::warn!("fault injection: killed at {point}");
+        let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault(_point: &str) {}
 
 #[cfg(test)]
 mod tests {

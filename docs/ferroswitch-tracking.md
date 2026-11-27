@@ -41,7 +41,7 @@ the evidence, and what is left. Updated with every step.
 
 | Step | Priority | Status |
 |---|---|---|
-| 1. Durable operation ledger, fingerprints, `operation.query`, `external_id` | P0 | planned |
+| 1. Durable operation ledger, fingerprints, `operation.query`, `external_id` | P0 | done |
 | 2. Inventory, boot id, recovery report | P0 | planned |
 | 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | planned |
 | 4. Replayable critical events with cursors | P0 | planned |
@@ -53,3 +53,41 @@ the evidence, and what is left. Updated with every step.
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | planned |
 | 11. Media graph, conference recovery | P2 | planned |
 | 12. Benchmarks against the baseline | all | planned |
+
+## Step 1: operation ledger and external ids
+
+- `control/ledger.rs`: fingerprints (SHA-256 of the canonical intent), the
+  ledger in memory or durable (append-only, synced; torn last line
+  skipped; `pending` without an outcome becomes `unknown` at start;
+  compaction by rewrite; mode 0600), retention, per-tenant quota without
+  early eviction.
+- Native requests: envelope checks first (never recorded); a keyed
+  mutation runs pending → apply → synced state (`save_durable`) → synced
+  outcome → reply; same key and another intent is `conflict`; an old
+  first attempt is `expired`; `unknown_outcome` after a crash.
+  `operation.query`. New error codes `unavailable`, `expired`,
+  `unknown_outcome`, and `detail` on errors. `hello` states the
+  guarantees.
+- `external_id` on `endpoint.create`, unique per tenant, kept with the
+  tombstones (never evicted early); `replaces_generation` for a new
+  endpoint under a destroyed one's id; `endpoint.lookup`. Tombstones and
+  id counters are saved with the state.
+- Feature `fault-injection` (tests only): `RTPFLUX_FAULT` kills the relay
+  (SIGKILL) at a boundary.
+
+Evidence: `cargo test -p rtpflux --features fault-injection --test crash`
+(CI runs it in the `all-features` test job); `cargo test --workspace`: 584
+passed.
+- A SIGKILL at `after_pending`, `after_apply`, `after_state` and
+  `after_outcome`, then a retry and reconciliation, leaves one endpoint
+  per external id; the outcome is either replayed or reported
+  `unknown_outcome`.
+- Durable keys and external ids work across a clean restart.
+
+Unit tests in `ledger.rs` cover fingerprints, a torn last line,
+`pending` turning `unknown` on restart, expiry and the quota.
+
+Residual: mixers, streams, playback and recordings are deduplicated by
+operation keys, but have no external id of their own (step 2 reports
+those that a restart loses). A ledger costs two `fsync`s and a state-file
+write per keyed mutation; this is measured in step 12.

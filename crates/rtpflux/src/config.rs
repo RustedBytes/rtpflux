@@ -208,6 +208,15 @@ pub struct Sessions {
     pub redis: Option<String>,
     /// The Redis key they are kept under.
     pub redis_key: String,
+    /// The native API's operation ledger (an append-only file, synced):
+    /// keyed operations' outcomes survive a restart, and a keyed
+    /// mutation's state is written (synced) before it is acknowledged.
+    /// Needs `state_file`.
+    pub ledger: Option<PathBuf>,
+    /// How long the ledger keeps an outcome (seconds), and how many it
+    /// keeps per tenant.
+    pub ledger_retention: u64,
+    pub ledger_quota: usize,
 }
 
 impl Sessions {
@@ -242,6 +251,9 @@ impl Default for Sessions {
             state_file: None,
             redis: None,
             redis_key: crate::redis::DEFAULT_KEY.to_owned(),
+            ledger: None,
+            ledger_retention: 86_400,
+            ledger_quota: 100_000,
         }
     }
 }
@@ -513,6 +525,9 @@ pub enum Problem {
     MaxMessage,
     /// `control.native_listen` without tokens, or a token shorter than 16.
     NativeTokens,
+    /// `sessions.ledger` without `sessions.state_file`, or a retention or
+    /// quota of 0.
+    Ledger,
     NoInterface,
     IcePacing,
     /// `ice.stun_server` that is not host:port.
@@ -591,6 +606,9 @@ impl fmt::Display for Problem {
             Problem::NoControlListen => {
                 f.write_str("control.listen: at least one endpoint is required")
             }
+            Problem::Ledger => f.write_str(
+                "sessions.ledger: needs sessions.state_file, and a ledger_retention and ledger_quota above 0",
+            ),
             Problem::NativeTokens => f.write_str(
                 "control.native_tokens: native_listen needs a token per tenant, each of 16 characters or more",
             ),
@@ -761,6 +779,13 @@ impl Config {
         let mut problems = Vec::new();
         if self.control.listen.is_empty() {
             problems.push(Problem::NoControlListen);
+        }
+        if self.sessions.ledger.is_some()
+            && (self.sessions.state_file.is_none()
+                || self.sessions.ledger_retention == 0
+                || self.sessions.ledger_quota == 0)
+        {
+            problems.push(Problem::Ledger);
         }
         if (!self.control.native_listen.is_empty() && self.control.native_tokens.is_empty())
             || self.control.native_tokens.values().any(|t| t.len() < 16)

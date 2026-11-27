@@ -187,13 +187,19 @@ impl Control {
 
     /// The dialogs as a file record, with the peers the workers learned.
     pub(super) fn snapshot(&mut self) -> state::Saved {
+        self.snapshot_with(true)
+    }
+
+    /// The state to save; with `live`, each call's learned peers are asked
+    /// of its worker.
+    pub(super) fn snapshot_with(&mut self, live: bool) -> state::Saved {
         let keys: Vec<(Vec<u8>, Vec<u8>)> = self.sessions.keys().cloned().collect();
         let mut sessions = Vec::with_capacity(keys.len());
         for key in keys {
             let Some(s) = self.sessions.get(&key).cloned() else {
                 continue;
             };
-            sessions.push(self.saved_session(&key, &s, true));
+            sessions.push(self.saved_session(&key, &s, live));
         }
         state::Saved {
             version: state::VERSION,
@@ -228,11 +234,39 @@ impl Control {
                 })
                 .collect(),
             endpoints: self.saved_endpoints(),
+            native: self.saved_native(),
         }
     }
 
     /// Write the dialogs to the state file and hand them to the Redis
     /// writer, whichever are set (Redis is written in the background).
+    /// Write the state file now, synced, and say whether it worked: what
+    /// a durable operation waits for before its outcome is recorded. The
+    /// peers learned from media are not asked for (the relay learns them
+    /// again); the next periodic write has them.
+    ///
+    /// # Errors
+    ///
+    /// When there is no state file, or it cannot be written.
+    pub(super) fn save_durable(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.state_file.clone() else {
+            return Err(std::io::Error::other("no state file"));
+        };
+        let snapshot = self.snapshot_with(false);
+        let bytes = snapshot.encode().map_err(std::io::Error::other)?;
+        self.stats.state_writes.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = state::write_bytes(&path, &bytes) {
+            self.stats
+                .state_write_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+        if let Some(w) = &self.state_redis {
+            w.put(bytes);
+        }
+        Ok(())
+    }
+
     pub fn save(&mut self) {
         if self.state_file.is_none() && self.state_redis.is_none() {
             return;
@@ -350,7 +384,7 @@ impl Control {
                 );
             }
         }
-        self.restore_endpoints(&saved.endpoints);
+        self.restore_endpoints(&saved.endpoints, &saved.native);
         for s in &saved.subscriptions {
             if let Err(e) = self.restore_subscription(s) {
                 log::warn!(

@@ -66,6 +66,10 @@ af-xdp = ["rtpflux-xdp/af-xdp"]
 # opencore-amr). Off by default: AMR's patents need checking where the
 # relay is used.
 amr = ["dep:amr-nb", "dep:amr-wb"]
+# Tests only: `RTPFLUX_FAULT=<point>` makes the relay kill itself (SIGKILL)
+# at that point of a keyed native operation (tests/crash.rs). Never in a
+# production build.
+fault-injection = []
 
 [dev-dependencies]
 nix = { workspace = true, features = ["sched", "signal"] }

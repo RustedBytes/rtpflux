@@ -153,6 +153,9 @@ strict_source = false  # every call as if flagged strict-source
 # state_file = "/var/lib/rtpflux/state.json"
 # redis = "redis://:password@127.0.0.1:6379/0"
 # redis_key = "rtpflux:state"
+# ledger = "/var/lib/rtpflux/ledger.jsonl"   # the native API's durable operation ledger
+ledger_retention = 86400                     # seconds an operation's outcome is kept
+ledger_quota = 100000                        # operation keys kept per tenant
 ```
 
 - `timeout` ends an answered call whose media stopped in both directions.
@@ -188,6 +191,13 @@ strict_source = false  # every call as if flagged strict-source
   database 0 by default; `rediss://` with TLS is not supported).
   `redis_key` is the key (default `rtpflux:state`); give each relay its
   own. See [Operations](operations.md#state-in-redis).
+- `ledger` makes the native API's operation keys durable. It needs
+  `state_file`. A keyed mutation's intent, its state and its outcome each
+  reach the disk before it is acknowledged, so a retry after a crash gets
+  the first outcome or `unknown_outcome`, and never runs twice. It costs
+  two `fsync`s and a state-file write per keyed mutation. A relay that
+  cannot open its ledger does not start. See
+  [Operation keys and the ledger](native-api.md#operation-keys-and-the-ledger).
 
 ## `[runtime]`: threads and buffers
 

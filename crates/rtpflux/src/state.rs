@@ -52,6 +52,36 @@ pub struct Saved {
     /// The native API's endpoints (their media is in `sessions`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<SavedEndpoint>,
+    /// The native API's tombstones and counters.
+    #[serde(default)]
+    pub native: SavedNative,
+}
+
+/// What the native API keeps besides its endpoints: the counters ids are
+/// made from (so no id is given twice, across restarts too) and the
+/// tombstones of destroyed endpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedNative {
+    #[serde(default)]
+    pub generation_seq: u64,
+    #[serde(default)]
+    pub next_stream: u32,
+    #[serde(default)]
+    pub next_mixer: u32,
+    #[serde(default)]
+    pub tombstones: Vec<SavedTomb>,
+}
+
+/// A destroyed endpoint, remembered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTomb {
+    pub id: String,
+    pub tenant: String,
+    pub generation: u64,
+    pub reason: String,
+    pub at_unix_ms: u64,
+    #[serde(default)]
+    pub external_id: Option<String>,
 }
 
 /// An endpoint of the native API: its identity and negotiation state (its
@@ -81,6 +111,8 @@ pub struct SavedEndpoint {
     #[serde(default)]
     pub remote_sdp: Option<String>,
     pub created_unix_ms: u64,
+    #[serde(default)]
+    pub external_id: Option<String>,
 }
 
 /// A media subscription (`subscribe request`).
@@ -980,6 +1012,7 @@ mod tests {
             labels: Vec::new(),
             copies: Vec::new(),
             endpoints: Vec::new(),
+            native: SavedNative::default(),
         };
         write(&path, &saved).unwrap();
         // Written again (replacing the file), still private.
@@ -1001,6 +1034,7 @@ mod tests {
             labels: Vec::new(),
             copies: Vec::new(),
             endpoints: Vec::new(),
+            native: SavedNative::default(),
         };
         assert_eq!(newer(Some(at(5)), Some(at(9))), Some(at(9)));
         assert_eq!(newer(Some(at(9)), Some(at(5))), Some(at(9)));

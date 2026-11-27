@@ -12,6 +12,15 @@ pub enum ErrorCode {
     Unauthorized,
     Invalid,
     Internal,
+    /// Durable storage failed (nothing done, unless the message says the
+    /// operation was applied).
+    Unavailable,
+    /// The operation key's first attempt is older than the relay's ledger
+    /// keeps: it was not run again.
+    Expired,
+    /// The operation began before a restart of the relay and its outcome
+    /// was not recorded: reconcile before trying again with a new key.
+    UnknownOutcome,
     /// A code this client does not know.
     Other(String),
 }
@@ -29,6 +38,9 @@ impl ErrorCode {
             "unauthorized" => ErrorCode::Unauthorized,
             "invalid" => ErrorCode::Invalid,
             "internal" => ErrorCode::Internal,
+            "unavailable" => ErrorCode::Unavailable,
+            "expired" => ErrorCode::Expired,
+            "unknown_outcome" => ErrorCode::UnknownOutcome,
             other => ErrorCode::Other(other.to_owned()),
         }
     }

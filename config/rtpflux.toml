@@ -76,6 +76,13 @@ strict_source = false
 # holds SRTP keys: use a password and a private network (no TLS).
 # redis = "redis://:password@127.0.0.1:6379/0"
 # redis_key = "rtpflux:state"
+# The native API's operation ledger (needs state_file): a keyed mutation's
+# intent, state and outcome reach the disk before it is acknowledged, so a
+# retry after a crash never runs it twice. Outcomes are kept
+# ledger_retention seconds; at most ledger_quota keys per tenant.
+# ledger = "/var/lib/rtpflux/ledger.jsonl"
+ledger_retention = 86400
+ledger_quota = 100000
 
 # Threads and buffers, all allocated once at start-up.
 [runtime]
