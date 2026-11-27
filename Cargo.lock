@@ -1537,9 +1537,11 @@ dependencies = [
  "clap",
  "nix",
  "rtpflux",
+ "rtpflux-client",
  "rtpflux-core",
  "rtpflux-ng",
  "rtpflux-srtp",
+ "serde_json",
 ]
 
 [[package]]

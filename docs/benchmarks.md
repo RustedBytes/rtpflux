@@ -87,6 +87,63 @@ the machine, including the kernel's packet processing and the load
 generator. Generic XDP runs late in the kernel; native XDP on a physical
 NIC should do better.
 
+## Against the integration baseline
+
+`bench/baseline.sh` compares HEAD with a pinned commit (`BASELINE`,
+default `cac9411`, before the Ferroswitch integration work). It runs on
+the same machine and configuration, alternating the two binaries over
+two rounds.
+
+The figures below are from an i9-9900K (8 cores, 16 threads) on Linux
+7.0, over loopback:
+- relay: 2 workers on CPUs 0,1,8,9 (two physical cores);
+- load generator on 2,3,10,11; `native-bench` on 4,12.
+
+**Ordinary relaying** (`rtpflux-bench`, G.711 both ways, 10 s windows,
+no loss in any run). Each cell is round 1 / round 2:
+
+| Load | Baseline: p50 / p99 µs | Baseline: relay CPU % | HEAD: p50 / p99 µs | HEAD: relay CPU % |
+|---|---|---|---|---|
+| 500 calls, plain | 93 / 184, 87 / 220 | 38.5, 37.1 | 97 / 189, 94 / 188 | 38.8, 38.5 |
+| 1000 calls, plain | 146 / 344, 216 / 354 | 63.1, 71.9 | 157 / 348, 134 / 342 | 66.4, 60.4 |
+| 500 calls, SRTP both sides | 110 / 262, 104 / 253 | 46.0, 46.7 | 88 / 254, 76 / 203 | 42.8, 37.8 |
+| 1000 calls, SRTP both sides | 213 / 477, 157 / 448 | 90.1, 77.6 | 147 / 451, 134 / 359 | 77.8, 71.9 |
+
+No regression beyond the run-to-run spread, which is itself larger than
+the proposed gates (5 % median throughput, 10 % p99). A short window
+misleads: a 2 s smoke run at 100 calls showed HEAD at 3.5× the
+baseline's CPU, and 6 s windows at 500 calls, in both orders, showed
+them equal. Transcoding (no load mode in `rtpflux-bench`) and XDP (root:
+`bench/fastpath.sh`) were not compared.
+
+**Native control** (`native-bench`, 2000 create+destroy pairs,
+unkeyed). Each cell is round 1 / round 2:
+
+| | Pairs/s | Create p50 / p95 / p99 ms | Destroy p50 / p99 ms | Events/s | RSS growth |
+|---|---|---|---|---|---|
+| Baseline | 5873 / 6819 | 0.085 / 0.114 / 0.133 | 0.079 / 0.133 | 5884 / 6836 | +8.9 MB |
+| HEAD | 8930 / 7779 | 0.069 / 0.075 / 0.102 | 0.041 / 0.075 | 8953 / 7798 | +0.8 MB |
+
+The baseline's memory growth was a leak, fixed during the integration
+work ("two leaks fixed").
+
+**Durable operations** (HEAD only, `[sessions] ledger`, keyed, 2000
+pairs): 72 pairs/s, create p50 2.6 ms and p99 29.7 ms, destroy p50
+3.1 ms and p99 34.0 ms. This is bound by the disk's sync latency (three
+to four syncs per operation), and runs of the same build vary from about
+35 to 70 pairs/s. The ledger keeps each outcome, its reply included, for
+its retention: about 4.6 KB of memory per keyed operation, bounded by
+`ledger_quota` per tenant. Lower the quota or the retention where
+memory matters.
+
+**Recovery** (500 endpoints; time from the relay's launch until it lists
+them all):
+
+| | After SIGINT (graceful) | After SIGKILL |
+|---|---|---|
+| Baseline | 180, 184 ms | 107, 101 ms |
+| HEAD | 136, 133 ms | 120, 106 ms |
+
 ## Running the benchmarks
 
 ```sh
@@ -99,6 +156,13 @@ bench/srtp.sh
 
 # kernel fast paths: rtpflux XDP against rtpengine's kernel module (root)
 bench/fastpath.sh
+
+# HEAD against a pinned baseline: relaying, native control, durable
+# operations, recovery (builds the baseline in a worktree)
+BASELINE=cac9411 bench/baseline.sh
+
+# the native API's load alone (native-bench), against a running relay
+target/release/native-bench --socket /run/rtpflux/native.sock --pid <pid> --ops 2000
 ```
 
 The scripts are configured with environment variables, listed at the top

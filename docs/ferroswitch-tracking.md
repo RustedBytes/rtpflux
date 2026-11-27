@@ -52,7 +52,7 @@ the evidence, and what is left. Updated with every step.
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | done |
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | done |
 | 11. Media graph, conference recovery | P2 | done |
-| 12. Benchmarks against the baseline | all | planned |
+| 12. Benchmarks against the baseline | all | done |
 
 ## Step 1: operation ledger and external ids
 
@@ -634,3 +634,28 @@ Evidence:
   one, a torn line skipped, compaction;
 - the crash tests (SIGKILL at each boundary, keys and external ids
   durable) and the restart tests pass unchanged.
+
+## Step 12: benchmarks against the baseline
+
+- New tools:
+  - `bench/baseline.sh`: HEAD against a pinned commit (default
+    `cac9411`), built from a worktree, run alternately on identical
+    configuration;
+  - `native-bench`, a binary of `rtpflux-bench`: native create+destroy
+    rate, per-operation p50/p95/p99, event throughput, RSS growth, and
+    the recovery time after a restart.
+- Results (`docs/benchmarks.md`, "Against the integration baseline"):
+  - **ordinary relaying**: no regression beyond the run-to-run spread,
+    plain and SRTP;
+  - **native control**: HEAD 7.8–8.9 k pairs/s against 5.9–6.8 k, lower
+    p99, and no memory growth (the baseline grew 8.9 MB per 2000 pairs,
+    a leak fixed earlier);
+  - **recovery** of 500 endpoints: about 105–135 ms either way;
+  - **durable operations**: 72 pairs/s, p50 2.6–3.1 ms, p99 about 30 ms,
+    sync-bound. Their cost growing with history is fixed (see above).
+- Not measured: transcoding (no load mode), XDP (needs root;
+  `bench/fastpath.sh`), the soak runs and `tc netem` (P1 acceptance
+  table), and 500/1000 simultaneous PCM streams (the load test measured
+  100).
+- Memory note: the ledger keeps about 4.6 KB per keyed operation for its
+  retention, bounded by `ledger_quota`.

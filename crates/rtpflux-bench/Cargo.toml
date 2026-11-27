@@ -14,6 +14,9 @@ nix = { workspace = true, features = ["feature", "resource", "sched"] }
 rtpflux-core = { path = "../rtpflux-core" }
 rtpflux-ng = { path = "../rtpflux-ng" }
 rtpflux-srtp = { path = "../rtpflux-srtp" }
+# native-bench: the native API's load.
+rtpflux-client = { path = "../rtpflux-client" }
+serde_json.workspace = true
 
 [dev-dependencies]
 rtpflux = { path = "../rtpflux" }
