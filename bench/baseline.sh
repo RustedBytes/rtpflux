@@ -47,7 +47,9 @@ NATIVE_CPUS=${NATIVE_CPUS:-4,12}
 TMP=$(mktemp -d)
 RELAY_PID=""
 cleanup() {
-    [ -n "$RELAY_PID" ] && kill -9 "$RELAY_PID" 2>/dev/null || true
+    if [ -n "$RELAY_PID" ]; then
+        kill -9 "$RELAY_PID" 2>/dev/null || true
+    fi
     git worktree remove --force "$TMP/base" >/dev/null 2>&1 || true
     rm -rf "$TMP"
     finish_output
