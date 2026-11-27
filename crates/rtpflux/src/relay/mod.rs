@@ -12,6 +12,7 @@
 
 mod calls;
 mod commands;
+pub mod media_events;
 mod offload;
 pub mod repack;
 mod transcode;
@@ -87,6 +88,10 @@ pub struct Relay {
     shards: Vec<Shard>,
     interfaces: Vec<Interface>,
     events: Receiver<Event>,
+    /// The queue of media events, until the control side takes it.
+    media_events: Option<media_events::MediaEventInbox>,
+    /// The sending end of the same queue (for threads the relay starts later).
+    media_sender: media_events::MediaEvents,
     calls: HashMap<CallId, CallEntry>,
     next_id: CallId,
     next_shard: usize,
@@ -130,6 +135,7 @@ fn load_xdp(config: &Config) -> Result<FastPath, RelayError> {
 fn start_converter(
     config: &Config,
     activity: &Arc<crate::recording::activity::Activity>,
+    events: media_events::MediaEvents,
 ) -> Result<(Sender<crate::recording::Job>, JoinHandle<()>), RelayError> {
     let store = crate::recording::store::Store::from_config(
         config.recording.storage,
@@ -143,6 +149,7 @@ fn start_converter(
         store,
         resumable,
         Arc::clone(activity),
+        Some(events),
     )?)
 }
 
@@ -297,10 +304,11 @@ impl Relay {
         let workers = workers.clamp(1, pairs / 2);
         let per_shard = pairs / workers;
         let (event_tx, events) = std::sync::mpsc::channel();
+        let (media_tx, media_rx) = media_events::channel()?;
         let (offload_tx, offload_rx) = std::sync::mpsc::channel();
         let identity = crate::dtls::Identity::generate().map_err(RelayError::Dtls)?;
         let recording_activity = Arc::new(crate::recording::activity::Activity::default());
-        let (jobs, converter) = start_converter(config, &recording_activity)?;
+        let (jobs, converter) = start_converter(config, &recording_activity, media_tx.clone())?;
         let (rec_writer, writer_thread) = crate::recording::writer::spawn()?;
         // Stopped again if a later step fails (no worker left blocked).
         let mut shards = StartedShards(Vec::with_capacity(workers));
@@ -315,8 +323,8 @@ impl Relay {
             // The worker is built on its own thread: its preallocated
             // message headers hold raw pointers and are not `Send`.
             let (ready_tx, ready_rx) = sync_channel(1);
-            let (wake_w, stats_w, events_w) =
-                (Arc::clone(&wake), Arc::clone(&stats), event_tx.clone());
+            let (wake_w, stats_w) = (Arc::clone(&wake), Arc::clone(&stats));
+            let events_w = (event_tx.clone(), media_tx.clone());
             let offload_w = xdp.is_some().then(|| offload_tx.clone());
             let (batch, buffer) = (config.runtime.batch, config.runtime.packet_buffer);
             let uring = uring_buffers(config);
@@ -373,6 +381,8 @@ impl Relay {
             shards: std::mem::take(&mut shards.0),
             interfaces: config.interfaces.clone(),
             events,
+            media_events: Some(media_rx),
+            media_sender: media_tx,
             calls: HashMap::new(),
             next_id: CallId::FIRST,
             next_shard: 0,

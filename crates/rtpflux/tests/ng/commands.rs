@@ -151,3 +151,40 @@ fn delete_with_a_delay() {
     a.send_to(&rtp(2), for_a).unwrap();
     assert!(b.recv_from(&mut buf).is_err());
 }
+
+/// A `delete-delay` ends the dialogs it selected, not one made again under
+/// the same Call-ID and tags meanwhile.
+#[test]
+fn a_delayed_delete_spares_a_dialog_made_again() {
+    let srv = server(51_100);
+    let client = endpoint();
+    let (alice, bob) = (endpoint(), endpoint());
+    codec_call(&client, srv.addr, b"del-2", (&alice, &bob), ("0", "0"), &[]);
+    for (cookie, delay) in [("d1", Some(1)), ("d2", None)] {
+        let mut p = vec![("command", V::S(b"delete")), ("call-id", V::S(b"del-2"))];
+        if let Some(d) = delay {
+            p.push(("delete-delay", V::I(d)));
+        }
+        assert_eq!(call(&client, srv.addr, &request(cookie, &p)).0, "ok");
+    }
+    // The same call again, between other endpoints.
+    let (carol, dave) = (endpoint(), endpoint());
+    let (_, _, for_carol, _) = codec_call(
+        &client,
+        srv.addr,
+        b"del-2",
+        (&carol, &dave),
+        ("0", "0"),
+        &[],
+    );
+    std::thread::sleep(Duration::from_millis(1_500));
+    let q = request(
+        "q",
+        &[("command", V::S(b"query")), ("call-id", V::S(b"del-2"))],
+    );
+    assert_eq!(call(&client, srv.addr, &q).0, "ok", "the new dialog stays");
+    let mut buf = [0u8; 2048];
+    let p = rtp(1);
+    carol.send_to(&p, for_carol).unwrap();
+    assert!(matches!(dave.recv_from(&mut buf), Ok((n, _)) if buf[..n] == p[..]));
+}

@@ -256,6 +256,8 @@ impl Worker {
         }
         let st = s.agent.stats;
         let c = &mut s.counted;
+        // The first nomination: connected.
+        let connected = c.nominations == 0 && st.nominations > 0;
         let add = |a: &std::sync::atomic::AtomicU64, now: u64, before: &mut u64| {
             a.fetch_add(now - *before, Ordering::Relaxed);
             *before = now;
@@ -277,6 +279,12 @@ impl Worker {
             &mut c.consent_lost,
         );
         add(&self.stats.ice_restarts, st.restarts, &mut c.restarts);
+        if connected {
+            self.emit_media(
+                rtp,
+                crate::relay::media_events::MediaEventKind::IceConnected,
+            );
+        }
         self.ice_apply(rtp, false);
         self.ice_next = self
             .ice_slots

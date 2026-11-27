@@ -328,6 +328,11 @@ pub enum StartError {
     },
     /// `[webui] user` and `password_hash` cannot be used.
     WebUiLogin(crate::webui::auth::CredentialsError),
+    /// The native API's socket cannot be made.
+    Native {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StartError {
@@ -340,6 +345,9 @@ impl std::fmt::Display for StartError {
             StartError::Link { what, source } => write!(f, "cannot start {what}: {source}"),
             StartError::Thread { what, source } => write!(f, "cannot start {what}: {source}"),
             StartError::WebUiLogin(e) => write!(f, "webui.password_hash: {e}"),
+            StartError::Native { path, source } => {
+                write!(f, "control.native_socket: {}: {source}", path.display())
+            }
         }
     }
 }
@@ -348,7 +356,9 @@ impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StartError::Relay(e) => Some(e),
-            StartError::Listen { source, .. } | StartError::Thread { source, .. } => Some(source),
+            StartError::Listen { source, .. }
+            | StartError::Thread { source, .. }
+            | StartError::Native { source, .. } => Some(source),
             StartError::Link { source, .. } => Some(source),
             StartError::WebUiLogin(e) => Some(e),
         }
@@ -430,6 +440,58 @@ fn start_streams(
     Ok((stream_addrs, stream_threads))
 }
 
+/// The native API's listener, if `[control] native_socket` is set: its
+/// thread.
+fn start_native(
+    control: &mut Control,
+    config: &Config,
+    stop: &Arc<AtomicBool>,
+) -> Result<(Vec<SocketAddr>, Vec<JoinHandle<()>>), StartError> {
+    let c = &config.control;
+    let mut addrs = Vec::new();
+    if c.native_socket.is_none() && c.native_listen.is_empty() {
+        return Ok((addrs, Vec::new()));
+    }
+    control.set_native_max_endpoints(c.native_max_endpoints);
+    control.set_pcm_dir(c.pcm_dir.clone());
+    let link = control.native_link().map_err(|source| StartError::Link {
+        what: "the native API",
+        source,
+    })?;
+    let mut threads = Vec::new();
+    for addr in &c.native_listen {
+        let listener =
+            std::net::TcpListener::bind(addr).map_err(StartError::listen("native", *addr))?;
+        let bound = listener
+            .local_addr()
+            .map_err(StartError::listen("native", *addr))?;
+        log::info!("native API on tcp {bound}");
+        addrs.push(bound);
+        let (stop, link, tokens) = (Arc::clone(stop), link.clone(), c.native_tokens.clone());
+        threads.push(
+            std::thread::Builder::new()
+                .name("rtpflux-native-tcp".to_owned())
+                .spawn(move || crate::native::serve_tcp(&listener, &link, &tokens, &stop))
+                .map_err(StartError::thread("the native API listener"))?,
+        );
+    }
+    let Some(path) = &c.native_socket else {
+        return Ok((addrs, threads));
+    };
+    let listener = crate::native::bind(path).map_err(|source| StartError::Native {
+        path: path.clone(),
+        source,
+    })?;
+    log::info!("native API on {}", path.display());
+    let (stop, uids) = (Arc::clone(stop), config.control.native_uids.clone());
+    let t = std::thread::Builder::new()
+        .name("rtpflux-native-listen".to_owned())
+        .spawn(move || crate::native::serve(&listener, &link, &uids, &stop))
+        .map_err(StartError::thread("the native API listener"))?;
+    threads.push(t);
+    Ok((addrs, threads))
+}
+
 /// The control plane over `relay`: state file (dialogs restored from it)
 /// and recording directory (created) from the configuration.
 fn control_for(relay: Relay, config: &Config) -> Control {
@@ -490,6 +552,7 @@ pub struct Daemon {
     stop: Arc<AtomicBool>,
     control_addrs: Vec<SocketAddr>,
     stream_addrs: Vec<SocketAddr>,
+    native_addrs: Vec<SocketAddr>,
     metrics_addrs: Vec<SocketAddr>,
     control_thread: JoinHandle<()>,
     metrics_threads: Vec<JoinHandle<()>>,
@@ -557,6 +620,8 @@ impl Daemon {
         let (stream_addrs, stream_threads) = start_streams(&mut control, config, &stop)?;
         let mut metrics_threads = Vec::new();
         metrics_threads.extend(stream_threads);
+        let (native_addrs, native_threads) = start_native(&mut control, config, &stop)?;
+        metrics_threads.extend(native_threads);
         for (listener, addr) in listeners.into_iter().zip(&metrics_addrs) {
             log::info!("metrics on http://{addr}/metrics");
             let (stop, sources) = (Arc::clone(&stop), sources.clone());
@@ -586,6 +651,7 @@ impl Daemon {
             stop,
             control_addrs,
             stream_addrs,
+            native_addrs,
             metrics_addrs,
             control_thread,
             metrics_threads,
@@ -604,6 +670,12 @@ impl Daemon {
     #[must_use]
     pub fn stream_addrs(&self) -> &[SocketAddr] {
         &self.stream_addrs
+    }
+
+    /// The bound TCP addresses of the native API.
+    #[must_use]
+    pub fn native_addrs(&self) -> &[SocketAddr] {
+        &self.native_addrs
     }
 
     /// The bound `ng` addresses (useful with port 0).

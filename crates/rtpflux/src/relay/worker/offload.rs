@@ -70,6 +70,7 @@ impl Worker {
         let detects = |slot: Slot| {
             self.transcode.get(slot).is_some_and(Option::is_some)
                 || self.repack.get(slot).is_some_and(Option::is_some)
+                || self.pcm_legs.get(slot).is_some_and(Option::is_some)
         };
         if has_srtp(sa)
             || has_srtp(sb)
@@ -253,6 +254,38 @@ impl Worker {
             if let Some(c) = self.calls.get_mut(&call) {
                 c.offload = OffloadState::No;
             }
+        }
+    }
+
+    /// Report `kind` about the leg of `slot` to the control thread (a scan
+    /// for its call: for rare events only).
+    pub(super) fn emit_media(&self, slot: Slot, kind: crate::relay::media_events::MediaEventKind) {
+        let rtp = slot.rtp();
+        // Legs come as A-RTP, A-RTCP, B-RTP, B-RTCP.
+        let found = self.calls.iter().find_map(|(&id, c)| {
+            c.slots
+                .iter()
+                .position(|&s| s == rtp)
+                .map(|i| (id, if i < 2 { CallLeg::A } else { CallLeg::B }))
+        });
+        if let Some((call, leg)) = found {
+            self.media_events
+                .emit(crate::relay::media_events::Subject::Leg(call, leg), kind);
+        }
+    }
+
+    /// Report key presses that finished on `slot`.
+    pub(super) fn report_dtmf(&self, slot: Slot, events: [Option<crate::relay::DtmfEvent>; 4]) {
+        for e in events.into_iter().flatten() {
+            self.emit_media(
+                slot,
+                crate::relay::media_events::MediaEventKind::Dtmf {
+                    code: e.code,
+                    duration_ms: e.duration_ms,
+                    rtp_timestamp: e.ts,
+                    inband: false,
+                },
+            );
         }
     }
 

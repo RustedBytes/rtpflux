@@ -519,3 +519,232 @@ fn mesh_joins_parties_of_calls() {
         .contains("several calls")
     );
 }
+
+/// `create from offer`: an endpoint's offer is answered by the relay with
+/// no other party; its media goes nowhere until it is connected (here to
+/// a `create`d party of another call, on the other worker); its re-offer
+/// keeps the ports and has its direction mirrored; `delete` ends it.
+#[test]
+#[allow(clippy::too_many_lines)] // Two endpoints, step by step.
+fn a_party_is_created_from_its_offer() {
+    let srv = server_full(
+        65_470,
+        "[[interface]]\nname = \"pub\"\naddress = \"127.0.0.1\"",
+        "",
+        2,
+    );
+    let client = endpoint();
+    let ok = |cookie: &str, pairs: &[(&str, V<'_>)]| {
+        let (r, why, raw) = call(&client, srv.addr, &request(cookie, pairs));
+        assert_eq!(r, "ok", "{}", String::from_utf8_lossy(&why));
+        raw
+    };
+    let (caller, ivr) = (endpoint(), endpoint());
+    for s in [&caller, &ivr] {
+        s.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+    }
+    let port = |s: &UdpSocket| s.local_addr().unwrap().port();
+    let flags: &[&[u8]] = &[b"trust-address"];
+    let offer = |direction: &str| {
+        format!(
+            "v=0\r\no=- 7 {} IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n\
+             a={direction}\r\n",
+            if direction == "sendrecv" { 1 } else { 2 },
+            port(&caller)
+        )
+    };
+    let inbound = |cookie: &str, sdp: &str| {
+        let raw = ok(
+            cookie,
+            &[
+                ("command", V::S(b"create from offer")),
+                ("call-id", V::S(b"in-1")),
+                ("from-tag", V::S(b"caller")),
+                ("label", V::S(b"inbound")),
+                ("sdp", V::S(sdp.as_bytes())),
+                ("flags", V::L(flags)),
+                ("endpoint-learning", V::S(b"off")),
+            ],
+        );
+        let reply = reply_dict(&raw);
+        assert_eq!(text(reply, b"call-id"), b"in-1");
+        assert_eq!(text(reply, b"from-tag"), b"caller");
+        String::from_utf8_lossy(text(reply, b"sdp")).into_owned()
+    };
+    // The caller's offer, answered by the relay alone.
+    let answer = inbound("i1", &offer("sendrecv"));
+    assert!(
+        answer.contains(" RTP/AVP 0 8\r\n")
+            && answer.contains("a=sendrecv")
+            && answer.contains("c=IN IP4 127.0.0.1"),
+        "{answer}"
+    );
+    let for_caller = relay_addr(answer.as_bytes());
+    std::thread::sleep(Duration::from_millis(50));
+    let mut buf = [0u8; 2048];
+    // Parked: its media goes nowhere, nothing comes back.
+    caller.send_to(&rtp(1), for_caller).unwrap();
+    assert!(caller.recv_from(&mut buf).is_err() && ivr.recv_from(&mut buf).is_err());
+    // `query`: the party by its label; the relay's hidden side is none.
+    let raw = ok(
+        "q",
+        &[("command", V::S(b"query")), ("call-id", V::S(b"in-1"))],
+    );
+    let Some(Value::Dict(tags)) = at(reply_dict(&raw), &[b"tags"]) else {
+        panic!()
+    };
+    assert_eq!(tags.iter().map(|(k, _)| k).collect::<Vec<_>>(), [b"caller"]);
+    assert_eq!(
+        text(
+            at(reply_dict(&raw), &[b"tags", b"caller"]).unwrap(),
+            b"label"
+        ),
+        b"inbound"
+    );
+    // An IVR leg of another call, offered by the relay (`create`).
+    let raw = ok(
+        "c1",
+        &[
+            ("command", V::S(b"create")),
+            ("call-id", V::S(b"out-1")),
+            ("from-tag", V::S(b"ivr")),
+            ("codec", V::Raw(b"d5:offerl4:PCMUee")),
+        ],
+    );
+    let for_ivr = relay_addr(text(reply_dict(&raw), b"sdp"));
+    let se = sdp_for(port(&ivr));
+    ok(
+        "c2",
+        &[
+            ("command", V::S(b"create answer")),
+            ("call-id", V::S(b"out-1")),
+            ("from-tag", V::S(b"ivr")),
+            ("sdp", V::S(&se)),
+            ("flags", V::L(flags)),
+            ("endpoint-learning", V::S(b"off")),
+        ],
+    );
+    // Bridged across calls: they talk.
+    ok(
+        "x",
+        &[
+            ("command", V::S(b"connect")),
+            ("call-id", V::S(b"in-1")),
+            ("from-label", V::S(b"inbound")),
+            ("to-call-id", V::S(b"out-1")),
+            ("to-tag", V::S(b"ivr")),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    both_ways(&caller, for_caller, &ivr, for_ivr, 2);
+    // The caller's re-offer puts the call on hold: same port, answered
+    // receive-only.
+    let held = inbound("i2", &offer("sendonly"));
+    assert!(
+        held.contains("a=recvonly") && !held.contains("a=sendrecv"),
+        "{held}"
+    );
+    assert_eq!(relay_addr(held.as_bytes()), for_caller);
+    // A tag of the relay's own, and a missing offer, are refused.
+    for (cookie, pairs) in [
+        (
+            "e1",
+            vec![
+                ("command", V::S(b"create from offer")),
+                ("from-tag", V::S(b"rtpflux-create:x")),
+                ("sdp", V::S(b"v=0\r\n")),
+            ],
+        ),
+        ("e2", vec![("command", V::S(b"create from offer"))]),
+    ] {
+        let (r, _, _) = call(&client, srv.addr, &request(cookie, &pairs));
+        assert_eq!(r, "error", "{cookie}");
+    }
+    // `delete` of the party ends its media.
+    ok(
+        "d",
+        &[
+            ("command", V::S(b"delete")),
+            ("call-id", V::S(b"in-1")),
+            ("from-tag", V::S(b"caller")),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    while ivr.recv_from(&mut buf).is_ok() {}
+    caller.send_to(&rtp(9), for_caller).unwrap();
+    assert!(ivr.recv_from(&mut buf).is_err(), "deleted");
+}
+
+/// `create from offer` answers an SRTP (SDES) offer with the relay's key,
+/// in the offer's profile, and keeps a rejected section rejected; a tag
+/// that already offered in an ordinary dialog is refused.
+#[test]
+fn create_from_offer_answers_srtp_and_refuses_a_dialogs_tag() {
+    let srv = server(59_900);
+    let client = endpoint();
+    let a = endpoint();
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+         m=audio {} RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+         a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n\
+         m=video 0 RTP/AVP 96\r\n",
+        a.local_addr().unwrap().port()
+    );
+    let (r, why, raw) = call(
+        &client,
+        srv.addr,
+        &request(
+            "s",
+            &[
+                ("command", V::S(b"create from offer")),
+                ("call-id", V::S(b"srtp-1")),
+                ("from-tag", V::S(b"a")),
+                ("sdp", V::S(offer.as_bytes())),
+                ("flags", V::L(&[b"trust-address"])),
+            ],
+        ),
+    );
+    assert_eq!(r, "ok", "{}", String::from_utf8_lossy(&why));
+    let answer = String::from_utf8_lossy(text(reply_dict(&raw), b"sdp")).into_owned();
+    assert!(answer.contains(" RTP/SAVP 0\r\n"), "{answer}");
+    assert!(
+        answer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:")
+            && !answer.contains("WVNfX19"),
+        "{answer}"
+    );
+    assert!(answer.contains("m=video 0 "), "{answer}");
+    // A tag that already offered in an ordinary dialog is not taken over.
+    let a = endpoint();
+    let sa = sdp_for(a.local_addr().unwrap().port());
+    let (r, _, _) = call(
+        &client,
+        srv.addr,
+        &request(
+            "o",
+            &[
+                ("command", V::S(b"offer")),
+                ("call-id", V::S(b"take-1")),
+                ("from-tag", V::S(b"a")),
+                ("sdp", V::S(&sa)),
+            ],
+        ),
+    );
+    assert_eq!(r, "ok");
+    let (r, why, _) = call(
+        &client,
+        srv.addr,
+        &request(
+            "c",
+            &[
+                ("command", V::S(b"create from offer")),
+                ("call-id", V::S(b"take-1")),
+                ("from-tag", V::S(b"a")),
+                ("sdp", V::S(&sa)),
+            ],
+        ),
+    );
+    assert_eq!(r, "error");
+    assert!(String::from_utf8_lossy(&why).contains("already offered"));
+}

@@ -1490,6 +1490,7 @@ fn rtpflux_agrees_with_the_reference_model() {
                         connections: vec![],
                         labels: vec![],
                         copies: vec![],
+                        endpoints: vec![],
                     })
                 };
                 let (file, redis) = (snap(f[1]), snap(f[2]));

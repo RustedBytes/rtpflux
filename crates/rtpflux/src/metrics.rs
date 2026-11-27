@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// `ng` commands counted by name.
-pub const COMMANDS: [&str; 31] = [
+pub const COMMANDS: [&str; 32] = [
     "ping",
     "offer",
     "answer",
@@ -45,6 +45,7 @@ pub const COMMANDS: [&str; 31] = [
     "rollback",
     "create",
     "create answer",
+    "create from offer",
     "other",
 ];
 
@@ -74,6 +75,13 @@ pub struct ControlStats {
     pub copies: AtomicU64,
     pub subscriptions: AtomicU64,
     pub delayed_deletes: AtomicU64,
+    /// The native API: endpoints, bridged endpoints, mixers, PCM streams,
+    /// and media events dropped (a full queue).
+    pub native_endpoints: AtomicU64,
+    pub native_bridged: AtomicU64,
+    pub native_mixers: AtomicU64,
+    pub native_streams: AtomicU64,
+    pub media_events_dropped: AtomicU64,
 }
 
 impl ControlStats {
@@ -196,7 +204,42 @@ type ControlMetric = (
     fn(&ControlStats) -> &AtomicU64,
 );
 
-const CONTROL_METRICS: [ControlMetric; 13] = [
+const CONTROL_METRICS: [ControlMetric; 18] = [
+    (
+        "rtpflux_native_endpoints",
+        "native",
+        false,
+        "Media endpoints of the native API.",
+        |c| &c.native_endpoints,
+    ),
+    (
+        "rtpflux_native_bridged_endpoints",
+        "native",
+        false,
+        "Native endpoints bridged to another.",
+        |c| &c.native_bridged,
+    ),
+    (
+        "rtpflux_native_mixers",
+        "native",
+        false,
+        "Conference mixers.",
+        |c| &c.native_mixers,
+    ),
+    (
+        "rtpflux_native_streams",
+        "native",
+        false,
+        "PCM streams to external audio services.",
+        |c| &c.native_streams,
+    ),
+    (
+        "rtpflux_media_events_dropped_total",
+        "native",
+        true,
+        "Media events (key presses, announcements' ends, ...) dropped: the queue to the control thread was full.",
+        |c| &c.media_events_dropped,
+    ),
     (
         "rtpflux_sessions",
         "relay",

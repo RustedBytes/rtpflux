@@ -96,6 +96,10 @@ impl Worker {
         }
         if let Some(Some(d)) = self.dtmf.get_mut(leg) {
             d.packet(&self.bufs[at..at + len], now, leg);
+            if d.unsent_any() {
+                let finished = d.take_unsent();
+                self.report_dtmf(leg, finished);
+            }
         }
         // DTMF security first: what it lets through (or rewrites) may be
         // transcoded then.

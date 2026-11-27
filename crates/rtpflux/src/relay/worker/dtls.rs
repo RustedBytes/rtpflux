@@ -23,6 +23,9 @@ pub(super) struct DtlsTables<'a> {
     pub(super) muxed: &'a PerSlot<bool>,
     pub(super) identity: &'a Identity,
     pub(super) stats: &'a Stats,
+    /// An association that keyed (`true`) or failed, to report once the
+    /// tables are let go ([`Worker::report_dtls`]).
+    pub(super) done: Option<(Slot, bool)>,
 }
 
 impl DtlsTables<'_> {
@@ -68,10 +71,12 @@ impl DtlsTables<'_> {
                 }
                 self.stats.dtls_handshakes.fetch_add(1, Ordering::Relaxed);
                 log::debug!("dtls: SRTP keyed on slot {slot}");
+                self.done = Some((slot, true));
             }
             Progress::Failed => {
                 self.stats.dtls_failures.fetch_add(1, Ordering::Relaxed);
                 log::info!("dtls: association on slot {slot} failed");
+                self.done = Some((slot, false));
             }
             Progress::Pending => {}
         }
@@ -164,6 +169,21 @@ impl Worker {
             muxed: &self.muxed,
             identity: &self.identity,
             stats: &self.stats,
+            done: None,
+        }
+    }
+
+    /// Report an association that keyed or failed.
+    pub(super) fn report_dtls(&self, done: Option<(Slot, bool)>) {
+        if let Some((slot, keyed)) = done {
+            self.emit_media(
+                slot,
+                if keyed {
+                    crate::relay::media_events::MediaEventKind::DtlsReady
+                } else {
+                    crate::relay::media_events::MediaEventKind::DtlsFailed
+                },
+            );
         }
     }
 }

@@ -13,6 +13,20 @@ listen_tcp = []
 listen_http = []
 # Largest accepted command datagram, in octets (512..=65535).
 max_message = 65535
+# The native control API (for a B2BUA or softswitch), on a Unix socket:
+# JSON requests and events, see docs/native-api.md. Only the relay's own
+# user, root and the user ids in native_uids may connect.
+# native_socket = "/run/rtpflux/native.sock"
+native_uids = []
+# Endpoints one tenant may hold at once (0: up to sessions.max).
+native_max_endpoints = 0
+# Where external audio services (speech recognition, voice bots) listen
+# for PCM streams; stream.start names a socket file in it.
+# pcm_dir = "/run/rtpflux/pcm"
+# The native API over TCP too (put TLS in front): each connection first
+# authenticates with a tenant's token (16 characters or more).
+native_listen = []
+native_tokens = {}
 
 # Media interfaces. `direction=<name>` in ng commands selects them.
 # `advertise` is the address written into SDP; it defaults to `address`

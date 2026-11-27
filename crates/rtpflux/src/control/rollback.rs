@@ -80,6 +80,9 @@ impl Control {
         // The re-offer's own calls end; the checkpoint's sides come back.
         let only = Self::only_in(&now.media, &cp.media);
         self.end_media(&only);
+        // The dialog is put back whatever happens; what the media workers
+        // could not take is reported in the reply's `warning`.
+        let mut failed = 0usize;
         for st in cp.media.iter().flatten() {
             for party in [Party::A, Party::B] {
                 let side = if party == Party::A {
@@ -87,11 +90,10 @@ impl Control {
                 } else {
                     &st.b_side
                 };
-                Self::logged(
-                    "rolling back",
-                    st.ports.id,
-                    self.relay.update_side(st.ports.id, st.leg(party), side),
-                );
+                if let Err(e) = self.relay.update_side(st.ports.id, st.leg(party), side) {
+                    log::warn!("call {}: rolling back: {e}", st.ports.id);
+                    failed += 1;
+                }
             }
         }
         if let Err(e) = self.rebundle(&cp.media) {
@@ -99,6 +101,12 @@ impl Control {
                 "call {}: rollback: BUNDLE: {e}",
                 String::from_utf8_lossy(&cp_key.0)
             );
+            failed += 1;
+        }
+        if failed > 0 {
+            self.warnings.push(format!(
+                "rollback: {failed} media update(s) failed; media may not match the SDP"
+            ));
         }
         log::info!(
             "call {}: re-offer rolled back",

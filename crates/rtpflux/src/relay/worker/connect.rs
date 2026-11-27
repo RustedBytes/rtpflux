@@ -193,6 +193,21 @@ impl Worker {
         self.set_transcode(y, transcode[1]);
     }
 
+    /// The leg of RTP slot `slot` is detached from whatever it was joined
+    /// to (its call's other party, a party it was connected to here or on
+    /// another worker): what it sends goes nowhere, and whoever sent to it
+    /// is detached too. Its call stays; `connect` joins it again.
+    pub(super) fn detach(&mut self, slot: Slot) {
+        let local = slot.rtp();
+        if self.legs.get(local).is_none_or(Option::is_none) {
+            return;
+        }
+        self.keep_in_userspace(&[local]);
+        self.release(local, None);
+        self.pair_to(local, DETACHED);
+        self.set_transcode(local, None);
+    }
+
     /// The conversion of what the side of RTP slot `slot` sends.
     fn set_transcode(&mut self, slot: Slot, config: Option<crate::relay::Transcode>) {
         if let Some(t) = self.transcode.get_mut(slot.rtp()) {

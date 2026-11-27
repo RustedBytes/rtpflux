@@ -231,6 +231,10 @@ impl Worker {
                 let (slot, other, call) = (p.slot, p.other, p.call);
                 self.playbacks.swap_remove(k);
                 self.end_play(Kind::Announcement, slot, other, call);
+                self.emit_media(
+                    slot,
+                    crate::relay::media_events::MediaEventKind::PlaybackEnded,
+                );
                 continue;
             };
             let (slot, dst) = (
@@ -325,6 +329,13 @@ impl Worker {
             }
             Err(e) => {
                 log::warn!("call {call}: recording to {}: {e}", path.display());
+                self.media_events.emit(
+                    crate::relay::media_events::Subject::Call(call),
+                    crate::relay::media_events::MediaEventKind::Failed {
+                        what: "recording",
+                        reason: e.kind().to_string(),
+                    },
+                );
                 return;
             }
         }

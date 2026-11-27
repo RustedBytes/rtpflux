@@ -15,7 +15,13 @@ pub(super) struct DtmfLeg {
     pub(super) last_ms: u64,
     pub(super) last_end: u64,
     pub(super) events: Vec<DtmfEvent>,
+    /// Finished events not yet reported to the control thread (a packet
+    /// or a tick finishes at most two); more are dropped.
+    unsent: [Option<DtmfEvent>; UNSENT],
 }
+
+/// Finished events kept for reporting between two drains.
+const UNSENT: usize = 4;
 
 /// Events kept per leg for `query`.
 pub(super) const MAX_DTMF_EVENTS: usize = 256;
@@ -29,7 +35,9 @@ impl DtmfLeg {
             detector: Detector::new(rate / 50),
             last_ms: 0,
             last_end: 0,
-            events: Vec::new(),
+            // Allocated with the leg, so a key press never allocates.
+            events: Vec::with_capacity(MAX_DTMF_EVENTS),
+            unsent: [None; UNSENT],
         })
     }
 
@@ -40,13 +48,27 @@ impl DtmfLeg {
             Some(d) => log::info!("dtmf: slot {slot}: '{d}' ({duration_ms} ms)"),
             None => log::info!("dtmf: slot {slot}: event {} ({duration_ms} ms)", f.code),
         }
+        let event = DtmfEvent {
+            code: f.code,
+            ts: f.ts,
+            duration_ms,
+        };
         if self.events.len() < MAX_DTMF_EVENTS {
-            self.events.push(DtmfEvent {
-                code: f.code,
-                ts: f.ts,
-                duration_ms,
-            });
+            self.events.push(event);
         }
+        if let Some(free) = self.unsent.iter_mut().find(|e| e.is_none()) {
+            *free = Some(event);
+        }
+    }
+
+    /// Whether finished events wait to be reported.
+    pub(super) fn unsent_any(&self) -> bool {
+        self.unsent.iter().any(Option::is_some)
+    }
+
+    /// The finished events not reported yet, oldest first.
+    pub(super) fn take_unsent(&mut self) -> [Option<DtmfEvent>; UNSENT] {
+        core::mem::replace(&mut self.unsent, [None; UNSENT])
     }
 
     /// An authentic RTP packet of this leg.

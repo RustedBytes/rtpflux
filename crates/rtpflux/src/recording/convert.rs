@@ -197,7 +197,24 @@ pub fn run(
     store: &super::store::Store,
     resumable: bool,
     activity: &super::activity::Activity,
+    events: Option<&crate::relay::media_events::MediaEvents>,
 ) {
+    use crate::relay::media_events::{MediaEventKind, Subject};
+    // A finished recording (its last job) is reported to the control
+    // thread's subscribers: its file, and whether it was uploaded.
+    let report = |job: &Job, file: Option<String>, uploaded: Option<bool>| {
+        if let Some(ev) = events.filter(|_| job.last) {
+            let m = &job.conversion.meta;
+            ev.emit(
+                Subject::Dialog {
+                    call_id: m.call_id.clone(),
+                    from_tag: m.from_tag.clone(),
+                    section: m.section,
+                },
+                MediaEventKind::RecordingDone { file, uploaded },
+            );
+        }
+    };
     for job in jobs {
         if !job.last && resumable {
             log::debug!("recording: {} kept, to be continued", job.pcap.display());
@@ -235,7 +252,10 @@ pub fn run(
                     }
                 }
                 if job.last {
-                    let _ = store.keep(&files, &job.conversion.meta);
+                    let left = store.keep(&files, &job.conversion.meta);
+                    let uploaded = store.uploads().then_some(left.is_empty());
+                    let file = files.first().map(|f| f.display().to_string());
+                    report(&job, file, uploaded);
                 }
             }
             Err(e) => {
@@ -246,6 +266,7 @@ pub fn run(
                     "recording: converting {}: {e}; the pcap is kept",
                     job.pcap.display()
                 );
+                report(&job, None, None);
             }
         }
     }
@@ -274,11 +295,12 @@ pub fn spawn(
     store: super::store::Store,
     resumable: bool,
     activity: std::sync::Arc<super::activity::Activity>,
+    events: Option<crate::relay::media_events::MediaEvents>,
 ) -> std::io::Result<(Sender<Job>, JoinHandle<()>)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("rtpflux-recording".to_owned())
-        .spawn(move || run(&rx, &store, resumable, &activity))?;
+        .spawn(move || run(&rx, &store, resumable, &activity, events.as_ref()))?;
     Ok((tx, thread))
 }
 
@@ -337,6 +359,7 @@ mod tests {
                 &super::super::store::Store::Local,
                 resumable,
                 &super::super::activity::Activity::default(),
+                None,
             );
             assert_eq!(wav.exists(), converted, "resumable {resumable}");
             assert!(pcap.exists(), "the pcap stays, to be continued");

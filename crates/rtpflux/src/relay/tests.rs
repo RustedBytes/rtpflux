@@ -12,15 +12,20 @@ fn relay(table: &Table) -> Relay {
 }
 
 fn relay_with(table: &Table, workers: usize) -> Relay {
+    // Each relay its own 64 ports: the tests run in parallel.
+    static NEXT_BLOCK: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     crate::test_logging::init();
+    let block = NEXT_BLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let min = 54_000 + 64 * block;
+    let max = min + 63;
     let config = Config::from_toml(&format!(
         r#"
         [[interface]]
         name = "lo"
         address = "127.0.0.1"
         [ports]
-        min = 53000
-        max = 53063
+        min = {min}
+        max = {max}
         [sessions]
         max = 8
         [runtime]

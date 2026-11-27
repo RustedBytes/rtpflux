@@ -49,6 +49,38 @@ pub struct Saved {
     /// The parties' labels: call-id, tag and label, as hex.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<[String; 3]>,
+    /// The native API's endpoints (their media is in `sessions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<SavedEndpoint>,
+}
+
+/// An endpoint of the native API: its identity and negotiation state (its
+/// media is the created party of the same session and id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedEndpoint {
+    pub id: String,
+    pub tenant: String,
+    pub session: String,
+    /// `local_offer` or `remote_offer`.
+    pub kind: String,
+    pub generation: u64,
+    pub revision: u64,
+    pub ready: bool,
+    #[serde(default)]
+    pub pending_revision: Option<u64>,
+    /// A remote endpoint's offer before the pending renegotiation.
+    #[serde(default)]
+    pub previous_remote_sdp: Option<String>,
+    #[serde(default)]
+    pub bridged_to: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Its lease (it starts again at the restart).
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+    #[serde(default)]
+    pub remote_sdp: Option<String>,
+    pub created_unix_ms: u64,
 }
 
 /// A media subscription (`subscribe request`).
@@ -947,6 +979,7 @@ mod tests {
             connections: Vec::new(),
             labels: Vec::new(),
             copies: Vec::new(),
+            endpoints: Vec::new(),
         };
         write(&path, &saved).unwrap();
         // Written again (replacing the file), still private.
@@ -967,6 +1000,7 @@ mod tests {
             connections: Vec::new(),
             labels: Vec::new(),
             copies: Vec::new(),
+            endpoints: Vec::new(),
         };
         assert_eq!(newer(Some(at(5)), Some(at(9))), Some(at(9)));
         assert_eq!(newer(Some(at(9)), Some(at(5))), Some(at(9)));

@@ -321,6 +321,11 @@ impl Relay {
 
     /// The relay calls that ended on their own since the last call (their
     /// media or answer timed out); their ports are free again.
+    pub fn take_media_events(&mut self) -> Option<super::media_events::MediaEventInbox> {
+        self.media_events.take()
+    }
+
+    /// Relay calls that ended on their own since the last call.
     pub fn take_ended(&mut self) -> Vec<CallId> {
         self.reap();
         std::mem::take(&mut self.ended)
@@ -380,6 +385,35 @@ impl Relay {
             .recv_timeout(std::time::Duration::from_secs(1))
             .ok()
             .flatten()
+    }
+
+    /// Wait (at most `timeout` in all) until the workers of `calls` have
+    /// applied every command sent to them before: `true` once they all
+    /// have. Commands reach a worker in order, so the changes sent for
+    /// these calls are then in effect.
+    pub fn applied(&mut self, calls: &[CallId], timeout: std::time::Duration) -> bool {
+        self.reap();
+        let mut shards: Vec<usize> = calls
+            .iter()
+            .filter_map(|id| self.calls.get(id).map(|c| c.shard))
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let end = std::time::Instant::now() + timeout;
+        let mut answers = Vec::with_capacity(shards.len());
+        for k in shards {
+            let s = &self.shards[k];
+            let (reply, answer) = sync_channel(1);
+            if s.commands.try_send(Command::Barrier { reply }).is_err() {
+                return false;
+            }
+            let _ = s.wake.write(1);
+            answers.push(answer);
+        }
+        answers.iter().all(|a| {
+            a.recv_timeout(end.saturating_duration_since(std::time::Instant::now()))
+                .is_ok()
+        })
     }
 
     /// Counters summed over all workers.

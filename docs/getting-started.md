@@ -83,7 +83,7 @@ a port range too small for the number of sessions. See
 ```
 
 ```text
-INFO rtpflux: rtpflux 0.1.0 starting: 1 interface(s), ports 30000-60000, up to 5000 sessions, xdp off
+INFO rtpflux: rtpflux 0.2.0 starting: 1 interface(s), ports 30000-60000, up to 5000 sessions, xdp off
 INFO rtpflux::relay: relay: 8 worker(s), 1875 port pairs each
 INFO rtpflux: ng control on udp 127.0.0.1:2223
 ```

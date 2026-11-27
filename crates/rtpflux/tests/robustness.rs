@@ -387,6 +387,7 @@ fn ng_control_never_panics() {
         b"rollback",
         b"create",
         b"create answer",
+        b"create from offer",
         b"inject start",
         b"inject stop",
         b"mesh",
@@ -501,6 +502,114 @@ fn ng_control_never_panics() {
     let ping = request("p", &[(b"command", b"ping", false)]);
     assert!(String::from_utf8_lossy(c.handle(&ping).unwrap()).contains("pong"));
     let _ = Value::Int(0);
+}
+
+/// Native API requests (JSON, mutated and random, of every operation,
+/// with fields of every type) never panic the control thread, which still
+/// answers afterwards; PCM stream frame headers never panic their parser.
+#[test]
+fn native_requests_and_pcm_frames_never_panic() {
+    use rtpflux::control::native::{OPERATIONS, Origin};
+    logging::init();
+    let config = Config::from_toml(
+        "[[interface]]\nname = \"pub\"\naddress = \"127.0.0.1\"\n\
+         [ports]\nmin = 41400\nmax = 41599\n[sessions]\nmax = 32\n[runtime]\nworkers = 1\n",
+    )
+    .unwrap();
+    let mut c = Control::new(Relay::start(&config).unwrap(), config.interfaces.clone());
+    let origin = Origin {
+        connection: 1,
+        events: None,
+        tenant: None,
+    };
+    let sdp = String::from_utf8_lossy(PLAIN_SDP).into_owned();
+    let values = [
+        serde_json::json!(null),
+        serde_json::json!(true),
+        serde_json::json!(-1),
+        serde_json::json!(u64::MAX),
+        serde_json::json!(1.5),
+        serde_json::json!("ep-0"),
+        serde_json::json!(sdp),
+        serde_json::json!([1, "x", {"y": []}]),
+        serde_json::json!({"flags": ["trust-address"], "ICE": "remove", "call-id": "x"}),
+        serde_json::json!(["PCMU", "nonsense"]),
+    ];
+    let keys = [
+        "v",
+        "endpoint_id",
+        "peer_endpoint_id",
+        "remote_sdp",
+        "sdp",
+        "codecs",
+        "options",
+        "session_id",
+        "label",
+        "lease_ms",
+        "revision",
+        "expected_generation",
+        "expected_revision",
+        "deadline_unix_ms",
+        "tenant",
+        "idempotency_key",
+        "file",
+        "blob_base64",
+        "mixer_id",
+        "stream_id",
+        "socket",
+        "rate",
+        "muted",
+        "gain_db",
+        "types",
+    ];
+    let mut rng = Rng(0x5eed);
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..1500 * scale() {
+        let mut req = serde_json::Map::new();
+        req.insert(
+            "op".into(),
+            serde_json::json!(OPERATIONS[rng.below(OPERATIONS.len())]),
+        );
+        for _ in 0..rng.below(6) {
+            let k = keys[rng.below(keys.len())];
+            let v = if k.ends_with("_id") && !ids.is_empty() && rng.below(2) == 0 {
+                serde_json::json!(ids[rng.below(ids.len())])
+            } else {
+                values[rng.below(values.len())].clone()
+            };
+            req.insert(k.into(), v);
+        }
+        let mut body = serde_json::to_vec(&req).unwrap();
+        if rng.below(6) == 0 {
+            body = rng.mutate(&body, b"{}");
+        }
+        let reply = catch_unwind(AssertUnwindSafe(|| c.native_request(&body, &origin)))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "native: case {i} panics on {}",
+                    String::from_utf8_lossy(&body)
+                )
+            });
+        // Endpoints made are used by the cases after.
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&reply)
+            && let Some(id) = v["result"]["endpoint_id"].as_str()
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    let hello = c.native_request(br#"{"op":"hello"}"#, &origin);
+    assert!(String::from_utf8_lossy(&hello).contains("\"ok\":true"));
+    fuzz(
+        "pcm frame",
+        20_000,
+        inputs(
+            &[b"RFPC\x01\x02\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x80\x3e\0\0\x01\x01\x40\x01"],
+            40,
+        ),
+        |b| {
+            let _ = rtpflux::pcm::frame::Header::parse(b);
+        },
+    );
 }
 
 /// What arrives on a call's ports — garbage, mutated RTP, RTCP, telephone

@@ -91,6 +91,26 @@ pub struct Control {
     pub listen_http: Vec<SocketAddr>,
     /// Largest accepted command datagram, in octets.
     pub max_message: usize,
+    /// The native control API's Unix socket (a B2BUA's or softswitch's
+    /// connection; see `docs/native-api.md`). None: not served.
+    pub native_socket: Option<std::path::PathBuf>,
+    /// The user ids allowed to connect to `native_socket`, besides the
+    /// relay's own user (always allowed) and root.
+    pub native_uids: Vec<u32>,
+    /// Endpoints one tenant may hold through the native API at once (0: up
+    /// to `sessions.max`).
+    pub native_max_endpoints: usize,
+    /// The directory of the Unix sockets external audio services listen
+    /// on (`stream.start` names one by its file name). None: no PCM
+    /// streams.
+    pub pcm_dir: Option<std::path::PathBuf>,
+    /// TCP endpoints of the native API (for a softswitch on another host;
+    /// put TLS in front). Each connection authenticates with a tenant's
+    /// token first.
+    pub native_listen: Vec<SocketAddr>,
+    /// The native API's tokens over TCP: tenant name → token (at least 16
+    /// characters).
+    pub native_tokens: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Control {
@@ -100,6 +120,12 @@ impl Default for Control {
             listen_tcp: Vec::new(),
             listen_http: Vec::new(),
             max_message: 65_535,
+            native_socket: None,
+            native_uids: Vec::new(),
+            native_max_endpoints: 0,
+            pcm_dir: None,
+            native_listen: Vec::new(),
+            native_tokens: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -485,6 +511,8 @@ pub enum LogFormat {
 pub enum Problem {
     NoControlListen,
     MaxMessage,
+    /// `control.native_listen` without tokens, or a token shorter than 16.
+    NativeTokens,
     NoInterface,
     IcePacing,
     /// `ice.stun_server` that is not host:port.
@@ -563,6 +591,9 @@ impl fmt::Display for Problem {
             Problem::NoControlListen => {
                 f.write_str("control.listen: at least one endpoint is required")
             }
+            Problem::NativeTokens => f.write_str(
+                "control.native_tokens: native_listen needs a token per tenant, each of 16 characters or more",
+            ),
             Problem::MaxMessage => {
                 f.write_str("control.max_message: must be between 512 and 65535")
             }
@@ -730,6 +761,11 @@ impl Config {
         let mut problems = Vec::new();
         if self.control.listen.is_empty() {
             problems.push(Problem::NoControlListen);
+        }
+        if (!self.control.native_listen.is_empty() && self.control.native_tokens.is_empty())
+            || self.control.native_tokens.values().any(|t| t.len() < 16)
+        {
+            problems.push(Problem::NativeTokens);
         }
         if !(512..=65_535).contains(&self.control.max_message) {
             problems.push(Problem::MaxMessage);

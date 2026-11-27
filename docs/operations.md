@@ -70,6 +70,9 @@ rtpflux_ng_requests_total{command="answer"} 1
 | `rtpflux_calls` | gauge | Relayed media sections (a dialog with audio and video counts 2) |
 | `rtpflux_workers` | gauge | Media worker threads |
 | `rtpflux_ng_requests_total{command=…}` | counter | ng requests by command (`other` for unknown commands) |
+| `rtpflux_native_endpoints`, `rtpflux_native_bridged_endpoints` | gauge | Endpoints of the [native API](native-api.md), and those bridged |
+| `rtpflux_native_mixers`, `rtpflux_native_streams` | gauge | Conference mixers, and PCM streams to external services |
+| `rtpflux_media_events_dropped_total` | counter | Media events (key presses, announcements' ends, …) dropped because the queue to the control thread was full |
 | `rtpflux_ng_errors_total` | counter | ng requests answered with an error |
 | `rtpflux_ng_retransmissions_total` | counter | Repeated ng requests answered from the reply cache |
 | `rtpflux_recordings_converted_total` | counter | Recordings converted when they ended (or kept as pcap) |

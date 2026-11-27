@@ -13,10 +13,20 @@
 //! the other options of an offer apply. Inside, the offer is made by a
 //! hidden party ([`CREATOR`] and the tag) whose side is never advertised;
 //! the created party is its answerer.
+//!
+//! `create from offer` (rtpflux's own) is the other direction: a party's
+//! endpoint offers (an inbound call to a media endpoint, with no second
+//! party yet), and the relay answers it. The party is the offerer of a
+//! dialog whose answerer is the hidden party, which answers the offer
+//! through the usual answer path with every offered format and each
+//! section's direction mirrored. The reply's `sdp` is the answer to the
+//! party's offer; its media then goes nowhere until it is joined to
+//! others, as a created party's. A later `create from offer` with the same
+//! tags is a re-offer of that dialog (the party's re-INVITE): same ports.
 
 use super::{Control, Error, RequestError, required, unix_now};
 use core::fmt::Write as _;
-use rtpflux_ng::bencode::{Dict, Value, decode};
+use rtpflux_ng::bencode::{Dict, Encoder, Value, decode};
 
 /// The hidden offerer of a created party's dialog: this and its tag.
 pub(super) const CREATOR: &[u8] = b"rtpflux-create:";
@@ -102,9 +112,9 @@ fn template(sections: &[Vec<&[u8]>]) -> Result<String, Error> {
 }
 
 impl Control {
-    /// `create`: the offer to the created party's endpoint. The reply has
-    /// `call-id`, `from-tag` (the party's) and `sdp`.
-    pub(super) fn create(&mut self, req: &Dict<'_>) -> Result<(Vec<u8>, Vec<u8>, usize), Error> {
+    /// The request's `call-id` and `from-tag`, each made up when missing
+    /// (32 and 16 hex digits).
+    fn made_up_ids(&mut self, req: &Dict<'_>) -> (Vec<u8>, Vec<u8>) {
         self.created_seq += 1;
         let seq = self.created_seq;
         let random = |n: u32| {
@@ -120,6 +130,13 @@ impl Control {
             Some(t) => t.to_vec(),
             None => random(3).into_bytes(),
         };
+        (call_id, tag)
+    }
+
+    /// `create`: the offer to the created party's endpoint. The reply has
+    /// `call-id`, `from-tag` (the party's) and `sdp`.
+    pub(super) fn create(&mut self, req: &Dict<'_>) -> Result<(Vec<u8>, Vec<u8>, usize), Error> {
+        let (call_id, tag) = self.made_up_ids(req);
         if is_creator(&tag) {
             return Err(Error::unsupported(
                 "create: a tag of the relay's own".to_owned(),
@@ -147,10 +164,7 @@ impl Control {
         // Nothing reaches the hidden side, and the party's media goes
         // nowhere until it is joined to someone.
         let key = (call_id.clone(), creator);
-        if let Some(s) = self.sessions.get(&key) {
-            let states = s.media.clone();
-            self.apply_echo(&states, Some([crate::relay::Echo::Discard; 2]), true);
-        }
+        self.park_or_rejoin(&key, &(call_id.clone(), tag.clone()));
         if let Some(l) = req
             .get_bytes(b"set-label")
             .or_else(|| req.get_bytes(b"label"))
@@ -163,6 +177,137 @@ impl Control {
             String::from_utf8_lossy(&tag)
         );
         Ok((call_id, tag, n))
+    }
+
+    /// `create from offer`: answer the offer `sdp` of a new party
+    /// `from-tag` (made up when missing) of `call-id` (likewise), with no
+    /// other party. The reply has `call-id`, `from-tag` and `sdp` (the
+    /// answer).
+    pub(super) fn create_from_offer(
+        &mut self,
+        req: &Dict<'_>,
+    ) -> Result<(Vec<u8>, Vec<u8>, usize), Error> {
+        required(req, "sdp")?;
+        let (call_id, tag) = self.made_up_ids(req);
+        if is_creator(&tag) {
+            return Err(Error::unsupported(
+                "create from offer: a tag of the relay's own".to_owned(),
+            ));
+        }
+        let creator = [CREATOR, &tag].concat();
+        let key = (call_id.clone(), tag.clone());
+        // The party's dialog with the hidden side, made before: a re-offer.
+        let again = self
+            .sessions
+            .get(&key)
+            .is_some_and(|s| s.to_tag.as_deref() == Some(&creator[..]));
+        if !again && self.sessions.contains_key(&key) {
+            // The tag offers in a dialog of another kind: not taken over.
+            return Err(Error::unsupported(
+                "create from offer: the tag already offered in this call".to_owned(),
+            ));
+        }
+        // The relay's side towards no one is plain RTP.
+        let mut set: Vec<(&[u8], &[u8])> = vec![
+            (b"call-id", &call_id),
+            (b"from-tag", &tag),
+            (b"transport-protocol", b"RTP/AVP"),
+        ];
+        if again {
+            set.push((b"to-tag", &creator));
+        }
+        let offer = super::subscribe::with_entries(req, &set, &[b"command"])?;
+        let Ok(Value::Dict(od)) = decode(&offer) else {
+            return Err(Error::Request(RequestError::TooLarge));
+        };
+        let n = self.offer(&od)?;
+        let hidden = crate::publish::mirror_answer(&self.sdp_buf[..n]);
+        // The hidden side's answer: its address taken as written, nothing
+        // learned.
+        let answer = {
+            let mut buf = vec![0u8; super::MAX_DATAGRAM];
+            let mut e = Encoder::new(&mut buf);
+            let full = |_| Error::Request(RequestError::TooLarge);
+            e.dict().map_err(full)?;
+            for (k, v) in [
+                (&b"call-id"[..], &call_id[..]),
+                (b"endpoint-learning", b"off"),
+            ] {
+                e.bytes(k).map_err(full)?;
+                e.bytes(v).map_err(full)?;
+            }
+            e.bytes(b"flags").map_err(full)?;
+            e.list().map_err(full)?;
+            e.bytes(b"trust-address").map_err(full)?;
+            e.end().map_err(full)?;
+            for (k, v) in [
+                (&b"from-tag"[..], &tag[..]),
+                (b"sdp", &hidden[..]),
+                (b"to-tag", &creator[..]),
+            ] {
+                e.bytes(k).map_err(full)?;
+                e.bytes(v).map_err(full)?;
+            }
+            e.end().map_err(full)?;
+            let n = e.len();
+            buf.truncate(n);
+            buf
+        };
+        let Ok(Value::Dict(ad)) = decode(&answer) else {
+            return Err(Error::Request(RequestError::TooLarge));
+        };
+        let n = match self.answer(&ad) {
+            Ok(n) => n,
+            Err(e) => {
+                // A new party that cannot be answered leaves nothing.
+                if !again && let Some(s) = self.sessions.remove(&key) {
+                    self.end_session(&s);
+                }
+                return Err(e);
+            }
+        };
+        // Nothing reaches the hidden side, and the party's media goes
+        // nowhere until it is joined to someone.
+        self.park_or_rejoin(&key, &key);
+        if let Some(l) = req
+            .get_bytes(b"set-label")
+            .or_else(|| req.get_bytes(b"label"))
+        {
+            self.set_label(&call_id, &tag, l);
+        }
+        log::info!(
+            "call {}: party {} created from its offer",
+            String::from_utf8_lossy(&call_id),
+            String::from_utf8_lossy(&tag)
+        );
+        Ok((call_id, tag, n))
+    }
+
+    /// After an offer of the created party `party` (in the dialog under
+    /// `key`): a party joined to another (`connect`) is joined again (a
+    /// re-offer may have changed its sections); any other is parked: its
+    /// media goes nowhere, and nothing reaches the hidden side.
+    fn park_or_rejoin(&mut self, key: &super::SessionKey, party: &super::SessionKey) {
+        let peer = self.connections.iter().find_map(|(a, b)| {
+            if a == party {
+                Some(b.clone())
+            } else if b == party {
+                Some(a.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(peer) = peer {
+            if let Err(e) = self.connect_parties(party, &peer) {
+                self.warnings
+                    .push(format!("the connection could not be made again: {e}"));
+            }
+            return;
+        }
+        if let Some(s) = self.sessions.get(key) {
+            let states = s.media.clone();
+            self.apply_echo(&states, Some([crate::relay::Echo::Discard; 2]), true);
+        }
     }
 
     /// `create answer`: `call-id`, `from-tag` (the created party's) and

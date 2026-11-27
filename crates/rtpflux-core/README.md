@@ -35,6 +35,25 @@ enforce that:
 | `dtmf`, `dtmf_inband` | RFC 4733 telephone events, and DTMF tone detection in audio |
 | `g711`, `g722` | G.711 and G.722 codecs |
 | `ports`, `ring` | The media port allocator and fixed-capacity ring buffers |
+| `dsp` | PCM kernels for decoded media: jitter buffer, loss concealment, gain and limiter, VAD, resampler, N − 1 mixer, tone generator |
+
+## PCM kernels (`dsp`)
+
+For media that is decoded rather than relayed (transcoding, conferences,
+announcements). Audio is `i16` mono, frames of 10 or 20 ms at 8, 16, 24
+or 48 kHz (at most `dsp::MAX_FRAME` = 960 samples). Every structure is
+fixed-size and nothing allocates; time comes in as an argument (RTP
+timestamp units), never from a clock.
+
+| Module | What it does |
+|---|---|
+| `dsp::jitter` | `JitterBuffer<N>`: reorders by extended sequence number, plays packets when due against the caller's playout clock and target delay, reports gaps as `Missing`; drops and counts duplicates, late, too-early and oversized packets |
+| `dsp::plc` | `Plc`: repeats the last good frame with −6 dB per further lost frame, silence after 60 ms, 5 ms cross-fade back |
+| `dsp::gain` | Q8/Q16 gains, a −60..+24 dB table, and a peak `Limiter` from `i32` into `i16` |
+| `dsp::vad` | `Vad`: energy detector with adaptive noise floor, 30 ms onset and 300 ms hangover by default |
+| `dsp::resample` | `Resampler`: polyphase Kaiser-windowed sinc among the four rates, coefficients built at compile time, continuous across frames |
+| `dsp::mix` | `Mixer<P>`: N − 1 conference mix in `i32`, own contribution removed exactly before limiting |
+| `dsp::tone` | `Tone`: one or two phase-continuous sines at a level in dBm0 (DTMF, call progress) |
 
 ## Depends on
 

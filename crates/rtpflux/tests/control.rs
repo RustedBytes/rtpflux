@@ -301,7 +301,15 @@ fn unusable_state_files_restore_nothing() {
     assert_eq!(restore(&saved.to_string(), 54_400), 1);
     // A port taken meanwhile: that call cannot come back.
     let port = saved["sessions"][0]["media"][0]["port_a"].as_u64().unwrap();
-    let _taken = std::net::UdpSocket::bind(("127.0.0.1", u16::try_from(port).unwrap())).unwrap();
+    // (The relay just dropped may still be closing its sockets.)
+    let port = u16::try_from(port).unwrap();
+    let _taken = (0..100)
+        .find_map(|_| {
+            std::net::UdpSocket::bind(("127.0.0.1", port))
+                .map_err(|_| std::thread::sleep(std::time::Duration::from_millis(20)))
+                .ok()
+        })
+        .expect("the port is released");
     assert_eq!(restore(&good, 54_400), 0);
     // Saving into a directory that does not exist is reported, not fatal.
     let mut c = control(54_500);

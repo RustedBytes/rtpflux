@@ -18,20 +18,22 @@ This runs, without root:
 - **Unit tests** in every crate: SDP parsing and rewriting, SRTP against
   the RFC test vectors, latching, DTMF detection, RTCP, G.711, G.722
   (bit for bit against another translation of the reference code), G.729,
-  Opus and AMR,
+  Opus and AMR, the PCM kernels (jitter buffer, concealment, resampler,
+  VAD, N − 1 mixer, tones; against reference implementations),
   the XDP program's reference logic, and more.
 - **Integration tests** in `crates/rtpflux/tests/`. They start a real relay
   on loopback and drive it over the ng protocol with real UDP media:
 
 | File | What it covers |
 |---|---|
-| `ng/` | The ng commands over UDP: calls, re-INVITEs and `rollback`, hold, BUNDLE, SRTP bridging, blocking and DTMF security, RTCP statistics, transcoding, announcements, subscriptions, calls with more than two parties (labels, `connect`, `mesh`, `inject`), `create`, and the options of offers and answers |
+| `ng/` | The ng commands over UDP: calls, re-INVITEs and `rollback`, hold, BUNDLE, SRTP bridging, blocking and DTMF security, RTCP statistics, transcoding, announcements, subscriptions, calls with more than two parties (labels, `connect`, `mesh`, `inject`), `create` and `create from offer`, delayed deletes, and the options of offers and answers |
+| `native.rs` | The [native control API](native-api.md) over its Unix socket, with `rtpflux-client`: two independent endpoints negotiated both ways, bridged across workers, renegotiated (commit and abort), destroyed (tombstones, idempotent destroy); DTMF, playback, bridge and speech events; idempotency keys, generations, tenants, deadlines, leases and the endpoint limit; endpoints surviving a restart; a PCM stream to a service (decoded audio, speech detection, audio back, marks, flush); mixers (N − 1, mute, active speaker; G.722 and PCMU together; a supervisor listening, whispering and barging in); in-band DTMF; the API over TCP with tokens; a worker's failure reported; churn without leaks |
 | `relay.rs` | The media relay itself: forwarding both ways, RTCP, latching, strict source, batching, port reuse, timeouts |
 | `recording.rs` | pcap recordings |
-| `restart.rs` | Calls, blocking, DTMF security, recordings, announcements, connections, copies, labels and `media echo` surviving a restart; offers answered, re-offers rolled back and created parties answered after one |
+| `restart.rs` | Calls, blocking, DTMF security, recordings, announcements, connections, copies, labels and `media echo` surviving a restart; offers answered, re-offers rolled back and created parties answered after one; parties created from their offer |
 | `conformance.rs` | The conformance vectors (below) |
 | `ng/uring.rs` | Calls received with `io_uring` and with `recvmmsg` (`runtime.receive`); the rest of `ng/` uses the default (`io_uring`), or `recvmmsg` with `RTPFLUX_TEST_RECEIVE=recvmmsg` |
-| `robustness.rs` | No untrusted input panics: RTP, RTCP, STUN, telephone events, SDP, bencode, SRTP and the XDP frame checks get random bytes and mutated valid inputs; the ng control layer gets every command with mutated options and SDP; a live call's ports get mutated media from its parties and a stranger, and still relay afterwards. Seeded, so reproducible; `RTPFLUX_FUZZ_SCALE=<n>` runs `n` times as many cases (run it in a debug build, where overflow panics) |
+| `robustness.rs` | No untrusted input panics: RTP, RTCP, STUN, telephone events, SDP, bencode, SRTP and the XDP frame checks get random bytes and mutated valid inputs; the ng control layer gets every command with mutated options and SDP; a live call's ports get mutated media from its parties and a stranger, and still relay afterwards; native API requests of every operation, with fields of every type, and PCM stream frames. Seeded, so reproducible; `RTPFLUX_FUZZ_SCALE=<n>` runs `n` times as many cases (run it in a debug build, where overflow panics) |
 | `control.rs` | Error replies to bad requests, state files that cannot be restored, and calls restored from Redis (the newer of file and Redis) |
 | `daemon.rs` | The command line, the daemon started, used and stopped, and the `rtpflux` binary itself (SIGTERM) |
 | `webui.rs` | The web UI over HTTP: login, the app's files and headers, read-only rules, and the API with a real call |

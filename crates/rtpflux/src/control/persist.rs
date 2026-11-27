@@ -227,6 +227,7 @@ impl Control {
                         .map(move |(tag, label)| [call, tag, label].map(|x| state::hex(x)))
                 })
                 .collect(),
+            endpoints: self.saved_endpoints(),
         }
     }
 
@@ -349,6 +350,7 @@ impl Control {
                 );
             }
         }
+        self.restore_endpoints(&saved.endpoints);
         for s in &saved.subscriptions {
             if let Err(e) = self.restore_subscription(s) {
                 log::warn!(
@@ -523,6 +525,7 @@ impl Control {
         );
         let session = Session {
             created: s.created,
+            generation: self.new_generation(),
             to_tag,
             dir: s.dir.map(InterfaceId::new),
             media: states,

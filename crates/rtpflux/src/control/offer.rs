@@ -404,8 +404,19 @@ impl Control {
             .dtls_fingerprint_with(fingerprint_hash(&opt, &[]))
             .to_owned();
         let relayed = self.offered_to_b(&states, &selections, &fingerprint, dir[1]);
-        let (created, to_tag, sdps, mut versions, prev_via, checkpoint) =
-            prev_meta.unwrap_or_else(|| (unix_now(), None, Vec::new(), Vec::new(), None, None));
+        let is_new = prev_meta.is_none();
+        let ((created, generation), to_tag, sdps, mut versions, prev_via, checkpoint) =
+            match prev_meta {
+                Some(p) => p,
+                None => (
+                    (unix_now(), self.new_generation()),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            };
         // Offering to a bundled answerer: its group again.
         let group_ids = if states.iter().flatten().any(MediaState::b_bundled) {
             Self::answer_group_ids(&states, &vec![true; states.len()])
@@ -431,6 +442,7 @@ impl Control {
         };
         let session = Session {
             created,
+            generation,
             to_tag,
             dir,
             media: states,
@@ -446,6 +458,11 @@ impl Control {
         self.warn_offer(sdp, &media[..count], &opt, &session.media);
         if written.is_ok() {
             self.apply_echo(&session.media, opt.media_echo, true);
+        } else if is_new {
+            // A new dialog whose offer cannot be written is not kept: its
+            // calls end, as if it had never been asked for.
+            self.end_session(&session);
+            return written;
         }
         self.store_offer(&key, session, sdp);
         written
@@ -494,7 +511,7 @@ impl Control {
             .collect();
         let prev_meta = prev.as_ref().map(|p| {
             (
-                p.created,
+                (p.created, p.generation),
                 p.to_tag.clone(),
                 p.sdps.clone(),
                 p.versions.clone(),
@@ -1167,10 +1184,10 @@ fn select_formats(
         .collect()
 }
 
-/// What a dialog had before a re-offer: (created, to-tag, SDPs, `o=`
-/// versions, via-branch).
+/// What a dialog had before a re-offer: ((created, generation), to-tag,
+/// SDPs, `o=` versions, via-branch).
 type PrevMeta = (
-    u64,
+    (u64, u64),
     Option<Vec<u8>>,
     Vec<(Vec<u8>, Vec<u8>)>,
     sdp_edits::Versions,

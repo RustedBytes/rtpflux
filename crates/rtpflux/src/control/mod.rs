@@ -44,6 +44,7 @@ mod ice;
 mod keys;
 mod legacy;
 mod media;
+pub mod native;
 mod offer;
 mod opts;
 mod parties;
@@ -97,6 +98,10 @@ pub const MAX_DATAGRAM: usize = 65_535;
 const WEB: u64 = u64::MAX;
 /// The epoll token of messages from streams.
 const STREAMS: u64 = u64::MAX - 1;
+/// The epoll key of the native API's wake-up.
+const NATIVE: u64 = u64::MAX - 2;
+/// The epoll key of the media events' wake-up.
+const MEDIA: u64 = u64::MAX - 3;
 /// Replies kept for retransmissions, at most, and their total size.
 const CACHE_ENTRIES: usize = 4_096;
 const CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -119,6 +124,9 @@ struct Selector {
     from_tag: Option<Vec<u8>>,
     to_tag: Option<Vec<u8>>,
     via: Option<Vec<u8>>,
+    /// Only the dialogs of these generations ([`Session::generation`]): a
+    /// delayed delete's, chosen when it was asked for.
+    generations: Option<Vec<u64>>,
 }
 
 impl Selector {
@@ -126,6 +134,10 @@ impl Selector {
     fn matches(&self, (c, f): &SessionKey, s: &Session) -> bool {
         let f = base_tag(f);
         *c == self.call_id
+            && self
+                .generations
+                .as_ref()
+                .is_none_or(|g| g.contains(&s.generation))
             && self
                 .from_tag
                 .as_deref()
@@ -165,6 +177,11 @@ type Stored = (SessionKey, Session);
 struct Session {
     /// When the offer created it (seconds since the Unix epoch).
     created: u64,
+    /// Which dialog under its key this is: a dialog made again under the
+    /// same key (after a `delete`) has another, its re-offers the same, so
+    /// what was meant for the earlier one (a `delete-delay`) never reaches
+    /// it.
+    generation: u64,
     /// The answer's `to-tag`, once answered.
     to_tag: Option<Vec<u8>>,
     /// Interface indices: offerer's side, answerer's side.
@@ -193,6 +210,7 @@ impl Session {
     fn bare(dir: [InterfaceId; 2], media: Vec<Option<MediaState>>) -> Self {
         Session {
             created: 0,
+            generation: 0,
             to_tag: None,
             dir,
             media,
@@ -333,6 +351,11 @@ pub struct Control {
     web: Option<web::WebInbox>,
     /// Messages from TCP, HTTP and WebSocket connections.
     streams: Option<streams::NgInbox>,
+    /// The native API: its endpoints, and requests from its connections.
+    native: native::Native,
+    native_inbox: Option<native::NativeInbox>,
+    /// Media events from the workers (key presses, announcements, …).
+    media_events: Option<crate::relay::media_events::MediaEventInbox>,
     /// The dialogs changed since the state file was written, and when it
     /// was.
     state_dirty: bool,
@@ -362,6 +385,8 @@ pub struct Control {
     copies: Vec<copies::Copy>,
     /// Parties made by `create`, so far (for their made-up tags).
     created_seq: u64,
+    /// The last dialog generation given ([`Session::generation`]).
+    generation_seq: u64,
     /// The relay calls a pending checkpoint has, while an offer is handled:
     /// not ended by it.
     keep_calls: Vec<CallId>,
@@ -423,7 +448,8 @@ fn required<'a>(d: &Dict<'a>, key: &str) -> Result<&'a [u8], Error> {
 
 impl Control {
     #[must_use]
-    pub fn new(relay: Relay, interfaces: Vec<Interface>) -> Self {
+    pub fn new(mut relay: Relay, interfaces: Vec<Interface>) -> Self {
+        let media_events = relay.take_media_events();
         Control {
             relay,
             started: Instant::now(),
@@ -452,6 +478,9 @@ impl Control {
             extras: HashMap::new(),
             web: None,
             streams: None,
+            native: native::Native::default(),
+            native_inbox: None,
+            media_events,
             state_dirty: false,
             state_written: Instant::now(),
             offer_timeout: Duration::from_secs(3_600),
@@ -462,6 +491,7 @@ impl Control {
             labels: HashMap::new(),
             keep_calls: Vec::new(),
             created_seq: 0,
+            generation_seq: 0,
             copies: Vec::new(),
             loop_attr: {
                 use std::hash::{Hash, Hasher};
@@ -633,6 +663,9 @@ impl Control {
             self.due_deletes();
         }
         self.end_overdue();
+        // Leases that ran out, endpoints a delayed delete ended.
+        self.native_reconcile("ended");
+        self.native_media_events();
         let ended = self.relay.take_ended();
         if ended.is_empty() {
             return;
@@ -662,6 +695,7 @@ impl Control {
             self.extras.remove(&id);
             self.ice_forget(id);
         }
+        self.native_reconcile("timeout");
         self.gauges();
         self.mark_dirty();
     }
@@ -682,6 +716,7 @@ impl Control {
         s.copies.store(self.copies.len() as u64, Ordering::Relaxed);
         s.subscriptions
             .store(self.subscriptions.len() as u64, Ordering::Relaxed);
+        self.native_gauges();
         s.delayed_deletes
             .store(self.delayed_deletes.len() as u64, Ordering::Relaxed);
         if let Some(w) = &self.state_redis {
@@ -766,6 +801,13 @@ impl Control {
                 ])
             }),
             b"create answer" => self.create_answer(body).map(|()| Reply::Ok),
+            b"create from offer" => self.create_from_offer(body).map(|(call_id, tag, n)| {
+                Reply::Fields(vec![
+                    (b"call-id".to_vec(), B::Bytes(call_id)),
+                    (b"from-tag".to_vec(), B::Bytes(tag)),
+                    (b"sdp".to_vec(), B::Bytes(self.sdp_buf[..n].to_vec())),
+                ])
+            }),
             b"inject start" => self.inject(body, true).map(|()| Reply::Ok),
             b"mesh" => self.mesh(body).map(|()| Reply::Ok),
             b"inject stop" => self.inject(body, false).map(|()| Reply::Ok),
@@ -816,6 +858,8 @@ impl Control {
             .into_owned();
         self.warnings.clear();
         let outcome = self.dispatch(command, &msg.body);
+        // Endpoints of the native API an `ng` command ended.
+        self.native_reconcile("ended");
         self.link_gauges();
         let warning = (!self.warnings.is_empty()).then(|| self.warnings.join("; "));
         if let Some(w) = &warning {
@@ -854,7 +898,18 @@ impl Control {
             {
                 self.mark_dirty();
             }
-            Ok(_) if matches!(command, b"offer" | b"answer" | b"delete" | b"publish") => {
+            Ok(_)
+                if matches!(
+                    command,
+                    b"offer"
+                        | b"answer"
+                        | b"delete"
+                        | b"publish"
+                        | b"create"
+                        | b"create answer"
+                        | b"create from offer"
+                ) =>
+            {
                 self.mark_dirty();
                 let sections = self
                     .sessions
@@ -1114,6 +1169,12 @@ impl Control {
         Ok(())
     }
 
+    /// A dialog generation not given before.
+    fn new_generation(&mut self) -> u64 {
+        self.generation_seq += 1;
+        self.generation_seq
+    }
+
     fn delete(&mut self, d: &Dict<'_>) -> Result<(), Error> {
         // What selects the dialog besides the call: a tag, its answerer (a
         // fork that lost must not end the call another fork answered) and
@@ -1124,6 +1185,7 @@ impl Control {
             from_tag: d.get_bytes(b"from-tag").map(<[u8]>::to_vec),
             to_tag: d.get_bytes(b"to-tag").map(<[u8]>::to_vec),
             via: d.get_bytes(b"via-branch").map(<[u8]>::to_vec),
+            generations: None,
         };
         let selected = self.sessions.iter().any(|(k, s)| sel.matches(k, s));
         if !selected {
@@ -1142,6 +1204,17 @@ impl Control {
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(0);
         if delay > 0 {
+            // The dialogs selected now, not those made again meanwhile.
+            let generations = self
+                .sessions
+                .iter()
+                .filter(|(k, s)| sel.matches(k, s))
+                .map(|(_, s)| s.generation)
+                .collect();
+            let sel = Selector {
+                generations: Some(generations),
+                ..sel
+            };
             self.delayed_deletes
                 .schedule(Instant::now() + Duration::from_secs(delay.min(3600)), sel);
             return Ok(());
@@ -1227,6 +1300,18 @@ pub fn serve(
             EpollEvent::new(EpollFlags::EPOLLIN, STREAMS),
         )?;
     }
+    if let Some(inbox) = &control.native_inbox {
+        epoll.add(
+            inbox.wake.as_fd(),
+            EpollEvent::new(EpollFlags::EPOLLIN, NATIVE),
+        )?;
+    }
+    if let Some(inbox) = &control.media_events {
+        epoll.add(
+            inbox.wake.as_fd(),
+            EpollEvent::new(EpollFlags::EPOLLIN, MEDIA),
+        )?;
+    }
     let mut ready = [EpollEvent::empty(); 16];
     let mut buf = vec![0u8; MAX_DATAGRAM];
     while !stop.load(Ordering::Relaxed) {
@@ -1245,6 +1330,14 @@ pub fn serve(
             }
             if ev.data() == STREAMS {
                 control.answer_streams();
+                continue;
+            }
+            if ev.data() == NATIVE {
+                control.answer_native();
+                continue;
+            }
+            if ev.data() == MEDIA {
+                control.native_media_events();
                 continue;
             }
             let Some(sock) = usize::try_from(ev.data()).ok().and_then(|i| sockets.get(i)) else {

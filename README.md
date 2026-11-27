@@ -41,6 +41,19 @@ proxy is set up.
 - **Handles re-INVITEs** from either party, hold and resume, and adding or
   removing streams; forked INVITEs, and calls with more than two parties
   (a party in dialogs with several others, labels to address them).
+- **A media engine for a B2BUA or softswitch:**
+  - the ng commands `create` and `create from offer`, and a
+    [native control API](docs/native-api.md) on a Unix socket;
+  - endpoints negotiated either way, parked, bridged across calls,
+    renegotiated with commit or abort, destroyed with tombstones;
+  - generations, idempotency keys, leases and tenants;
+  - events: DTMF, announcements, recordings, ICE, DTLS, speech, bridges;
+  - PCM streams to external audio services (speech recognition, voice
+    bots), with barge-in and playout marks;
+  - N − 1 conference mixing with active-speaker events.
+
+  A Rust client is in `crates/rtpflux-client`. See
+  [Media engine](docs/media-engine.md) for its status.
 - **Keeps calls across restarts** when a state file or Redis is
   configured; with Redis, another host can take them over.
 - **Optional kernel fast path.** Settled RTP calls can be forwarded in the

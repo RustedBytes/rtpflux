@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "rtpflux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amr-nb",
  "amr-wb",
@@ -1497,6 +1497,7 @@ dependencies = [
  "opus-rs",
  "p256",
  "rand",
+ "rtpflux-client",
  "rtpflux-core",
  "rtpflux-ng",
  "rtpflux-srtp",
@@ -1520,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "rtpflux-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "nix",
@@ -1531,8 +1532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtpflux-client"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rtpflux-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ezk-g722",
  "hmac",
@@ -1542,11 +1550,11 @@ dependencies = [
 
 [[package]]
 name = "rtpflux-ng"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rtpflux-srtp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1557,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "rtpflux-uring"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -1567,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "rtpflux-xdp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aya",
  "nix",
@@ -1577,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "rtpflux-xdp-common"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rustc_version"

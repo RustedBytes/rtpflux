@@ -275,6 +275,12 @@ impl Store {
         }
     }
 
+    /// Whether finished recordings are uploaded (not only kept locally).
+    #[must_use]
+    pub fn uploads(&self) -> bool {
+        !matches!(self, Store::Local)
+    }
+
     /// Keep the finished recording's `files` (of the recording `meta`
     /// describes): nothing to do locally; with S3, upload each (and remove
     /// the uploaded local copies unless they are kept), then queue the

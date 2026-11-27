@@ -13,6 +13,7 @@
 )]
 #![no_std]
 
+pub mod dsp;
 pub mod dtls;
 pub mod dtmf;
 pub mod dtmf_inband;

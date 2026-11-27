@@ -11,6 +11,11 @@ impl Worker {
         match cmd {
             Command::ConnectLocal { x, y, transcode } => self.connect_local(x, y, transcode),
             Command::ConnectRemote(end) => self.connect_remote(*end),
+            Command::Detach { slot } => self.detach(slot),
+            Command::Barrier { reply } => {
+                let _ = reply.try_send(());
+            }
+            Command::Pcm { call, slot, end } => self.pcm(call, slot, end.map(|e| *e)),
             Command::Echo { slots, modes } => self.echo(slots, modes),
             Command::SecureDtmf {
                 call,
@@ -58,6 +63,9 @@ impl Worker {
                 Ok(
                     cmd @ (Command::ConnectLocal { .. }
                     | Command::ConnectRemote(_)
+                    | Command::Detach { .. }
+                    | Command::Pcm { .. }
+                    | Command::Barrier { .. }
                     | Command::Echo { .. }
                     | Command::SecureDtmf { .. }
                     | Command::Listen { .. }
@@ -152,6 +160,13 @@ impl Worker {
                 )
             {
                 log::error!("media worker {}: epoll add: {e}", self.index);
+                self.media_events.emit(
+                    crate::relay::media_events::Subject::Call(call),
+                    crate::relay::media_events::MediaEventKind::Failed {
+                        what: "media",
+                        reason: format!("a socket cannot be watched: {e}"),
+                    },
+                );
             }
             self.legs[slot] = Some(Leg::new(leg.latch, leg.partner, now));
             // Legs come as A-RTP, A-RTCP, B-RTP, B-RTCP.
@@ -214,6 +229,7 @@ impl Worker {
         self.tone_plays.retain(|t| t.call != call);
         self.ice_close(&c.slots);
         self.untap(&c.slots);
+        self.pcm_forget(&c.slots);
         if matches!(c.offload, OffloadState::Pending(_) | OffloadState::Active)
             && let Some(tx) = &self.offload
         {
@@ -359,7 +375,10 @@ impl Worker {
                         l.assoc.as_mut().map(|a| a.set_remote(side.remote))
                     });
                     if let Some(p) = progress {
-                        self.dtls_tables().install(slot, p, None);
+                        let mut t = self.dtls_tables();
+                        t.install(slot, p, None);
+                        let done = t.done;
+                        self.report_dtls(done);
                     }
                 } else if let Some(d) = self.dtls.get_mut(slot) {
                     *d = wanted.then(|| {

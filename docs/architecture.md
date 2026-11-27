@@ -53,6 +53,18 @@ this means:
 - **The XDP thread** (only with `[xdp] enabled`) installs settled calls
   into the kernel program. Every second it reads the kernel's per-flow
   counters, so those calls do not time out.
+- **The native API** (only with `[control] native_socket`) has a
+  listener thread and a thread per connection. They hand each request to
+  the control thread and write its reply, and the events the connection
+  subscribed to. See [Native control API](native-api.md).
+- **PCM streams and mixers** each have threads of their own. A worker
+  copies an endpoint's packets into a bounded queue for them, and plays
+  the 20 ms frames they send back. Decoding, jitter buffering,
+  concealment, resampling, voice detection and mixing happen there,
+  never on a media worker.
+- **Media events** (key presses, announcements played out, DTLS and ICE
+  progress, recordings finished) go from the workers to the control
+  thread through one bounded queue, which never blocks a worker.
 - **The metrics thread** serves Prometheus metrics from counters the
   workers update atomically. Reading them takes no locks.
 
@@ -90,6 +102,7 @@ threads or clocks:
 | [`rtpflux-xdp-ebpf`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-xdp-ebpf/README.md) | The XDP program itself, built for the BPF target | `no_std`, outside the workspace |
 | [`rtpflux-uring`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-uring/README.md) | `io_uring` multishot UDP receive for the media workers, with its benchmark | `std` |
 | [`rtpflux`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux/README.md) | The daemon: configuration, sockets, threads, DTLS, recordings, state file and Redis, metrics, web UI | `std` |
+| [`rtpflux-client`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-client/README.md) | A client of the native control API, for a softswitch | `std`, only `serde_json` |
 | [`rtpflux-bench`](https://github.com/RustedBytes/rtpflux/blob/main/crates/rtpflux-bench/README.md) | The load generator used by the benchmarks | `std` |
 
 Each crate's README explains why it is separate and what is in it.

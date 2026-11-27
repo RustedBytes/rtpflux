@@ -7,6 +7,7 @@
 - [Getting started](getting-started.md)
 - [Configuration](configuration.md)
 - [Control protocol](control-protocol.md)
+- [Native control API](native-api.md)
 - [Integration with SIP servers](integration.md)
 - [Operations](operations.md)
 - [Web UI](webui.md)
@@ -23,6 +24,8 @@
 - [Architecture](architecture.md)
 - [Testing](testing.md)
 - [Conformance](conformance.md)
+- [Media engine: audit and status](media-engine.md)
+  - [ADR 0001: native control API](adr/0001-native-control-api.md)
 
 ---
 

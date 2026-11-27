@@ -28,6 +28,7 @@ mod features;
 mod ice;
 mod io;
 mod offload;
+mod pcm;
 mod repack;
 mod rtcp;
 mod slots;
@@ -137,6 +138,18 @@ pub(super) enum Command {
     },
     /// `connect` across workers: this worker's end (boxed: channels).
     ConnectRemote(Box<RemoteEnd>),
+    /// A PCM stream of the leg of RTP slot `slot` (of `call`) starts, or
+    /// (`None`) stops.
+    Pcm {
+        call: CallId,
+        slot: Slot,
+        end: Option<Box<crate::pcm::stream::WorkerEnd>>,
+    },
+    /// The leg of RTP slot `slot` leaves whatever it is joined to: it
+    /// sends nowhere, and nothing is sent to it (a bridge taken down).
+    Detach {
+        slot: Slot,
+    },
     /// `connect` with `directional` on this worker: copy (`on`) what the
     /// leg of RTP slot `source` sends to the leg of `dest`, or stop.
     /// Copies are converted to the listener's codec (`transcode`).
@@ -210,6 +223,10 @@ pub(super) enum Command {
     Query {
         call: CallId,
         reply: SyncSender<QueryReply>,
+    },
+    /// Answer once every command queued before it is applied.
+    Barrier {
+        reply: SyncSender<()>,
     },
     /// Play G.711 codes to one side (`None`: stop playing to it).
     Play {
@@ -360,6 +377,9 @@ pub(super) struct Worker {
     record_to: PerSlot<Option<(CallId, SocketAddr)>>,
     /// Announcements being played.
     playbacks: Vec<Playback>,
+    /// Per leg: its PCM stream, if it has one; the slots that have one.
+    pcm_legs: PerSlot<Option<Box<pcm::PcmLeg>>>,
+    pcm_slots: Vec<Slot>,
     /// `play DTMF` in progress.
     tone_plays: Vec<tones::TonePlayback>,
     /// Per slot: the stream announcements to it are sent in.
@@ -408,6 +428,9 @@ pub(super) struct Worker {
     wake: Arc<EventFd>,
     commands: Receiver<Command>,
     events: Sender<Event>,
+    /// Key presses, announcements played out, DTLS and ICE progress, for
+    /// the control thread's subscribers.
+    media_events: crate::relay::media_events::MediaEvents,
     stats: Arc<Stats>,
     offload: Option<Sender<OffloadMsg>>,
     /// Where finished recordings go to be converted.
@@ -451,7 +474,7 @@ impl Worker {
         packet_buffer: usize,
         commands: Receiver<Command>,
         wake: Arc<EventFd>,
-        events: Sender<Event>,
+        (events, media_events): (Sender<Event>, crate::relay::media_events::MediaEvents),
         stats: Arc<Stats>,
         offload: Option<Sender<OffloadMsg>>,
         identity: Identity,
@@ -513,6 +536,8 @@ impl Worker {
             record_to: PerSlot::filled(slots, None),
             recorders: HashMap::new(),
             playbacks: Vec::new(),
+            pcm_legs: PerSlot::with(slots, || None),
+            pcm_slots: Vec::new(),
             tone_plays: Vec::new(),
             play_streams: PerSlot::filled(slots, None),
             hold: crate::relay::hold::Hold::new(slots),
@@ -524,6 +549,7 @@ impl Worker {
             wake,
             commands,
             events,
+            media_events,
             stats,
             offload,
             jobs,
@@ -557,6 +583,7 @@ impl Worker {
         loop {
             let due = [
                 self.next_playback_ms(),
+                self.next_pcm_ms(),
                 self.next_tone_ms(),
                 self.ice_next,
                 self.next_repack_ms(),
@@ -600,6 +627,9 @@ impl Worker {
             if !self.playbacks.is_empty() {
                 self.play_due(self.now_ms());
             }
+            if !self.pcm_slots.is_empty() {
+                self.pcm_due(self.now_ms());
+            }
             if !self.tone_plays.is_empty() {
                 self.tones_due(self.now_ms());
             }
@@ -624,10 +654,17 @@ impl Worker {
 
     /// End calls whose RTP legs have both been silent for their timeout.
     fn sweep(&mut self, now: u64) {
+        let mut finished = Vec::new();
         for (slot, d) in self.dtmf.slots_mut() {
             if let Some(d) = d {
                 d.tick(now, slot);
+                if d.unsent_any() {
+                    finished.push((slot, d.take_unsent()));
+                }
             }
+        }
+        for (slot, events) in finished {
+            self.report_dtmf(slot, events);
         }
         let mut idle: [Option<CallId>; 64] = [None; 64];
         let mut n = 0;

@@ -1334,3 +1334,109 @@ fn a_created_party_is_answered_after_a_restart() {
     drop(c);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A party made by `create from offer` survives a restart: on its ports,
+/// still parked, its re-offer still a re-offer; `connect`ed to a created
+/// party after it, media flows.
+#[test]
+fn a_party_created_from_its_offer_survives_a_restart() {
+    let dir = std::env::temp_dir().join(format!("rtpflux-from-offer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = dir.join("state.json");
+    let mut c = control(&state);
+    let sdp = |s: &UdpSocket, version: u32| {
+        format!(
+            "v=0\r\no=- 1 {version} IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {} RTP/AVP 0\r\n",
+            s.local_addr().unwrap().port()
+        )
+    };
+    let at = |m: Media| SocketAddr::new("127.0.0.1".parse().unwrap(), m.port);
+    let (caller, server_e) = (endpoint(), endpoint());
+    let req = |cookie: &str, pairs: &[(&str, &[u8], bool)]| request_raw(cookie, pairs);
+    let from_offer = |c: &mut Control, cookie: &str, version: u32| {
+        let s = sdp(&caller, version);
+        at(media(&sdp_of(
+            c.handle(&req(
+                cookie,
+                &[
+                    ("command", b"create from offer", false),
+                    ("call-id", b"from-offer-1", false),
+                    ("from-tag", b"caller", false),
+                    ("endpoint-learning", b"off", false),
+                    ("sdp", s.as_bytes(), false),
+                ],
+            ))
+            .unwrap(),
+        )))
+    };
+    let for_caller = from_offer(&mut c, "i", 1);
+    let for_server = at(media(&sdp_of(
+        c.handle(&req(
+            "c",
+            &[
+                ("command", b"create", false),
+                ("call-id", b"from-offer-1", false),
+                ("from-tag", b"srv", false),
+                ("codec", b"d5:offerl4:PCMUee", true),
+            ],
+        ))
+        .unwrap(),
+    )));
+    c.save();
+    drop(c);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut c = control(&state);
+    assert_eq!(c.restore(), 2);
+    // Still parked.
+    let mut buf = [0u8; 2048];
+    caller.send_to(&rtp(1), for_caller).unwrap();
+    server_e
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(server_e.recv_from(&mut buf).is_err(), "parked");
+    // Its re-INVITE: the same port.
+    assert_eq!(from_offer(&mut c, "i2", 2), for_caller);
+    let se = sdp(&server_e, 1);
+    sdp_of(
+        c.handle(&req(
+            "ca",
+            &[
+                ("command", b"create answer", false),
+                ("call-id", b"from-offer-1", false),
+                ("from-tag", b"srv", false),
+                ("endpoint-learning", b"off", false),
+                ("sdp", se.as_bytes(), false),
+            ],
+        ))
+        .unwrap(),
+    );
+    sdp_of(
+        c.handle(&req(
+            "x",
+            &[
+                ("command", b"connect", false),
+                ("call-id", b"from-offer-1", false),
+                ("from-tag", b"caller", false),
+                ("to-tag", b"srv", false),
+            ],
+        ))
+        .unwrap(),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    server_e
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    caller.send_to(&rtp(2), for_caller).unwrap();
+    assert!(
+        server_e.recv_from(&mut buf).is_ok(),
+        "the server hears the caller"
+    );
+    server_e.send_to(&rtp(3), for_server).unwrap();
+    assert!(
+        caller.recv_from(&mut buf).is_ok(),
+        "the caller hears the server"
+    );
+    drop(c);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -367,14 +367,96 @@ impl Relay {
                 },
             ),
         ];
-        for (w, end) in ends {
+        // The first end refused leaves nothing changed. Once it is taken,
+        // its worker has detached its party's former peer: the second end
+        // is waited for (briefly) rather than refused at the first full
+        // queue, so a connection is not left half made.
+        for (i, (w, end)) in ends.into_iter().enumerate() {
             let s = &self.shards[w];
-            s.commands
-                .try_send(Command::ConnectRemote(Box::new(end)))
-                .map_err(RelayError::from)?;
+            let mut cmd = Command::ConnectRemote(Box::new(end));
+            let mut tries = if i == 0 { 1 } else { SECOND_END_TRIES };
+            loop {
+                match s.commands.try_send(cmd) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(back)) if tries > 1 => {
+                        tries -= 1;
+                        cmd = back;
+                        let _ = s.wake.write(1);
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                    Err(e) => return Err(RelayError::from(e)),
+                }
+            }
             s.wake.write(1)?;
         }
         Ok(true)
+    }
+
+    /// Detach leg `x.1` of call `x.0` from whatever it is joined to (the
+    /// reverse of [`Relay::connect`]): its media goes nowhere and nothing
+    /// is sent to it, until it is connected again. Returns `false` when
+    /// the call is unknown or ending.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError`] when the worker cannot be told.
+    pub fn detach(&mut self, x: (CallId, CallLeg)) -> Result<bool, RelayError> {
+        self.reap();
+        let Some(c) = self.calls.get(&x.0).filter(|c| !c.ending) else {
+            return Ok(false);
+        };
+        let port = if x.1 == CallLeg::B {
+            c.port_b
+        } else {
+            c.port_a
+        };
+        let s = &self.shards[c.shard];
+        let slot = Slot::new(u32::from(port - s.first_port));
+        s.commands
+            .try_send(Command::Detach { slot })
+            .map_err(RelayError::from)?;
+        s.wake.write(1)?;
+        Ok(true)
+    }
+
+    /// Start (`Some`) or stop a PCM stream on leg `x.1` of call `x.0`.
+    /// Returns `false` when the call is unknown or ending.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError`] when the worker cannot be told.
+    pub fn pcm_stream(
+        &mut self,
+        x: (CallId, CallLeg),
+        end: Option<crate::pcm::stream::WorkerEnd>,
+    ) -> Result<bool, RelayError> {
+        self.reap();
+        let Some(c) = self.calls.get(&x.0).filter(|c| !c.ending) else {
+            return Ok(false);
+        };
+        let port = if x.1 == CallLeg::B {
+            c.port_b
+        } else {
+            c.port_a
+        };
+        let s = &self.shards[c.shard];
+        let slot = Slot::new(u32::from(port - s.first_port));
+        s.commands
+            .try_send(Command::Pcm {
+                call: x.0,
+                slot,
+                end: end.map(Box::new),
+            })
+            .map_err(RelayError::from)?;
+        s.wake.write(1)?;
+        Ok(true)
+    }
+
+    /// Clone of the sending end of media events (for a PCM stream's
+    /// threads).
+    #[must_use]
+    pub fn media_event_sender(&self) -> super::media_events::MediaEvents {
+        self.media_sender.clone()
     }
 
     /// `connect` with `directional`: copy (`on`) what leg `source` sends
@@ -529,9 +611,23 @@ impl Relay {
                 let _ = s.wake.write(1);
             }
             Err(TrySendError::Full(_)) => self.unsent_deletes.push(id),
-            Err(TrySendError::Disconnected(_)) => return Err(RelayError::WorkerGone),
+            Err(TrySendError::Disconnected(_)) => {
+                self.forget_call(id);
+                return Err(RelayError::WorkerGone);
+            }
         }
         Ok(true)
+    }
+
+    /// Forget call `id`, whose worker has stopped (and with it the call's
+    /// sockets): its ports go back to the shard, as when a worker reports
+    /// a call closed.
+    fn forget_call(&mut self, id: CallId) {
+        if let Some(c) = self.calls.remove(&id) {
+            let alloc = &mut self.shards[c.shard].alloc;
+            alloc.free(c.port_a);
+            alloc.free(c.port_b);
+        }
     }
 
     /// Send again the deletes a full queue refused.
@@ -550,12 +646,17 @@ impl Relay {
                 // Its worker stopped: nothing relays the call any more.
                 Err(TrySendError::Disconnected(_)) => {
                     log::warn!("call {id}: its media worker stopped");
+                    self.forget_call(id);
                 }
             }
         }
         self.unsent_deletes = left;
     }
 }
+
+/// How many times (200 µs apart) the second end of a `connect` across
+/// workers is offered to a full queue: 20 ms in all.
+const SECOND_END_TRIES: u32 = 100;
 
 /// The latch of a leg of `side` whose SDP address is `expected`.
 fn latch_of(side: &Side, expected: Option<SocketAddr>) -> Latch {

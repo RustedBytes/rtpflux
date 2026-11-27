@@ -16,6 +16,8 @@ pub enum Warning {
     ControlExposed { key: &'static str, addr: SocketAddr },
     /// The web UI on a non-loopback address: Basic auth without TLS.
     WebUiExposed(SocketAddr),
+    /// `control.native_listen` not on loopback: plain TCP, tokens in clear.
+    NativeExposed(SocketAddr),
     /// An interface (named) advertising another address family than it
     /// binds.
     AdvertiseFamily(String),
@@ -44,6 +46,10 @@ impl fmt::Display for Warning {
             Warning::ControlExposed { key, addr } => write!(
                 f,
                 "{key}: {addr} is reachable beyond loopback and private networks, and ng has no authentication"
+            ),
+            Warning::NativeExposed(addr) => write!(
+                f,
+                "control.native_listen: {addr} is not loopback; tokens and SDP travel without TLS unless a proxy adds it"
             ),
             Warning::WebUiExposed(addr) => write!(
                 f,
@@ -102,6 +108,11 @@ impl Config {
         for (key, &addr) in ng {
             if !is_private(addr.ip()) {
                 w.push(Warning::ControlExposed { key, addr });
+            }
+        }
+        for &addr in &self.control.native_listen {
+            if !addr.ip().is_loopback() {
+                w.push(Warning::NativeExposed(addr));
             }
         }
         for i in &self.interfaces {

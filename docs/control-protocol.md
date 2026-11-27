@@ -117,6 +117,7 @@ front.
 | [`subscribe request`, `subscribe answer`, `unsubscribe`](#subscribe-request-subscribe-answer-and-unsubscribe) | Sends copies of parties' media to a third party (a SIPREC recorder) |
 | [`publish`](#publish) | Takes media from a party that only sends, for others to subscribe to |
 | [`create`, `create answer`](#create-and-create-answer) | Makes an offer for a party of the relay's own, answered by an endpoint such as a media server |
+| [`create from offer`](#create-from-offer) | Answers an endpoint's offer for a party of the relay's own, with no other party (rtpflux's own) |
 | [`inject start`, `inject stop`](#inject-start-and-inject-stop) | Sends one party's media to another party as well, one way |
 | [`mesh`](#mesh) | Sends parties' media to other parties, of one call or several, in one request |
 | [`connect`](#connect) | Joins a party of one call with a party of another, or copies parties' media to another |
@@ -580,6 +581,37 @@ again with the same tags offers the same ports again.
 `query` lists the created party like any other. Deleting it (`delete`
 with its tag) ends its media. A created party, answered or not, is kept
 across a restart of the relay.
+
+### `create from offer`
+
+rtpflux's own command (rtpengine has none like it): the other direction of
+`create`. An endpoint offers (an inbound call to an IVR, or a call that is
+parked before it is joined to anyone) and the relay answers it, with no
+second party. The party then exists like a created one: join it with
+[`connect`](#connect), play media to it, subscribe to it, `delete` it.
+Until then its media goes nowhere and nothing is sent to it.
+
+| Option | Meaning |
+|---|---|
+| `sdp` | The endpoint's offer (required) |
+| `call-id` | The call (made up, 32 hex digits, when missing) |
+| `from-tag` | The party's tag (made up, 16 hex digits, when missing) |
+| `label` (or `set-label`) | A label for the party |
+| other options | As for an [`offer`](#offer) towards the party: `flags: trust-address`, `received-from`, `endpoint-learning`, `SDES`, `DTLS`, `ICE`, `rtcp-mux`, `direction`, `codec: strip`, … |
+
+The reply has `call-id`, `from-tag` and `sdp`, the answer for the
+endpoint. It accepts every format of each section that the relay offered
+on (strip formats with `codec` options to narrow it), and mirrors each
+section's direction (RFC 3264 §6.1): `sendonly` is answered `recvonly`,
+`recvonly` `sendonly`. A rejected section (port 0) stays rejected. The
+answer takes the profile of the offer, so SRTP (SDES), DTLS-SRTP and ICE
+are answered as for an ordinary `offer`.
+
+`create from offer` again with the same `call-id` and `from-tag` is the
+party's re-offer (a re-INVITE: hold, resume, new codecs): the same ports
+and keys, answered the same way. A `from-tag` that already offered in the
+call in an ordinary dialog is refused. The party is kept across a restart
+of the relay, as a created one is.
 
 ### `inject start` and `inject stop`
 

@@ -70,6 +70,7 @@ amr = ["dep:amr-nb", "dep:amr-wb"]
 [dev-dependencies]
 nix = { workspace = true, features = ["sched", "signal"] }
 rtpflux-ng = { path = "../rtpflux-ng" }
+rtpflux-client = { path = "../rtpflux-client" }
 
 [lints]
 workspace = true

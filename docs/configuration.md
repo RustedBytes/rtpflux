@@ -54,6 +54,12 @@ listen = ["127.0.0.1:2223"]   # default
 listen_tcp = []               # ng over TCP (none by default)
 listen_http = []              # ng over HTTP and WebSocket (none by default)
 max_message = 65535           # largest command, in bytes (512 to 65535)
+# native_socket = "/run/rtpflux/native.sock"   # the native API (off by default)
+native_uids = []              # user ids allowed on native_socket, besides the relay's and root
+native_max_endpoints = 0      # endpoints per tenant on the native API (0: up to sessions.max)
+# pcm_dir = "/run/rtpflux/pcm"  # where external audio services listen (PCM streams)
+native_listen = []            # the native API over TCP too (needs native_tokens)
+native_tokens = {}            # tenant = "token" (16 characters or more), for native_listen
 ```
 
 `listen` takes one or more `address:port` pairs. The ng protocol has no
@@ -62,6 +68,17 @@ your SIP proxies can reach. `listen_tcp` and `listen_http` serve the same
 commands over TCP, and over HTTP (`POST /ng`, `/ng-plain`) and WebSocket
 (`ng.rtpengine.com`); see
 [Over TCP, HTTP and WebSocket](control-protocol.md#over-tcp-http-and-websocket).
+
+`native_socket` serves the [native control API](native-api.md), for a
+B2BUA or softswitch that manages media endpoints itself. It is a Unix
+socket, created mode 0600: only the relay's own user, root and the user ids
+in `native_uids` may connect (checked with the peer's credentials).
+`native_listen` serves the same API over TCP, for a softswitch on another
+host. Each connection authenticates with one of `native_tokens` first, and
+is then that tenant's. There is no TLS: use a private network or a TLS
+proxy. `pcm_dir` is the directory where external audio services listen
+for [PCM streams](native-api.md#pcm-streams); a stream names its socket by
+its file name there.
 
 ## `[[interface]]`: where media flows
 

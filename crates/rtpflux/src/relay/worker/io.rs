@@ -313,8 +313,11 @@ impl Worker {
                     muxed: &self.muxed,
                     identity: &self.identity,
                     stats: &self.stats,
+                    done: None,
                 };
                 t.datagram(slot, packet, src, now);
+                let done = t.done;
+                self.report_dtls(done);
                 Demux::Handled
             }
             // On an RTP port (or its RTCP twin); ZRTP has no RTCP.
@@ -401,6 +404,9 @@ impl Worker {
             }
             self.sync_via(leg);
             let decision = relay::on_packet(self.legs.as_mut_slice(), leg, src, len, now);
+            if !self.pcm_slots.is_empty() {
+                self.pcm_in(leg, (i * size, len));
+            }
             if self.subscriptions_in(leg, decision, (i * size, len), now) {
                 continue;
             }
