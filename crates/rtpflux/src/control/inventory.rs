@@ -225,7 +225,7 @@ impl Control {
     pub(super) fn native_recording(&self, req: &native::Request<'_>) -> Result<Json, NativeError> {
         let id = req.need("recording_id")?;
         match self.native.recordings.get(id) {
-            Some(r) if r.tenant == req.tenant => Ok(json!(r)),
+            Some(r) if r.tenant == req.tenant => Ok(super::rec::recording_json(r)),
             Some(_) => Err(NativeError::new(
                 Code::Unauthorized,
                 format!("recording {id}: another tenant's"),

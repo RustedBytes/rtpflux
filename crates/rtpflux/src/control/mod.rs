@@ -55,6 +55,7 @@ mod parties;
 mod pending;
 mod persist;
 mod query;
+mod rec;
 mod reply;
 mod rollback;
 mod sdp_edits;

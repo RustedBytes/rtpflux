@@ -17,7 +17,6 @@
 use super::native::{Code, Endpoint, NativeError, Request};
 use super::parties::side_of;
 use super::{CallId, CallLeg, Control, SessionKey};
-use crate::lifecycle::RecStep;
 use crate::relay::{SILENCE, SINE, ToneMode, Tones};
 use rtpflux_core::g711::PT_PCMA;
 use rtpflux_core::rtp::Pt;
@@ -341,43 +340,21 @@ impl Control {
             .get("sensitive")
             .and_then(Json::as_bool)
             .ok_or_else(|| NativeError::invalid("sensitive: true or false"))?;
-        let resume = self
+        let we_paused = self
             .native
             .ivr
             .get(&ep.id)
             .is_some_and(|i| i.recording_paused);
-        let call = ep.session.as_bytes().to_vec();
-        let ids: Vec<CallId> = self
-            .sessions
-            .iter()
-            .filter(|(k, s)| k.0 == call && side_of(k, s, ep.id.as_bytes()).is_some())
-            .flat_map(|(_, s)| s.media.iter().flatten().map(|st| st.ports.id))
-            .collect();
-        let mut paused = false;
-        for id in ids {
-            let Some(x) = self.extras.get_mut(&id) else {
-                continue;
-            };
-            let mut rec = x.rec();
-            if on && rec.writes().is_some() {
-                if let RecStep::Pause(_) = rec.pause() {
-                    x.set_rec(rec);
-                    self.relay
-                        .pause_recording(id, true)
-                        .map_err(|e| NativeError::new(Code::Internal, e.to_string()))?;
-                    paused = true;
-                }
-            } else if !on
-                && resume
-                && rec.current().is_some_and(|(_, p)| p)
-                && let RecStep::Resume(_) = rec.start()
-            {
-                x.set_rec(rec);
-                self.relay
-                    .pause_recording(id, false)
-                    .map_err(|e| NativeError::new(Code::Internal, e.to_string()))?;
+        // Confirmed by the media workers, or refused: never reported
+        // paused while capture may go on.
+        let paused = if on {
+            self.pause_capture(&ep, true)?
+        } else {
+            if we_paused {
+                self.pause_capture(&ep, false)?;
             }
-        }
+            false
+        };
         let ivr = self.native.ivr.entry(ep.id).or_default();
         ivr.sensitive = on;
         ivr.recording_paused = on && (paused || ivr.recording_paused);

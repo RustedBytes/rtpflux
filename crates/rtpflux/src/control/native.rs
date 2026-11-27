@@ -55,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 38] = [
+pub const OPERATIONS: [&str; 40] = [
     "hello",
     "ownership.claim",
     "endpoint.create",
@@ -83,6 +83,8 @@ pub const OPERATIONS: [&str; 38] = [
     "endpoint.sensitive",
     "recording.start",
     "recording.stop",
+    "recording.pause",
+    "recording.resume",
     "stream.start",
     "stream.flush",
     "stream.detect",
@@ -292,7 +294,9 @@ pub struct Recording {
     pub id: String,
     pub tenant: String,
     pub endpoint_id: String,
-    /// `active`, `stopped` (asked to stop, not finished yet), `completed`
+    /// `active`, `paused` (the media workers confirmed they stopped
+    /// writing), `pausing` (asked to pause, not confirmed: capture may
+    /// go on), `stopped` (asked to stop, not finished yet), `completed`
     /// or `failed`.
     pub state: String,
     pub file: Option<String>,
@@ -300,6 +304,10 @@ pub struct Recording {
     pub detail: Option<String>,
     pub started_unix_ms: u64,
     pub ended_unix_ms: Option<u64>,
+    /// Its pauses: when each began and ended, as the media workers
+    /// confirmed them (the recording holds nothing in between).
+    #[serde(default)]
+    pub pauses: Vec<(u64, Option<u64>)>,
 }
 
 /// An endpoint destroyed: by whom, its generation, and when.
@@ -1081,6 +1089,8 @@ impl Control {
             "inventory.list" => self.native_inventory(req),
             "recovery.report" => Ok(self.native_recovery()),
             "recording.query" => self.native_recording(req),
+            "recording.pause" => self.native_record_pause(req, true),
+            "recording.resume" => self.native_record_pause(req, false),
             "operation.query" => self.native_operation(req),
             "endpoint.renew" => self.native_renew(req),
             "bridge.attach" => self.native_attach(req),
@@ -1969,7 +1979,7 @@ impl Control {
             self.native
                 .recordings
                 .get(id)
-                .is_some_and(|r| r.state == "active")
+                .is_some_and(|r| matches!(r.state.as_str(), "active" | "paused" | "pausing"))
         });
         let id = if start {
             // Started again while it records: the same recording.
@@ -1987,6 +1997,7 @@ impl Control {
                         detail: None,
                         started_unix_ms: now,
                         ended_unix_ms: None,
+                        pauses: Vec::new(),
                     },
                 );
                 id

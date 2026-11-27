@@ -379,7 +379,8 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
 | `playback.start` | `endpoint_id`, `file` or `blob_base64`, `repeat_times`, `start_pos`, `duration`, `repeat_duration`, `queue` (wait behind the current one), `stop_on` (`["dtmf", "speech"]`) | `playback_id`, `duration_ms`; queued: `queued`, `position` |
 | `playback.stop` | `endpoint_id` | `stopped`, `playback_id` (the queue goes too) |
 | `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording`, `recording_id` (starting again while it records gives the same id) |
-| `recording.query` | `recording_id` | Its `state` (`active`, `stopped`, `completed`, `failed`), `file`, `uploaded`, `detail`, start and end times |
+| `recording.pause`, `recording.resume` | `endpoint_id` | `recording_id`, `state`, `changed`, `pauses` |
+| `recording.query` | `recording_id` | Its `state` (`active`, `paused`, `pausing`, `stopped`, `completed`, `failed`), `pauses`, `file`, `finalized`, `uploaded`, `upload` (`pending`, `none`, `uploaded`, `failed`), `detail`, start and end times |
 
 - An announcement that plays to its end gives `playback.completed`, with
   the `operation_id` of its `playback.start`. One that is stopped, or
@@ -441,6 +442,21 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
     `ng`'s `block DTMF` if it must not);
   - the in-memory event journal holds the digit, for the subscribers
     entitled to it.
+- **Pause and resume** take effect when the media workers confirm them
+  (a barrier over the endpoint's calls). Only then is the recording
+  `paused`, with the time in `pauses` (`[paused_at, resumed_at]`, in ms
+  since the epoch). The recording holds nothing inside a pause. If the
+  workers do not confirm within a second, the request fails (`timeout`,
+  `detail.state: "pausing"`) and the recording stays `pausing`: the relay
+  never says `paused` while capture may go on. A pause survives a restart
+  of the relay. `endpoint.sensitive` pauses through the same path.
+- **Outcomes** are kept apart in `recording.query`: `finalized` (the file
+  is written), `upload` (`none` without uploads, `uploaded`, `failed`,
+  `pending` before the end), and `failed` with its `detail` when no file
+  could be made. `recording.start` with an `idempotency_key` records the
+  `recording_id` among the operation's resources (`operation.query`).
+- Only relayed media is recorded: an endpoint bridged to no one records
+  nothing.
 - A finished recording gives `recording.completed` once its audio file is
   written (`file`), with `uploaded` saying whether the S3 upload worked
   (`null` without uploads). A recording whose conversion failed gives

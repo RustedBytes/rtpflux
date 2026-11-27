@@ -449,3 +449,42 @@ Residual gaps:
   worker-confirmed pause boundary is step 10.
 - Tones and `dtmf.send` have no completion event; their reply gives the
   duration.
+
+## Step 10a: recording pause/resume with a confirmed boundary
+
+- `recording.pause` and `recording.resume` (`control/rec.rs`). The
+  recording is `paused` only after a barrier confirms the media workers
+  took the pause; the boundary time is recorded in `pauses`. Unconfirmed,
+  the recording is `pausing` and the request fails (`timeout`). It is
+  never reported paused while capture may go on.
+- `endpoint.sensitive` now pauses through the same confirmed path.
+- `recording.query` reports outcomes apart: `finalized` (the file is
+  written), `upload` (`pending`, `none`, `uploaded`, `failed`), and
+  `failed` with its detail.
+- Identity: a recording keeps its `recording_id` across pause, resume and
+  a restart. A keyed `recording.start` lists it in the operation's
+  resources.
+
+Evidence: `tests/recpause.rs` `pauses_are_confirmed_and_hold_nothing`:
+- pausing with no recording is refused;
+- a pause is confirmed with its boundary; pausing again changes nothing;
+- resume;
+- a second pause spans a restart of the relay, and the recording is still
+  `paused` after it;
+- resume, then stop: `completed`, `finalized`, `upload: none`, two
+  pauses;
+- the finished pcap is parsed: no packet inside either pause window,
+  and audio before, between and after them.
+
+The existing `a_worker_failure_is_reported` covers a recording whose file
+cannot be written (`recording.failed`).
+
+Deviations and gaps found:
+- **Only relayed media is recorded.** An endpoint bridged to no one (an
+  IVR leg talking to prompts) records nothing; the test had to bridge
+  it. Recording an IVR leg needs the recorder to also take dropped
+  authentic packets and injected audio. Recorded, not changed.
+- A failed upload is mapped (`upload: failed`) and covered by the store's
+  own tests, but there is no end-to-end test: S3 needs the `s3` feature
+  and credentials.
+- Disk full mid-recording is not simulated; an unwritable directory is.
