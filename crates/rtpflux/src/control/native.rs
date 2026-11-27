@@ -465,6 +465,10 @@ pub struct Native {
     pub(super) restored_mixers: Vec<u32>,
     /// PCM streams that are taps on mixer participants.
     pub(super) taps: std::collections::HashSet<u32>,
+    /// The tombstones' own file (with a state file).
+    pub(super) tomb_log: Option<super::tomblog::TombLog>,
+    /// Rewrite it compact at the next save (after a start).
+    pub(super) tombs_compact: bool,
     /// `ng` may not change calls holding native endpoints.
     pub(super) ng_protect: bool,
     /// Under `[ha]`: resource id (an endpoint's, `mixer_id:N`,
@@ -673,17 +677,96 @@ impl Native {
             self.externals.remove(&k);
             self.external_tombs.insert(k, ep.id.clone());
         }
+        let at_ms = crate::relay::media_events::unix_ms();
+        if let Some(log) = &mut self.tomb_log {
+            let saved = crate::state::SavedTomb {
+                id: ep.id.clone(),
+                tenant: ep.tenant.clone(),
+                generation: ep.generation,
+                reason: reason.to_owned(),
+                at_unix_ms: at_ms,
+                external_id: ep.external_id.clone(),
+            };
+            if let Err(e) = log.append(&saved) {
+                log::warn!("native: endpoint {}: its tombstone not written: {e}", ep.id);
+            }
+        }
         self.tombs.insert(
             ep.id.clone(),
             Tomb {
                 tenant: ep.tenant.clone(),
                 generation: ep.generation,
                 reason: reason.to_owned(),
-                at_ms: crate::relay::media_events::unix_ms(),
+                at_ms,
                 external_id: ep.external_id.clone(),
             },
         );
         self.tomb_order.push_back(ep.id.clone());
+    }
+
+    /// Saved tombstones back (those not known already).
+    pub(super) fn restore_tombs(&mut self, saved: &[crate::state::SavedTomb]) {
+        for t in saved {
+            if self.tombs.contains_key(&t.id) {
+                continue;
+            }
+            if let Some(x) = &t.external_id {
+                self.external_tombs
+                    .insert((t.tenant.clone(), x.clone()), t.id.clone());
+            }
+            self.tombs.insert(
+                t.id.clone(),
+                Tomb {
+                    tenant: t.tenant.clone(),
+                    generation: t.generation,
+                    reason: t.reason.clone(),
+                    at_ms: t.at_unix_ms,
+                    external_id: t.external_id.clone(),
+                },
+            );
+            self.tomb_order.push_back(t.id.clone());
+        }
+    }
+
+    /// The tombstones kept, oldest first, as saved.
+    pub(super) fn saved_tombs(&self) -> Vec<crate::state::SavedTomb> {
+        self.tomb_order
+            .iter()
+            .filter_map(|id| {
+                let t = self.tombs.get(id)?;
+                Some(crate::state::SavedTomb {
+                    id: id.clone(),
+                    tenant: t.tenant.clone(),
+                    generation: t.generation,
+                    reason: t.reason.clone(),
+                    at_unix_ms: t.at_ms,
+                    external_id: t.external_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The tombstones' file on the disk: synced, or rewritten compact when
+    /// it holds far more than is kept (or once after a start).
+    pub(super) fn tombs_to_disk(&mut self) -> std::io::Result<()> {
+        let kept = self.tombs.len();
+        let compact = self.tombs_compact
+            || self
+                .tomb_log
+                .as_ref()
+                .is_some_and(|l| l.wants_compacting(kept));
+        if compact {
+            let all = self.saved_tombs();
+            if let Some(log) = &mut self.tomb_log {
+                log.rewrite(&all)?;
+            }
+            self.tombs_compact = false;
+            return Ok(());
+        }
+        match &mut self.tomb_log {
+            Some(log) => log.sync(),
+            None => Ok(()),
+        }
     }
 
     /// How long tombstones are kept: as long as the ledger keeps outcomes
@@ -2733,21 +2816,12 @@ impl Control {
             generation_seq: n.generation_seq,
             next_stream: n.next_stream,
             next_mixer: n.next_mixer,
-            tombstones: n
-                .tomb_order
-                .iter()
-                .filter_map(|id| {
-                    let t = n.tombs.get(id)?;
-                    Some(crate::state::SavedTomb {
-                        id: id.clone(),
-                        tenant: t.tenant.clone(),
-                        generation: t.generation,
-                        reason: t.reason.clone(),
-                        at_unix_ms: t.at_ms,
-                        external_id: t.external_id.clone(),
-                    })
-                })
-                .collect(),
+            // With their own file, not here (the state file stays small).
+            tombstones: if n.tomb_log.is_some() {
+                Vec::new()
+            } else {
+                n.saved_tombs()
+            },
             ..crate::state::SavedNative::default()
         }
     }
@@ -2761,24 +2835,9 @@ impl Control {
         self.native.generation_seq = self.native.generation_seq.max(native.generation_seq);
         self.native.next_stream = self.native.next_stream.max(native.next_stream);
         self.native.next_mixer = self.native.next_mixer.max(native.next_mixer);
-        for t in &native.tombstones {
-            if let Some(x) = &t.external_id {
-                self.native
-                    .external_tombs
-                    .insert((t.tenant.clone(), x.clone()), t.id.clone());
-            }
-            self.native.tombs.insert(
-                t.id.clone(),
-                Tomb {
-                    tenant: t.tenant.clone(),
-                    generation: t.generation,
-                    reason: t.reason.clone(),
-                    at_ms: t.at_unix_ms,
-                    external_id: t.external_id.clone(),
-                },
-            );
-            self.native.tomb_order.push_back(t.id.clone());
-        }
+        // A state file of an older version holds them (else they are in
+        // their own file, read already).
+        self.native.restore_tombs(&native.tombstones);
         for e in saved {
             let kind = if e.kind == "remote_offer" {
                 Kind::RemoteOffer

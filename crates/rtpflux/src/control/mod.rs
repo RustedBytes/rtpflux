@@ -63,6 +63,7 @@ mod rollback;
 mod sdp_edits;
 mod streams;
 mod subscribe;
+mod tomblog;
 mod web;
 
 pub use streams::NgLink;
@@ -570,6 +571,21 @@ impl Control {
 
     /// Write the dialogs to `path` after every change ([`Control::save`]).
     pub fn set_state_file(&mut self, path: Option<std::path::PathBuf>) {
+        // The tombstones' own file, next to it ([`tomblog`]).
+        if let Some(p) = &path {
+            let at = tomblog::path_for(p);
+            match tomblog::TombLog::open(&at) {
+                Ok((log, tombs)) => {
+                    self.native.restore_tombs(&tombs);
+                    self.native.tomb_log = Some(log);
+                    self.native.tombs_compact = true;
+                }
+                Err(e) => log::warn!(
+                    "state: {}: {e}; tombstones kept in the state file",
+                    at.display()
+                ),
+            }
+        }
         self.state_file = path;
     }
 

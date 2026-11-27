@@ -604,3 +604,33 @@ Not covered (spec items left as gaps):
 - Mixer-to-mixer links (cascading) are not supported, by design (no
   cycles).
 - AEC, AGC, video and T.38 are optional later milestones, per the spec.
+
+## Step 12 finding: durable operations cost grew with history (fixed)
+
+Found by the step 12 benchmark. With `[sessions] ledger`, every keyed
+operation rewrote and synced the whole state file, and the state file
+held every tombstone (up to 65 536). The cost of each operation grew
+with the number of endpoints ever destroyed. The rate fell from 122
+pairs/s after 500 keyed pairs to 53 after 1500 and 37 after 2000, and
+over 1500 pairs the relay wrote 509 MB to a 330 KB state file.
+
+Tombstones now have their own append-only file next to the state file
+(`<state>.tombs.jsonl`, `control/tomblog.rs`):
+- a destruction appends a line, synced before a durable reply;
+- the file is compacted at start-up and whenever it holds more than
+  twice the tombstones kept;
+- a torn last line is skipped;
+- a state file of an older version still restores its tombstones, and
+  they move to the new file.
+
+Over 1500 keyed pairs: 8.7 MB written (58× less), a 354-octet state
+file, and a rate that no longer falls as history grows. The durable rate
+itself is bound by the disk's sync latency (three to four syncs per
+operation), which on this machine varies from about 35 to 70 pairs a
+second from run to run.
+
+Evidence:
+- `tomblog.rs` unit test: append, a later line replacing an earlier
+  one, a torn line skipped, compaction;
+- the crash tests (SIGKILL at each boundary, keys and external ids
+  durable) and the restart tests pass unchanged.

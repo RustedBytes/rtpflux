@@ -256,6 +256,8 @@ impl Control {
         let Some(path) = self.state_file.clone() else {
             return Err(std::io::Error::other("no state file"));
         };
+        // The tombstones first: the state file no longer holds them.
+        self.native.tombs_to_disk()?;
         let snapshot = self.snapshot_with(false);
         let bytes = snapshot.encode().map_err(std::io::Error::other)?;
         self.stats.state_writes.fetch_add(1, Ordering::Relaxed);
@@ -274,6 +276,9 @@ impl Control {
     pub fn save(&mut self) {
         if self.state_file.is_none() && self.state_redis.is_none() {
             return;
+        }
+        if let Err(e) = self.native.tombs_to_disk() {
+            log::warn!("state: tombstones: {e}");
         }
         let snapshot = self.snapshot();
         match snapshot.encode() {
