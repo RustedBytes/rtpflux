@@ -59,7 +59,7 @@ fn start(dir: &Path, min: u16, fault: Option<&str>) -> (Relay, Client) {
             ledger = "{}"
             ledger_retention = 3600
             [runtime]
-            workers = 1
+            workers = 2
             "#,
             sock.display(),
             min + 63,
@@ -234,6 +234,94 @@ fn keys_and_external_ids_are_durable() {
     assert_eq!(op["resources"][0], b["endpoint_id"]);
     let hello = c.call("hello", Value::Null).unwrap();
     assert_eq!(hello["guarantees"]["idempotency"], "durable");
+    drop(c);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A bridge across two workers whose second end fails (the first worker
+/// took its end, detaching its endpoint's former peer): the attach fails,
+/// every endpoint involved (the former peer too) is detached in the
+/// records as on the media workers, and media flows neither way. No
+/// half-bridge is left behind a reply, and no bridge is reported that the
+/// media do not have.
+#[test]
+fn a_half_made_bridge_is_compensated() {
+    use std::net::UdpSocket;
+    let dir = temp_dir("half");
+    let (_relay, mut c) = start(&dir, 61_500, Some("connect_half"));
+    let party = || {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        s
+    };
+    let (ua_x, ua_y, ua_z) = (party(), party(), party());
+    let offer = |s: &UdpSocket| {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {} RTP/AVP 0\r\na=sendrecv\r\n",
+            s.local_addr().unwrap().port()
+        )
+    };
+    let opts = json!({"flags": ["trust-address"], "endpoint-learning": "off"});
+    let a = c
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": offer(&ua_x), "options": opts}),
+        )
+        .unwrap();
+    let b = c
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": offer(&ua_y), "options": opts}),
+        )
+        .unwrap();
+    // Calls alternate between the two workers: a and z share one.
+    let peer = c
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": offer(&ua_z), "options": opts}),
+        )
+        .unwrap();
+    c.call(
+        "bridge.attach",
+        json!({"endpoint_id": a["endpoint_id"], "peer_endpoint_id": peer["endpoint_id"]}),
+    )
+    .unwrap();
+    let e = c
+        .call(
+            "bridge.attach",
+            json!({"endpoint_id": a["endpoint_id"], "peer_endpoint_id": b["endpoint_id"]}),
+        )
+        .unwrap_err();
+    assert_eq!(code(&e), "exhausted", "{e}");
+    for ep in [&a, &b, &peer] {
+        let snap = c
+            .call("endpoint.query", json!({"endpoint_id": ep["endpoint_id"]}))
+            .unwrap();
+        assert_eq!(snap["bridged_to"], Value::Null, "{snap}");
+    }
+    let port = |sdp: &Value| {
+        sdp.as_str()
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("m=audio "))
+            .and_then(|l| l.split(' ').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap()
+    };
+    let rtp = [0x80u8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0xff, 0xff];
+    let mut buf = [0u8; 64];
+    ua_x.send_to(&rtp, ("127.0.0.1", port(&a["sdp"]))).unwrap();
+    assert!(ua_y.recv_from(&mut buf).is_err(), "nothing x → y");
+    ua_y.send_to(&rtp, ("127.0.0.1", port(&b["sdp"]))).unwrap();
+    assert!(ua_x.recv_from(&mut buf).is_err(), "nothing y → x");
+    ua_z.send_to(&rtp, ("127.0.0.1", port(&peer["sdp"])))
+        .unwrap();
+    assert!(
+        ua_x.recv_from(&mut buf).is_err(),
+        "nothing from the former peer"
+    );
     drop(c);
     std::fs::remove_dir_all(&dir).unwrap();
 }

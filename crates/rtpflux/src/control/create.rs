@@ -144,10 +144,9 @@ impl Control {
         }
         let sdp = template(&sections(req))?;
         let creator = [CREATOR, &tag].concat();
-        // A party created before: a re-offer of its dialog (its ports).
-        let again = self
-            .sessions
-            .contains_key(&(call_id.clone(), creator.clone()));
+        // A party created before (from either side's offer): a re-offer of
+        // its dialog (its ports), whoever offered last.
+        let again = self.created_dialog(&call_id, &tag).is_some();
         let mut set: Vec<(&[u8], &[u8])> = vec![
             (b"call-id", &call_id),
             (b"from-tag", &creator),
@@ -163,7 +162,9 @@ impl Control {
         let n = self.offer(&od)?;
         // Nothing reaches the hidden side, and the party's media goes
         // nowhere until it is joined to someone.
-        let key = (call_id.clone(), creator);
+        let key = self
+            .created_dialog(&call_id, &tag)
+            .unwrap_or((call_id.clone(), creator));
         self.park_or_rejoin(&key, &(call_id.clone(), tag.clone()));
         if let Some(l) = req
             .get_bytes(b"set-label")
@@ -196,11 +197,9 @@ impl Control {
         }
         let creator = [CREATOR, &tag].concat();
         let key = (call_id.clone(), tag.clone());
-        // The party's dialog with the hidden side, made before: a re-offer.
-        let again = self
-            .sessions
-            .get(&key)
-            .is_some_and(|s| s.to_tag.as_deref() == Some(&creator[..]));
+        // The party's dialog with the hidden side, made before (from either
+        // side's offer): a re-offer, whoever offered last.
+        let again = self.created_dialog(&call_id, &tag).is_some();
         if !again && self.sessions.contains_key(&key) {
             // The tag offers in a dialog of another kind: not taken over.
             return Err(Error::unsupported(
@@ -268,7 +267,8 @@ impl Control {
         };
         // Nothing reaches the hidden side, and the party's media goes
         // nowhere until it is joined to someone.
-        self.park_or_rejoin(&key, &key);
+        let dialog = self.created_dialog(&call_id, &tag).unwrap_or(key.clone());
+        self.park_or_rejoin(&dialog, &key);
         if let Some(l) = req
             .get_bytes(b"set-label")
             .or_else(|| req.get_bytes(b"label"))
@@ -283,11 +283,31 @@ impl Control {
         Ok((call_id, tag, n))
     }
 
+    /// The dialog of created party `tag` of `call` with its hidden side,
+    /// whichever offered last (the dialog is under the last offerer's key).
+    pub(super) fn created_dialog(&self, call: &[u8], tag: &[u8]) -> Option<super::SessionKey> {
+        let creator = [CREATOR, tag].concat();
+        let by_relay = (call.to_vec(), creator.clone());
+        // (Not answered yet, it has no to-tag: the key is the party's own.)
+        if self
+            .sessions
+            .get(&by_relay)
+            .is_some_and(|s| s.to_tag.as_deref().is_none_or(|t| t == tag))
+        {
+            return Some(by_relay);
+        }
+        let by_party = (call.to_vec(), tag.to_vec());
+        self.sessions
+            .get(&by_party)
+            .is_some_and(|s| s.to_tag.as_deref() == Some(&creator[..]))
+            .then_some(by_party)
+    }
+
     /// After an offer of the created party `party` (in the dialog under
     /// `key`): a party joined to another (`connect`) is joined again (a
     /// re-offer may have changed its sections); any other is parked: its
     /// media goes nowhere, and nothing reaches the hidden side.
-    fn park_or_rejoin(&mut self, key: &super::SessionKey, party: &super::SessionKey) {
+    pub(super) fn park_or_rejoin(&mut self, key: &super::SessionKey, party: &super::SessionKey) {
         let peer = self.connections.iter().find_map(|(a, b)| {
             if a == party {
                 Some(b.clone())
@@ -320,10 +340,9 @@ impl Control {
         if !self.sessions.keys().any(|k| k.0 == call_id) {
             return Err(Error::UnknownCall);
         }
-        if !self
-            .sessions
-            .contains_key(&(call_id.to_vec(), creator.clone()))
-        {
+        // The relay's offer is the one waiting: the dialog is under the
+        // hidden side's key (it offered last).
+        if self.created_dialog(call_id, tag) != Some((call_id.to_vec(), creator.clone())) {
             return Err(Error::Request(RequestError::UnknownTag(
                 String::from_utf8_lossy(tag).into_owned(),
             )));

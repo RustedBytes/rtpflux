@@ -389,6 +389,9 @@ pub struct Control {
     created_seq: u64,
     /// The last dialog generation given ([`Session::generation`]).
     generation_seq: u64,
+    /// Set by the native API for one answer: its `track-state` checkpoint
+    /// is kept (committed by `endpoint.commit`, or rolled back).
+    keep_checkpoint: bool,
     /// The relay calls a pending checkpoint has, while an offer is handled:
     /// not ended by it.
     keep_calls: Vec<CallId>,
@@ -494,6 +497,7 @@ impl Control {
             keep_calls: Vec::new(),
             created_seq: 0,
             generation_seq: 0,
+            keep_checkpoint: false,
             copies: Vec::new(),
             loop_attr: {
                 use std::hash::{Hash, Hasher};

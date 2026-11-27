@@ -372,6 +372,11 @@ impl Relay {
         // is waited for (briefly) rather than refused at the first full
         // queue, so a connection is not left half made.
         for (i, (w, end)) in ends.into_iter().enumerate() {
+            // Tests only: the second end refused, the first taken.
+            #[cfg(feature = "fault-injection")]
+            if i == 1 && std::env::var("RTPFLUX_FAULT").is_ok_and(|v| v == "connect_half") {
+                return Err(RelayError::Busy);
+            }
             let s = &self.shards[w];
             let mut cmd = Command::ConnectRemote(Box::new(end));
             let mut tries = if i == 0 { 1 } else { SECOND_END_TRIES };

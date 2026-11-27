@@ -109,6 +109,10 @@ pub struct SavedEndpoint {
     pub ready: bool,
     #[serde(default)]
     pub pending_revision: Option<u64>,
+    /// The pending renegotiation is the relay's offer (else the remote
+    /// side's).
+    #[serde(default)]
+    pub pending_local: bool,
     /// A remote endpoint's offer before the pending renegotiation.
     #[serde(default)]
     pub previous_remote_sdp: Option<String>,
@@ -129,6 +133,8 @@ pub struct SavedEndpoint {
     /// The announcement playing to it then.
     #[serde(default)]
     pub playback: Option<String>,
+    #[serde(default)]
+    pub topology_revision: u64,
 }
 
 /// A media subscription (`subscribe request`).

@@ -338,7 +338,9 @@ impl Control {
             self.apply_echo(&states, opt.media_echo, false);
         }
         self.store_answer(&key, states, (req.get_bytes(b"to-tag"), sdp), versions);
-        if written.is_ok() {
+        // (The native API's remote re-offer keeps it until its commit.)
+        let keep = std::mem::take(&mut self.keep_checkpoint);
+        if written.is_ok() && !keep {
             self.commit_checkpoint(&key);
         }
         // (A dialog under a pair key stays there.)

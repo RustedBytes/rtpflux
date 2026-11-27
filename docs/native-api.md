@@ -169,8 +169,8 @@ gives).
 | `hello` | | `versions`, `operations`, `events`, `capabilities` (codecs, transports, PCM streaming and its rates, mixer), `limits` |
 | `endpoint.create` | `remote_sdp` (the remote side's offer, which the relay answers), or `codecs` (the relay offers these: `PCMU`, `PCMA`, `G722`, `G729`, `opus`, `AMR`, `AMR-WB`, `telephone-event`, `CN`); `session_id`, `label`, `lease_ms`, `options`, `external_id`, `replaces_generation` | `endpoint_id`, `session_id`, `generation`, `revision`, `state`, `sdp_type` (`answer` or `offer`), `sdp`, `warnings` |
 | `endpoint.apply_answer` | `endpoint_id`, `sdp`, `options` | `revision`, `state` |
-| `endpoint.prepare` | `endpoint_id`; for a remote-offer endpoint `remote_sdp` (its re-INVITE); for a local one `codecs`, `options` | `pending_revision`, `sdp_type`, `sdp` |
-| `endpoint.commit` | `endpoint_id`, `revision`; for a local endpoint `sdp` (the answer) | `revision` |
+| `endpoint.prepare` | `endpoint_id`; `remote_sdp` (the remote side's re-offer), or `codecs` / `options` (the relay's re-offer), whichever side offered first | `pending_revision`, `sdp_type`, `sdp` |
+| `endpoint.commit` | `endpoint_id`, `revision`; after the relay's re-offer, `sdp` (the answer) | `revision` |
 | `endpoint.abort` | `endpoint_id`, `revision` | `revision` (the committed one) |
 | `endpoint.destroy` | `endpoint_id` | `destroyed`, or `already: true` |
 | `endpoint.query` | `endpoint_id` | The endpoint's snapshot, and `media` (its streams, statistics, RTCP, DTMF, as ng `query` reports them) |
@@ -185,14 +185,17 @@ Strings, integers, lists and objects map to their bencode forms, and
 `true`/`false` become `yes`/`no`. Keys the operation sets itself are
 refused: `call-id`, `from-tag`, `to-tag`, `sdp`, `label`.
 
-**Renegotiation.**
-- `endpoint.prepare` leaves the committed media in place until
-  `endpoint.commit`.
-- `endpoint.abort` puts the committed media back: the same ports, keys
-  and bridge.
-- For a local endpoint, the relay's new offer is taken back with
-  [`rollback`](control-protocol.md#rollback).
-- For a remote endpoint, its earlier offer is applied again.
+**Renegotiation** goes in either direction, whichever side made the
+endpoint's first offer. With `remote_sdp`, the remote side re-offers (a
+re-INVITE or UPDATE). Without it, the relay re-offers (a delayed offer, a
+codec change).
+- Both keep the committed media (ports, keys, ICE, roles, bridge) as a
+  checkpoint until `endpoint.commit`. The answer to a remote re-offer is
+  given at prepare, and its media apply then, but the checkpoint stays.
+- `endpoint.abort` puts the checkpoint back exactly
+  ([`rollback`](control-protocol.md#rollback)), and the endpoint is
+  bridged again as it was. An abort that cannot take it back fails
+  (`internal`) and says so; it does not report success.
 - A renegotiation that does not change the media keeps the ports, the
   keys and the bridge.
 
@@ -259,8 +262,32 @@ resynchronise. What does not come back:
 
 | Operation | Fields | Result |
 |---|---|---|
-| `bridge.attach` | `endpoint_id`, `peer_endpoint_id`, `peer_expected_generation` (optional) | `bridged_to`, `replaced` (the former peers, now alone) |
+| `bridge.attach` | `endpoint_id`, `peer_endpoint_id`; optionally `peer_expected_generation`, `peer_expected_revision`, `peer_expected_topology_revision` (with `expected_*` for `endpoint_id`) | `bridged_to`, `replaced` (the former peers, now alone) |
 | `bridge.detach` | `endpoint_id` | `detached`, `was_bridged_to` |
+
+**Topology revisions.**
+- Every endpoint has a `topology_revision`, which changes whenever what
+  it is bridged to changes. Negotiation revisions do not.
+- A bridge request may expect both endpoints' topology revisions
+  (`expected_topology_revision` and `peer_expected_topology_revision`). A
+  stale one is a `conflict`, so a late request never undoes a newer
+  bridge.
+- The control thread runs every mutation in turn, so concurrent requests
+  are ordered, and nothing deadlocks.
+
+**Confirmation.**
+- A bridge change replies only once both endpoints' media workers have
+  applied it.
+- If they do not confirm within a second, the reply is `timeout`, and the
+  endpoints' snapshots say `topology_state: "unconfirmed"` until a later
+  change is confirmed.
+
+**A failed attach** may have been half applied: one worker took its end,
+and its endpoint's former peer was detached. Every endpoint involved is
+then detached, on the media workers and in the records, each with
+`bridge.changed` (`reason: "attach_failed"`). The error's `detail` says
+so (`compensated`). No bridge is ever reported that the media do not
+have.
 
 Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect).
 - The two may be in different sessions, and on different media workers.

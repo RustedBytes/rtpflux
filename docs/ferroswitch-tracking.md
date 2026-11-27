@@ -43,7 +43,7 @@ the evidence, and what is left. Updated with every step.
 |---|---|---|
 | 1. Durable operation ledger, fingerprints, `operation.query`, `external_id` | P0 | done |
 | 2. Inventory, boot id, recovery report | P0 | done |
-| 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | planned |
+| 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | done |
 | 4. Replayable critical events with cursors | P0 | planned |
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | planned |
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | planned |
@@ -116,3 +116,38 @@ recording is still active, and the bridge is intact.
 
 Residual: leases start again at a restart (documented). The epoch is
 coarse: any mutation invalidates a paged walk.
+
+## Step 3: topology and renegotiation
+
+- **Created parties in either orientation.** `create`, `create answer`
+  and `create from offer` find a created party's dialog whoever offered
+  last (`created_dialog`), so the relay can re-offer to an endpoint that
+  offered first, and an endpoint the relay offered to can re-offer.
+- **Prepare in both directions, by what it is given.**
+  - `remote_sdp` is answered at once, and its checkpoint is kept by an
+    internal flag until the commit.
+  - The relay's re-offer is committed by its answer.
+  - Abort is an exact `rollback` (it fails visibly if nothing was taken
+    back), and the endpoint is bridged again as it was.
+- **`topology_revision` per endpoint.** CAS on both endpoints of an
+  attach (topology revision, and the peer's generation and revision), and
+  `expected_topology_revision` on any request that names an endpoint.
+- **A failed attach is compensated:** every endpoint involved, the former
+  peers included, is detached on the workers and in the records. A worker
+  that does not confirm leaves `topology_state: "unconfirmed"`.
+- **Fault injection:** `connect_half` refuses a cross-worker bridge's
+  second end after the first was taken.
+
+Evidence:
+- `tests/native.rs` `renegotiation_both_ways_and_topology_cas`. The IVR
+  leg's own hold re-offer is aborted, then committed; the caller's leg
+  gets the relay's re-offer, aborted, then committed. Media flows after
+  each step, and a stale topology revision is a conflict.
+- `tests/crash.rs` `a_half_made_bridge_is_compensated`. It fails when the
+  compensation is removed (mutation check): the former peer is then
+  still reported bridged while its media is not.
+
+Residual: worker acknowledgements are synchronous barriers on the control
+thread (at most a second), so a late acknowledgement cannot overwrite a
+newer intent. Early media and delayed SDP are the existing endpoint
+flows, exercised end to end in step 6.

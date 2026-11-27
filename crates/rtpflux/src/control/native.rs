@@ -227,9 +227,11 @@ impl Kind {
 #[derive(Debug, Clone)]
 pub(super) struct Pending {
     revision: u64,
-    /// The remote offer the endpoint had before (a remote endpoint's
-    /// abort offers it again).
+    /// The remote offer the endpoint had before (back at an abort).
     previous_remote: Option<Vec<u8>>,
+    /// The relay offered (the commit brings the answer); else the remote
+    /// side did (answered at prepare).
+    local: bool,
 }
 
 /// An endpoint of the native API.
@@ -260,6 +262,11 @@ pub(super) struct Endpoint {
     pub(super) external_id: Option<String>,
     /// Its current recording's id.
     pub(super) recording: Option<String>,
+    /// Counts the changes of what it is bridged to.
+    pub(super) topology_revision: u64,
+    /// `unconfirmed` while a change of its media's routing was not
+    /// confirmed by its workers.
+    pub(super) topology_state: Option<&'static str>,
 }
 
 /// A recording of an endpoint: what became of it.
@@ -928,6 +935,17 @@ impl Control {
                     format!("endpoint {id}: generation {} (not {g})", ep.generation),
                 ));
             }
+            if let Some(t) = req.u64("expected_topology_revision")?
+                && t != ep.topology_revision
+            {
+                return Err(NativeError::new(
+                    Code::Conflict,
+                    format!(
+                        "endpoint {id}: topology revision {} (not {t})",
+                        ep.topology_revision
+                    ),
+                ));
+            }
             if let Some(r) = req.u64("expected_revision")?
                 && r != ep.revision
             {
@@ -1084,6 +1102,8 @@ impl Control {
             "created_unix_ms": ep.created_unix_ms,
             "external_id": ep.external_id,
             "recording_id": ep.recording,
+            "topology_revision": ep.topology_revision,
+            "topology_state": ep.topology_state.unwrap_or("confirmed"),
         })
     }
 
@@ -1200,6 +1220,8 @@ impl Control {
             created_unix_ms: crate::relay::media_events::unix_ms(),
             external_id: external_id.clone(),
             recording: None,
+            topology_revision: 0,
+            topology_state: None,
         };
         self.native.endpoints.insert(id.clone(), ep);
         if let Some(x) = external_id {
@@ -1262,9 +1284,16 @@ impl Control {
     }
 
     /// `endpoint.prepare`: a renegotiation, not committed until
-    /// `endpoint.commit` (or taken back with `endpoint.abort`). A remote
-    /// endpoint gives its remote side's new offer (`remote_sdp`) and gets
-    /// the answer; a local one gets a new offer (`codecs`, `options`).
+    /// `endpoint.commit` (or taken back with `endpoint.abort`), in either
+    /// direction, whichever side made the endpoint's first offer:
+    /// - `remote_sdp`: the remote side's new offer (its re-INVITE); the
+    ///   reply's `sdp` is the answer;
+    /// - else (`codecs`, `options`): the relay's new offer; the remote
+    ///   side's answer comes with `endpoint.commit`.
+    ///
+    /// Either way the committed media stay as they were (ports, keys, ICE,
+    /// bridge) until the commit, and `endpoint.abort` puts them back
+    /// exactly (`rollback`).
     fn native_prepare(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
         let ep = self.endpoint(req)?;
         if ep.pending.is_some() {
@@ -1282,36 +1311,35 @@ impl Control {
         let mut entries = options(req)?;
         entries.push((b"call-id".to_vec(), bytes(ep.session.as_bytes())));
         entries.push((b"from-tag".to_vec(), bytes(ep.id.as_bytes())));
+        // Kept as last agreed until the commit: an abort rolls back to it.
+        with_flag(&mut entries, b"track-state");
         let pending_revision = ep.revision + 1;
-        let (r, warnings, previous_remote) = match ep.kind {
-            Kind::RemoteOffer => {
-                let sdp = req.need("remote_sdp")?;
-                entries.push((b"sdp".to_vec(), bytes(sdp.as_bytes())));
-                let (r, w) = self.ng_run(b"create from offer", entries)?;
-                if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
-                    e.remote_sdp = Some(sdp.as_bytes().to_vec());
-                }
-                (r, w, ep.remote_sdp.clone())
-            }
-            Kind::LocalOffer => {
-                offer_codecs(req, &mut entries);
-                // Kept as last agreed until the answer: an abort rolls
-                // back to it.
-                with_flag(&mut entries, b"track-state");
-                let (r, w) = self.ng_run(b"create", entries)?;
-                (r, w, None)
-            }
+        let remote = req.str("remote_sdp").map(str::to_owned);
+        let (r, warnings) = if let Some(sdp) = &remote {
+            entries.push((b"sdp".to_vec(), bytes(sdp.as_bytes())));
+            // The relay's answer must not commit it: the commit does.
+            self.keep_checkpoint = true;
+            let run = self.ng_run(b"create from offer", entries);
+            self.keep_checkpoint = false;
+            run?
+        } else {
+            offer_codecs(req, &mut entries);
+            self.ng_run(b"create", entries)?
         };
         let sdp = self.reply_sdp(&r).unwrap_or_default();
         if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
             e.pending = Some(Pending {
                 revision: pending_revision,
-                previous_remote,
+                previous_remote: ep.remote_sdp.clone(),
+                local: remote.is_none(),
             });
+            if let Some(sdp) = &remote {
+                e.remote_sdp = Some(sdp.as_bytes().to_vec());
+            }
         }
         Ok(json!({
             "pending_revision": pending_revision,
-            "sdp_type": if ep.kind == Kind::RemoteOffer { "answer" } else { "offer" },
+            "sdp_type": if remote.is_some() { "answer" } else { "offer" },
             "sdp": sdp,
             "warnings": warnings,
         }))
@@ -1337,7 +1365,8 @@ impl Control {
         let ep = self.endpoint(req)?;
         let p = Self::pending_of(&ep, req)?;
         let mut warnings = Vec::new();
-        if ep.kind == Kind::LocalOffer {
+        if p.local {
+            // The relay's offer, answered (the answer commits it).
             let sdp = req.need("sdp")?;
             let mut entries = options(req)?;
             entries.push((b"call-id".to_vec(), bytes(ep.session.as_bytes())));
@@ -1346,6 +1375,10 @@ impl Control {
             // An answer that does not fit: still pending, abort takes it
             // back.
             warnings = self.ng_run(b"create answer", entries)?.1;
+        } else if let Some(key) = self.created_dialog(ep.session.as_bytes(), ep.id.as_bytes()) {
+            // The remote offer, answered at prepare: its checkpoint goes.
+            self.commit_checkpoint(&key);
+            self.mark_dirty();
         }
         if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
             e.pending = None;
@@ -1357,36 +1390,35 @@ impl Control {
     fn native_abort(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
         let ep = self.endpoint(req)?;
         let p = Self::pending_of(&ep, req)?;
-        let mut warnings = Vec::new();
-        match ep.kind {
-            Kind::LocalOffer => {
-                let entries = vec![
-                    (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
-                    (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
-                    (
-                        b"to-tag".to_vec(),
-                        bytes(&[super::create::CREATOR, ep.id.as_bytes()].concat()),
-                    ),
-                ];
-                warnings = self.ng_run(b"rollback", entries)?.1;
-            }
-            Kind::RemoteOffer => {
-                // The offer agreed before, again: the same ports and keys.
-                if let Some(sdp) = &p.previous_remote {
-                    let entries = vec![
-                        (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
-                        (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
-                        (b"sdp".to_vec(), bytes(sdp)),
-                    ];
-                    warnings = self.ng_run(b"create from offer", entries)?.1;
-                }
-                if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
-                    e.remote_sdp.clone_from(&p.previous_remote);
-                }
-            }
+        // The committed media back, exactly: ports, keys, ICE, roles.
+        let entries = vec![
+            (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
+            (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
+            (
+                b"to-tag".to_vec(),
+                bytes(&[super::create::CREATOR, ep.id.as_bytes()].concat()),
+            ),
+        ];
+        let (r, warnings) = self.ng_run(b"rollback", entries)?;
+        let rolled = matches!(&r, Reply::Fields(f) if f.iter().any(|(k, v)| k == b"rolled-back" && matches!(v, B::Int(1))));
+        if !rolled {
+            return Err(NativeError::new(
+                Code::Internal,
+                "the renegotiation could not be taken back: the endpoint has its prepared media",
+            ));
+        }
+        // Back where it was: bridged again, if it was.
+        if let Some(key) = self.created_dialog(ep.session.as_bytes(), ep.id.as_bytes()) {
+            self.park_or_rejoin(
+                &key,
+                &(ep.session.as_bytes().to_vec(), ep.id.as_bytes().to_vec()),
+            );
         }
         if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
             e.pending = None;
+            if !p.local {
+                e.remote_sdp.clone_from(&p.previous_remote);
+            }
         }
         Ok(json!({"revision": ep.revision, "warnings": warnings}))
     }
@@ -1540,6 +1572,7 @@ impl Control {
             return;
         }
         ep.bridged_to = peer.map(str::to_owned);
+        ep.topology_revision += 1;
         self.endpoint_event(
             id,
             "bridge.changed",
@@ -1560,6 +1593,25 @@ impl Control {
                 format!("endpoint {peer_id}: generation {} (not {g})", b.generation),
             ));
         }
+        if let Some(t) = req.u64("peer_expected_topology_revision")?
+            && t != b.topology_revision
+        {
+            return Err(NativeError::new(
+                Code::Conflict,
+                format!(
+                    "endpoint {peer_id}: topology revision {} (not {t})",
+                    b.topology_revision
+                ),
+            ));
+        }
+        if let Some(r) = req.u64("peer_expected_revision")?
+            && r != b.revision
+        {
+            return Err(NativeError::new(
+                Code::Conflict,
+                format!("endpoint {peer_id}: revision {} (not {r})", b.revision),
+            ));
+        }
         if a.id == b.id {
             return Err(NativeError::invalid("an endpoint bridged to itself"));
         }
@@ -1569,7 +1621,17 @@ impl Control {
             (b"to-call-id".to_vec(), bytes(b.session.as_bytes())),
             (b"to-tag".to_vec(), bytes(b.id.as_bytes())),
         ];
-        let (_, warnings) = self.ng_run(b"connect", entries)?;
+        let warnings = match self.ng_run(b"connect", entries) {
+            Ok((_, w)) => w,
+            Err(e) => {
+                // Part of it may have taken effect (a worker took its end,
+                // the other did not): every endpoint involved is detached,
+                // so what is reported is what the media do.
+                self.compensate_attach(&a, &b, req.operation_id);
+                return Err(e.with_detail(json!({"compensated": true,
+                    "detached": [a.id, b.id, a.bridged_to, b.bridged_to]})));
+            }
+        };
         // Whoever either was bridged to is left alone (the relay detached
         // them).
         for (old, keep) in [(&a.bridged_to, &b.id), (&b.bridged_to, &a.id)] {
@@ -2102,7 +2164,14 @@ impl Control {
             .flatten()
             .map(|((id, _), _)| id)
             .collect();
-        if self.relay.applied(&calls, Duration::from_secs(1)) {
+        let confirmed = self.relay.applied(&calls, Duration::from_secs(1));
+        // What the snapshots say until a later confirmation.
+        for e in eps {
+            if let Some(ep) = self.native.endpoints.get_mut(&e.id) {
+                ep.topology_state = (!confirmed).then_some("unconfirmed");
+            }
+        }
+        if confirmed {
             Ok(())
         } else {
             Err(NativeError::new(
@@ -2110,6 +2179,41 @@ impl Control {
                 "the media workers did not confirm the change in time",
             ))
         }
+    }
+
+    /// A failed `bridge.attach`: `a`, `b` and whoever either was bridged to
+    /// are detached on the media workers and in the records, each told so.
+    fn compensate_attach(&mut self, a: &Endpoint, b: &Endpoint, operation_id: Option<&str>) {
+        let mut ids: Vec<String> = vec![a.id.clone(), b.id.clone()];
+        ids.extend(a.bridged_to.iter().cloned());
+        ids.extend(b.bridged_to.iter().cloned());
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            let Some(ep) = self.native.endpoints.get(id).cloned() else {
+                continue;
+            };
+            let (call, tag) = (ep.session.as_bytes().to_vec(), ep.id.as_bytes().to_vec());
+            for ((call_id, leg), _) in self
+                .party_legs(&call, &tag)
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+            {
+                if let Err(e) = self.relay.detach((call_id, leg)) {
+                    log::warn!("native: endpoint {id}: detaching after a failed attach: {e}");
+                }
+            }
+            let key = (call, tag);
+            self.connections.retain(|(x, y)| *x != key && *y != key);
+            self.set_bridge(id, None, "attach_failed", operation_id);
+        }
+        self.mark_dirty();
+        let eps: Vec<Endpoint> = ids
+            .iter()
+            .filter_map(|id| self.native.endpoints.get(id).cloned())
+            .collect();
+        let _ = self.confirm(&eps.iter().collect::<Vec<_>>());
     }
 
     /// The native API's gauges and counters, for `/metrics`.
@@ -2181,6 +2285,7 @@ impl Control {
                 revision: e.revision,
                 ready: e.ready,
                 pending_revision: e.pending.as_ref().map(|p| p.revision),
+                pending_local: e.pending.as_ref().is_some_and(|p| p.local),
                 previous_remote_sdp: e.pending.as_ref().and_then(|p| text(&p.previous_remote)),
                 bridged_to: e.bridged_to.clone(),
                 label: e.label.clone(),
@@ -2190,6 +2295,7 @@ impl Control {
                 external_id: e.external_id.clone(),
                 recording: e.recording.clone(),
                 playback: e.playback.as_ref().map(|p| p.0.clone()),
+                topology_revision: e.topology_revision,
             })
             .collect();
         v.sort_by_key(|e| e.generation);
@@ -2271,6 +2377,7 @@ impl Control {
                         .previous_remote_sdp
                         .as_ref()
                         .map(|s| s.as_bytes().to_vec()),
+                    local: e.pending_local,
                 }),
                 bridged_to: e.bridged_to.clone(),
                 label: e.label.clone(),
@@ -2283,6 +2390,8 @@ impl Control {
                 created_unix_ms: e.created_unix_ms,
                 external_id: e.external_id.clone(),
                 recording: e.recording.clone(),
+                topology_revision: e.topology_revision,
+                topology_state: None,
             };
             if let Some(x) = &e.external_id {
                 self.native

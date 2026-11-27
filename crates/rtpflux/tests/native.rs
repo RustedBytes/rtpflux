@@ -1382,3 +1382,146 @@ fn inventory_and_recovery_report() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Renegotiation in both directions, whichever side offered first: the
+/// IVR leg (the relay offered it) re-offers itself (hold), and the
+/// caller's leg (it offered) gets an offer of the relay's. Each prepared
+/// change is aborted (the committed media back, the bridge intact) and
+/// then committed. Bridge changes are fenced by topology revisions.
+#[test]
+#[allow(clippy::too_many_lines)] // Two legs, four renegotiations.
+fn renegotiation_both_ways_and_topology_cas() {
+    let dir = temp_dir("reneg");
+    let (daemon, sock) = relay(&dir, 53_500, 2);
+    let mut api = Client::connect(&sock).unwrap();
+    let (caller, ivr) = (endpoint(), endpoint());
+    let a = api
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": sdp(&caller, 1, "sendrecv"), "options": opts()}),
+        )
+        .unwrap();
+    let b = api
+        .call(
+            "endpoint.create",
+            json!({"codecs": ["PCMU", "telephone-event"]}),
+        )
+        .unwrap();
+    let (a_id, b_id) = (
+        a["endpoint_id"].as_str().unwrap().to_owned(),
+        b["endpoint_id"].as_str().unwrap().to_owned(),
+    );
+    api.call(
+        "endpoint.apply_answer",
+        json!({"endpoint_id": b_id, "sdp": sdp(&ivr, 1, "sendrecv"), "options": opts()}),
+    )
+    .unwrap();
+    let (for_caller, for_ivr) = (
+        relay_addr(a["sdp"].as_str().unwrap()),
+        relay_addr(b["sdp"].as_str().unwrap()),
+    );
+    let flows = |seq: u16| {
+        drain(&ivr);
+        drain(&caller);
+        caller
+            .send_to(&rtp(0, seq, 0, false, &[0xff; 160]), for_caller)
+            .unwrap();
+        let there = receives(&ivr);
+        ivr.send_to(&rtp(0, seq, 0, false, &[0xff; 160]), for_ivr)
+            .unwrap();
+        there && receives(&caller)
+    };
+    // Topology CAS: the revision moves with the bridge.
+    let snap = api
+        .call("endpoint.query", json!({"endpoint_id": a_id}))
+        .unwrap();
+    let t0 = snap["topology_revision"].as_u64().unwrap();
+    api.call(
+        "bridge.attach",
+        json!({"endpoint_id": a_id, "peer_endpoint_id": b_id,
+               "expected_topology_revision": t0, "peer_expected_topology_revision": 0}),
+    )
+    .unwrap();
+    assert!(flows(1), "bridged");
+    let stale = api
+        .call(
+            "bridge.detach",
+            json!({"endpoint_id": a_id, "expected_topology_revision": t0}),
+        )
+        .unwrap_err();
+    assert_eq!(code(&stale), "conflict");
+    let snap = api
+        .call("endpoint.query", json!({"endpoint_id": a_id}))
+        .unwrap();
+    assert_eq!(snap["topology_revision"].as_u64(), Some(t0 + 1));
+    assert_eq!(snap["topology_state"], "confirmed");
+
+    // The IVR (offered to by the relay) re-offers: hold.
+    let p = api
+        .call(
+            "endpoint.prepare",
+            json!({"endpoint_id": b_id, "remote_sdp": sdp(&ivr, 2, "sendonly"), "options": opts()}),
+        )
+        .unwrap();
+    assert_eq!(p["sdp_type"], "answer");
+    let held = p["sdp"].as_str().unwrap();
+    assert!(held.contains("a=recvonly"), "{held}");
+    assert_eq!(relay_addr(held), for_ivr, "the same port");
+    api.call(
+        "endpoint.abort",
+        json!({"endpoint_id": b_id, "revision": 2}),
+    )
+    .unwrap();
+    assert!(flows(2), "aborted: the committed media and the bridge");
+    let p = api
+        .call(
+            "endpoint.prepare",
+            json!({"endpoint_id": b_id, "remote_sdp": sdp(&ivr, 3, "sendrecv"), "options": opts()}),
+        )
+        .unwrap();
+    let c = api
+        .call(
+            "endpoint.commit",
+            json!({"endpoint_id": b_id, "revision": p["pending_revision"]}),
+        )
+        .unwrap();
+    assert_eq!(c["revision"], 2);
+    assert!(flows(3), "committed");
+
+    // The caller (who offered first) gets the relay's offer.
+    let p = api
+        .call(
+            "endpoint.prepare",
+            json!({"endpoint_id": a_id, "codecs": ["PCMU"]}),
+        )
+        .unwrap();
+    assert_eq!(p["sdp_type"], "offer");
+    assert_eq!(
+        relay_addr(p["sdp"].as_str().unwrap()),
+        for_caller,
+        "the same port"
+    );
+    api.call(
+        "endpoint.abort",
+        json!({"endpoint_id": a_id, "revision": 2}),
+    )
+    .unwrap();
+    assert!(flows(4), "aborted");
+    api.call(
+        "endpoint.prepare",
+        json!({"endpoint_id": a_id, "codecs": ["PCMU"]}),
+    )
+    .unwrap();
+    let c = api
+        .call(
+            "endpoint.commit",
+            json!({"endpoint_id": a_id, "revision": 2, "sdp": sdp(&caller, 2, "sendrecv"),
+                   "options": opts()}),
+        )
+        .unwrap();
+    assert_eq!(c["revision"], 2);
+    assert!(flows(5), "committed");
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
