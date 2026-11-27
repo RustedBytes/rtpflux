@@ -70,6 +70,17 @@ pub struct SavedNative {
     pub next_mixer: u32,
     #[serde(default)]
     pub tombstones: Vec<SavedTomb>,
+    /// The run that wrote it.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// PCM streams and mixers then (not restored: reported lost).
+    #[serde(default)]
+    pub streams: Vec<(u32, String, String)>,
+    #[serde(default)]
+    pub mixers: Vec<(u32, String, Vec<String>)>,
+    /// Recordings and what became of them.
+    #[serde(default)]
+    pub recordings: Vec<crate::control::native::Recording>,
 }
 
 /// A destroyed endpoint, remembered.
@@ -113,6 +124,11 @@ pub struct SavedEndpoint {
     pub created_unix_ms: u64,
     #[serde(default)]
     pub external_id: Option<String>,
+    #[serde(default)]
+    pub recording: Option<String>,
+    /// The announcement playing to it then.
+    #[serde(default)]
+    pub playback: Option<String>,
 }
 
 /// A media subscription (`subscribe request`).

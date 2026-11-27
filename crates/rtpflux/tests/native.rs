@@ -1243,3 +1243,142 @@ fn churn_leaves_nothing_behind() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The inventory, paged: every endpoint once, in order; a change between
+/// pages makes the next one a conflict. Bridges and recordings are listed.
+/// After a restart, the recovery report names the previous run, the
+/// endpoints restored and the mixer lost; the recording's record is back.
+#[test]
+#[allow(clippy::too_many_lines)] // A run, a restart, step by step.
+fn inventory_and_recovery_report() {
+    let dir = temp_dir("inventory");
+    let rec = dir.join("rec");
+    std::fs::create_dir_all(&rec).unwrap();
+    let extra = format!(
+        "state_file = \"{}\"\n[recording]\ndir = \"{}\"",
+        dir.join("state.json").display(),
+        rec.display()
+    );
+    let (daemon, sock) = relay_with(&dir, 53_100, 1, &extra);
+    let mut api = Client::connect(&sock).unwrap();
+    let boot1 = api.call("hello", Value::Null).unwrap()["boot_id"].clone();
+    let parties: Vec<UdpSocket> = (0..5).map(|_| endpoint()).collect();
+    let mut ids = Vec::new();
+    for (i, p) in parties.iter().enumerate() {
+        let ep = api
+            .call(
+                "endpoint.create",
+                json!({"remote_sdp": sdp(p, 1, "sendrecv"), "options": opts(),
+                       "external_id": format!("inv-{i}")}),
+            )
+            .unwrap();
+        ids.push(ep["endpoint_id"].as_str().unwrap().to_owned());
+    }
+    api.call(
+        "bridge.attach",
+        json!({"endpoint_id": ids[0], "peer_endpoint_id": ids[1]}),
+    )
+    .unwrap();
+    let rec_id = api
+        .call("recording.start", json!({"endpoint_id": ids[2]}))
+        .unwrap()["recording_id"]
+        .clone();
+    assert_eq!(
+        api.call("recording.query", json!({"recording_id": rec_id}))
+            .unwrap()["state"],
+        "active"
+    );
+    let mixer = api.call("mixer.create", Value::Null).unwrap()["mixer_id"].clone();
+    api.call(
+        "mixer.add",
+        json!({"mixer_id": mixer, "endpoint_id": ids[3]}),
+    )
+    .unwrap();
+
+    // Two pages of 3: all five, in order, once.
+    let first = api
+        .call("inventory.list", json!({"kind": "endpoints", "limit": 3}))
+        .unwrap();
+    assert_eq!(first["total"], 5);
+    let mut seen: Vec<String> = first["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["endpoint_id"].as_str().unwrap().to_owned())
+        .collect();
+    let cursor = first["next_cursor"].clone();
+    let second = api
+        .call(
+            "inventory.list",
+            json!({"kind": "endpoints", "limit": 3, "cursor": cursor}),
+        )
+        .unwrap();
+    seen.extend(
+        second["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["endpoint_id"].as_str().unwrap().to_owned()),
+    );
+    assert!(second["next_cursor"].is_null());
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(seen, sorted);
+    assert_eq!(
+        first["items"][0]["external_id"]
+            .as_str()
+            .map(|x| x.starts_with("inv-")),
+        Some(true)
+    );
+    // A change in between: the old cursor is refused.
+    api.call("endpoint.create", json!({"codecs": ["PCMU"]}))
+        .unwrap();
+    let stale = api
+        .call(
+            "inventory.list",
+            json!({"kind": "endpoints", "limit": 3, "cursor": cursor}),
+        )
+        .unwrap_err();
+    assert_eq!(code(&stale), "conflict");
+    let bridges = api
+        .call("inventory.list", json!({"kind": "bridges"}))
+        .unwrap();
+    assert_eq!(bridges["items"].as_array().unwrap().len(), 1);
+    let recs = api
+        .call("inventory.list", json!({"kind": "recordings"}))
+        .unwrap();
+    assert_eq!(recs["items"][0]["id"], rec_id);
+    let mixers = api
+        .call("inventory.list", json!({"kind": "mixers"}))
+        .unwrap();
+    assert_eq!(mixers["items"][0]["participants"][0], ids[3].as_str());
+    drop(api);
+    daemon.stop();
+
+    // Restarted.
+    let (daemon, sock) = relay_with(&dir, 53_100, 1, &extra);
+    let mut api = Client::connect(&sock).unwrap();
+    let report = api.call("recovery.report", Value::Null).unwrap();
+    assert_eq!(report["previous_boot_id"], boot1);
+    assert_ne!(report["boot_id"], boot1);
+    assert_eq!(report["restored_endpoints"].as_array().unwrap().len(), 6);
+    let lost = report["lost"].as_array().unwrap();
+    assert!(
+        lost.iter()
+            .any(|l| l["kind"] == "mixer" && l["mixer_id"] == mixer),
+        "{report}"
+    );
+    assert_eq!(
+        api.call("recording.query", json!({"recording_id": rec_id}))
+            .unwrap()["state"],
+        "active",
+        "the recording goes on in its file"
+    );
+    let snap = api
+        .call("endpoint.lookup", json!({"external_id": "inv-0"}))
+        .unwrap();
+    assert_eq!(snap["bridged_to"], ids[1].as_str());
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

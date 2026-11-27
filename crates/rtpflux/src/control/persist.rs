@@ -234,7 +234,11 @@ impl Control {
                 })
                 .collect(),
             endpoints: self.saved_endpoints(),
-            native: self.saved_native(),
+            native: {
+                let mut n = self.saved_native();
+                self.saved_native_extra(&mut n);
+                n
+            },
         }
     }
 
@@ -385,6 +389,7 @@ impl Control {
             }
         }
         self.restore_endpoints(&saved.endpoints, &saved.native);
+        self.restore_native_extra(&saved.native);
         for s in &saved.subscriptions {
             if let Err(e) = self.restore_subscription(s) {
                 log::warn!(

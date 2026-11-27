@@ -41,6 +41,7 @@ mod dtmf_security;
 mod error;
 mod features;
 mod ice;
+mod inventory;
 mod keys;
 pub mod ledger;
 mod legacy;
@@ -479,7 +480,7 @@ impl Control {
             extras: HashMap::new(),
             web: None,
             streams: None,
-            native: native::Native::default(),
+            native: native::Native::fresh(),
             native_inbox: None,
             media_events,
             state_dirty: false,

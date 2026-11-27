@@ -55,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 28] = [
+pub const OPERATIONS: [&str; 31] = [
     "hello",
     "endpoint.create",
     "endpoint.apply_answer",
@@ -67,6 +67,9 @@ pub const OPERATIONS: [&str; 28] = [
     "endpoint.list",
     "endpoint.lookup",
     "operation.query",
+    "inventory.list",
+    "recovery.report",
+    "recording.query",
     "endpoint.renew",
     "bridge.attach",
     "bridge.detach",
@@ -159,7 +162,7 @@ pub struct NativeError {
 }
 
 impl NativeError {
-    fn new(code: Code, message: impl Into<String>) -> Self {
+    pub(super) fn new(code: Code, message: impl Into<String>) -> Self {
         NativeError {
             code,
             message: message.into(),
@@ -167,11 +170,11 @@ impl NativeError {
         }
     }
 
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(super) fn invalid(message: impl Into<String>) -> Self {
         Self::new(Code::Invalid, message)
     }
 
-    fn with_detail(mut self, detail: Json) -> Self {
+    pub(super) fn with_detail(mut self, detail: Json) -> Self {
         self.detail = Some(detail);
         self
     }
@@ -255,6 +258,24 @@ pub(super) struct Endpoint {
     pub(super) created_unix_ms: u64,
     /// The client's stable key for it (unique per tenant).
     pub(super) external_id: Option<String>,
+    /// Its current recording's id.
+    pub(super) recording: Option<String>,
+}
+
+/// A recording of an endpoint: what became of it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recording {
+    pub id: String,
+    pub tenant: String,
+    pub endpoint_id: String,
+    /// `active`, `stopped` (asked to stop, not finished yet), `completed`
+    /// or `failed`.
+    pub state: String,
+    pub file: Option<String>,
+    pub uploaded: Option<bool>,
+    pub detail: Option<String>,
+    pub started_unix_ms: u64,
+    pub ended_unix_ms: Option<u64>,
 }
 
 /// An endpoint destroyed: by whom, its generation, and when.
@@ -338,9 +359,21 @@ pub struct Native {
     pub(super) ledger: super::ledger::Ledger,
     subscribers: Vec<(u64, Subscriber)>,
     next_subscription: u64,
+    /// This run's id (`boot-` and 32 hex digits), and the previous run's.
+    pub(super) boot_id: String,
+    pub(super) previous_boot: Option<String>,
+    /// Changes whenever a resource or a link between resources may have:
+    /// a paged inventory taken across a change starts again.
+    pub(super) topology_epoch: u64,
+    /// Recordings: id → what became of it.
+    pub(super) recordings: HashMap<String, Recording>,
+    /// What the last restart could not bring back.
+    pub(super) lost: Vec<Json>,
+    /// The endpoints the last restart brought back.
+    pub(super) restored: Vec<String>,
     /// The last event's number across all events.
-    global_seq: u64,
-    generation_seq: u64,
+    pub(super) global_seq: u64,
+    pub(super) generation_seq: u64,
     /// Endpoints per tenant at most (0: no limit of its own).
     pub(super) max_endpoints: usize,
     /// Media events the queue dropped (gaps reported).
@@ -348,32 +381,32 @@ pub struct Native {
     /// Where external audio services' sockets are (`[control] pcm_dir`).
     pub(super) pcm_dir: Option<std::path::PathBuf>,
     /// PCM streams: id → (endpoint, handle).
-    streams: HashMap<u32, (String, crate::pcm::stream::Handle)>,
-    next_stream: u32,
+    pub(super) streams: HashMap<u32, (String, crate::pcm::stream::Handle)>,
+    pub(super) next_stream: u32,
     /// Mixers: id → (tenant, handle).
-    mixers: HashMap<u32, (String, crate::pcm::mixer::MixerHandle)>,
-    next_mixer: u32,
+    pub(super) mixers: HashMap<u32, (String, crate::pcm::mixer::MixerHandle)>,
+    pub(super) next_mixer: u32,
 }
 
 /// A request's common fields.
-struct Request<'a> {
-    op: &'a str,
-    operation_id: Option<&'a str>,
-    tenant: &'a str,
-    body: &'a Map<String, Json>,
+pub(super) struct Request<'a> {
+    pub(super) op: &'a str,
+    pub(super) operation_id: Option<&'a str>,
+    pub(super) tenant: &'a str,
+    pub(super) body: &'a Map<String, Json>,
 }
 
 impl Request<'_> {
-    fn str(&self, key: &str) -> Option<&str> {
+    pub(super) fn str(&self, key: &str) -> Option<&str> {
         self.body.get(key).and_then(Json::as_str)
     }
 
-    fn need(&self, key: &str) -> Result<&str, NativeError> {
+    pub(super) fn need(&self, key: &str) -> Result<&str, NativeError> {
         self.str(key)
             .ok_or_else(|| NativeError::invalid(format!("missing {key}")))
     }
 
-    fn u64(&self, key: &str) -> Result<Option<u64>, NativeError> {
+    pub(super) fn u64(&self, key: &str) -> Result<Option<u64>, NativeError> {
         match self.body.get(key) {
             None | Some(Json::Null) => Ok(None),
             Some(v) => v
@@ -385,7 +418,7 @@ impl Request<'_> {
 }
 
 /// 128 random bits, as 32 hex digits, after `prefix`.
-fn random_id(prefix: &str) -> String {
+pub(super) fn random_id(prefix: &str) -> String {
     let mut b = [0u8; 16];
     rand::fill(&mut b);
     let mut s = String::with_capacity(prefix.len() + 32);
@@ -716,6 +749,9 @@ impl Control {
             reply(req.operation_id, outcome)
         };
         let out = serde_json::to_vec(&r).unwrap_or_default();
+        if mutates(req.op) {
+            self.native.topology_epoch += 1;
+        }
         // Endpoints whose media ended meanwhile (an `ng` delete, say).
         self.native_reconcile("ended");
         if !matches!(req.op, "hello" | "endpoint.query" | "endpoint.list") {
@@ -912,6 +948,9 @@ impl Control {
             "endpoint.query" => self.native_query(req),
             "endpoint.list" => Ok(self.native_list(req.tenant)),
             "endpoint.lookup" => self.native_lookup(req),
+            "inventory.list" => self.native_inventory(req),
+            "recovery.report" => Ok(self.native_recovery()),
+            "recording.query" => self.native_recording(req),
             "operation.query" => self.native_operation(req),
             "endpoint.renew" => self.native_renew(req),
             "bridge.attach" => self.native_attach(req),
@@ -991,6 +1030,7 @@ impl Control {
     fn native_hello(&self) -> Json {
         json!({
             "versions": VERSIONS,
+            "boot_id": self.native.boot_id,
             "server": format!("rtpflux {}", env!("CARGO_PKG_VERSION")),
             "operations": OPERATIONS,
             "events": EVENTS,
@@ -1024,7 +1064,7 @@ impl Control {
     }
 
     /// An endpoint's snapshot.
-    fn endpoint_snapshot(ep: &Endpoint) -> Json {
+    pub(super) fn endpoint_snapshot(ep: &Endpoint) -> Json {
         json!({
             "endpoint_id": ep.id,
             "session_id": ep.session,
@@ -1043,6 +1083,7 @@ impl Control {
             "event_seq": ep.seq,
             "created_unix_ms": ep.created_unix_ms,
             "external_id": ep.external_id,
+            "recording_id": ep.recording,
         })
     }
 
@@ -1158,6 +1199,7 @@ impl Control {
             playback: None,
             created_unix_ms: crate::relay::media_events::unix_ms(),
             external_id: external_id.clone(),
+            recording: None,
         };
         self.native.endpoints.insert(id.clone(), ep);
         if let Some(x) = external_id {
@@ -1384,6 +1426,7 @@ impl Control {
         );
         self.native.bury(&ep, reason);
         self.native.endpoints.remove(id);
+        self.native.topology_epoch += 1;
         log::info!("native: endpoint {id} destroyed ({reason})");
     }
 
@@ -1632,7 +1675,49 @@ impl Control {
             b"stop recording"
         };
         let (_, warnings) = self.ng_run(command, entries)?;
-        Ok(json!({"recording": start, "warnings": warnings}))
+        let now = crate::relay::media_events::unix_ms();
+        let current = ep.recording.clone().filter(|id| {
+            self.native
+                .recordings
+                .get(id)
+                .is_some_and(|r| r.state == "active")
+        });
+        let id = if start {
+            // Started again while it records: the same recording.
+            current.unwrap_or_else(|| {
+                let id = random_id("rec-");
+                self.native.recordings.insert(
+                    id.clone(),
+                    Recording {
+                        id: id.clone(),
+                        tenant: ep.tenant.clone(),
+                        endpoint_id: ep.id.clone(),
+                        state: "active".into(),
+                        file: None,
+                        uploaded: None,
+                        detail: None,
+                        started_unix_ms: now,
+                        ended_unix_ms: None,
+                    },
+                );
+                id
+            })
+        } else {
+            let Some(id) = current else {
+                return Ok(
+                    json!({"recording": false, "recording_id": ep.recording, "warnings": warnings}),
+                );
+            };
+            if let Some(r) = self.native.recordings.get_mut(&id) {
+                r.state = "stopped".into();
+                r.ended_unix_ms = Some(now);
+            }
+            id
+        };
+        if let Some(e) = self.native.endpoints.get_mut(&ep.id) {
+            e.recording = Some(id.clone());
+        }
+        Ok(json!({"recording": start, "recording_id": id, "warnings": warnings}))
     }
 
     fn native_subscribe(
@@ -1753,6 +1838,15 @@ impl Control {
         })
     }
 
+    /// A party of relay call `call` that is not a hidden side.
+    pub(super) fn party_on_leg_any(
+        &self,
+        call: crate::relay::CallId,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.party_on_leg(call, CallLeg::A)
+            .or_else(|| self.party_on_leg(call, CallLeg::B))
+    }
+
     /// Hand the media events waiting to the subscribers.
     pub(super) fn native_media_events(&mut self) {
         let Some(inbox) = self.media_events.as_mut() else {
@@ -1826,7 +1920,10 @@ impl Control {
                 } else {
                     "endpoint.failed"
                 },
-                json!({"reason": what, "detail": reason}),
+                json!({"reason": what, "detail": reason,
+                       "recording_id": (*what == "recording")
+                           .then(|| self.recording_ended(&e.subject, None, None, Some(reason)))
+                           .flatten()}),
             ),
             MediaEventKind::ActiveSpeaker { mixer } => {
                 ("mixer.speaker", json!({"mixer_id": mixer}))
@@ -1846,16 +1943,15 @@ impl Control {
                 } else {
                     "recording.failed"
                 },
-                json!({"file": file, "uploaded": uploaded}),
+                json!({"file": file, "uploaded": uploaded,
+                       "recording_id": self.recording_ended(&e.subject, file.as_ref(), *uploaded, None)}),
             ),
         };
         // Who it is about: an endpoint, or an `ng` party.
         let party = match &e.subject {
             Subject::Leg(call, leg) => self.party_on_leg(*call, *leg),
             // A call's: its first party that is not a hidden side.
-            Subject::Call(call) => self
-                .party_on_leg(*call, CallLeg::A)
-                .or_else(|| self.party_on_leg(*call, CallLeg::B)),
+            Subject::Call(call) => self.party_on_leg_any(*call),
             Subject::Dialog {
                 call_id, from_tag, ..
             } => {
@@ -2092,6 +2188,8 @@ impl Control {
                 remote_sdp: text(&e.remote_sdp),
                 created_unix_ms: e.created_unix_ms,
                 external_id: e.external_id.clone(),
+                recording: e.recording.clone(),
+                playback: e.playback.as_ref().map(|p| p.0.clone()),
             })
             .collect();
         v.sort_by_key(|e| e.generation);
@@ -2122,6 +2220,7 @@ impl Control {
                     })
                 })
                 .collect(),
+            ..crate::state::SavedNative::default()
         }
     }
 
@@ -2180,9 +2279,10 @@ impl Control {
                     .map(|ms| (ms, Instant::now() + Duration::from_millis(ms))),
                 seq: 0,
                 remote_sdp: e.remote_sdp.as_ref().map(|s| s.as_bytes().to_vec()),
-                playback: None,
+                playback: e.playback.clone().map(|p| (p, None)),
                 created_unix_ms: e.created_unix_ms,
                 external_id: e.external_id.clone(),
+                recording: e.recording.clone(),
             };
             if let Some(x) = &e.external_id {
                 self.native
@@ -2555,6 +2655,7 @@ fn mutates(op: &str) -> bool {
             | "operation.query"
             | "inventory.list"
             | "recovery.report"
+            | "recording.query"
             | "events.subscribe"
             | "events.unsubscribe"
     )

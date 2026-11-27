@@ -42,7 +42,7 @@ the evidence, and what is left. Updated with every step.
 | Step | Priority | Status |
 |---|---|---|
 | 1. Durable operation ledger, fingerprints, `operation.query`, `external_id` | P0 | done |
-| 2. Inventory, boot id, recovery report | P0 | planned |
+| 2. Inventory, boot id, recovery report | P0 | done |
 | 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | planned |
 | 4. Replayable critical events with cursors | P0 | planned |
 | 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | planned |
@@ -91,3 +91,28 @@ Residual: mixers, streams, playback and recordings are deduplicated by
 operation keys, but have no external id of their own (step 2 reports
 those that a restart loses). A ledger costs two `fsync`s and a state-file
 write per keyed mutation; this is measured in step 12.
+
+## Step 2: inventory and recovery report
+
+- `control/inventory.rs`: `inventory.list` (six kinds, id order, pages of
+  at most 500, a cursor bound to the run and `topology_epoch`, a conflict
+  when anything changed between pages, a watermark on every page);
+  `recovery.report`; `recording.query`.
+- A boot id per run (in `hello`), and the previous one after a restart.
+- `topology_epoch` changes with every mutation, endpoint end, recording
+  end.
+- Recordings have ids and a state (`active`, `stopped`, `completed`,
+  `failed`), updated from the media events, saved with the state.
+- Saved with the state: the streams, mixers, recordings and each
+  endpoint's playback and recording. After a restart, streams and mixers
+  are reported lost, and so is a playback the relay did not restore
+  (one from a blob).
+
+Evidence: `tests/native.rs` `inventory_and_recovery_report`. It pages
+through five endpoints, refuses a stale cursor, lists the bridges, the
+recordings and the mixers, then restarts. Afterwards `previous_boot_id`
+matches, six endpoints are restored, the mixer is reported lost, the
+recording is still active, and the bridge is intact.
+
+Residual: leases start again at a restart (documented). The epoch is
+coarse: any mutation invalidates a paged walk.

@@ -196,6 +196,31 @@ refused: `call-id`, `from-tag`, `to-tag`, `sdp`, `label`.
 - A renegotiation that does not change the media keeps the ports, the
   keys and the bridge.
 
+**Inventory and recovery.**
+
+| Operation | Fields | Result |
+|---|---|---|
+| `inventory.list` | `kind` (`endpoints`, `bridges`, `streams`, `mixers`, `playbacks`, `recordings`), `limit` (1–500, default 100), `cursor` | `items`, `next_cursor`, `total`, `watermark` (`boot_id`, `global_seq`, `topology_epoch`) |
+| `recovery.report` | | `boot_id`, `previous_boot_id`, `restored_endpoints`, `lost`, `unknown_operations` |
+
+Inventory pages list one kind in id order. A cursor is valid only while
+nothing changes. If any resource or link changes between two pages, the
+next page is a `conflict`, and the client starts again without a cursor.
+It never gets pages of two different states. Endpoint items also carry
+their stream and mixer.
+
+`hello` gives this run's `boot_id`; a restart makes a new one. After a
+restart, `recovery.report` says what came back and what did not:
+- the endpoints restored, with their media, bridges and recordings, which
+  continue in the same files;
+- what was lost: PCM streams and mixers are never restored, and neither
+  is an announcement from a `blob`. Announcements from a file are;
+- the operations whose outcome is unknown.
+
+Nothing is reported as restored that is not. The client reconstructs the
+rest: it starts streams again, and creates mixers and adds their
+participants.
+
 **External ids.** `external_id` is the client's stable key for an
 endpoint, such as a call's UUID and leg. It is unique per tenant:
 - Creating a second endpoint under a live endpoint's external id is a
@@ -253,7 +278,8 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
 |---|---|---|
 | `playback.start` | `endpoint_id`, `file` or `blob_base64`, `repeat_times`, `start_pos`, `duration`, `repeat_duration` | `playback_id`, `duration_ms` |
 | `playback.stop` | `endpoint_id` | `stopped`, `playback_id` |
-| `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording` |
+| `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording`, `recording_id` (starting again while it records gives the same id) |
+| `recording.query` | `recording_id` | Its `state` (`active`, `stopped`, `completed`, `failed`), `file`, `uploaded`, `detail`, start and end times |
 
 - An announcement that plays to its end gives `playback.completed`, with
   the `operation_id` of its `playback.start`. One that is stopped, or

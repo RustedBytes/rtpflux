@@ -225,6 +225,14 @@ impl Ledger {
         self.entries.get(&(tenant.to_owned(), key.to_owned()))
     }
 
+    /// The operations whose outcome is unknown: (tenant, key, entry).
+    pub fn unknown(&self) -> impl Iterator<Item = (&str, &str, &Entry)> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.status == Status::Unknown)
+            .map(|((t, k), e)| (t.as_str(), k.as_str(), e))
+    }
+
     /// Forget entries older than the retention period.
     pub fn expire(&mut self, now_ms: u64) {
         while let Some((k, at)) = self.order.front() {
