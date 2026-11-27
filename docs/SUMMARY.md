@@ -26,6 +26,7 @@
 - [Conformance](conformance.md)
 - [Media engine: audit and status](media-engine.md)
   - [ADR 0001: native control API](adr/0001-native-control-api.md)
+- [Ferroswitch integration: tracking](ferroswitch-tracking.md)
 
 ---
 
