@@ -84,6 +84,9 @@ pub struct SavedNative {
     /// Under `[ha]`: (resource id, tenant, ownership group).
     #[serde(default)]
     pub owned: Vec<(String, String, String)>,
+    /// Mixers' desired topologies (rebuilt after a restart).
+    #[serde(default)]
+    pub mixer_plans: Vec<crate::control::conference::MixerPlan>,
 }
 
 /// A destroyed endpoint, remembered.

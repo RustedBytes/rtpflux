@@ -10,8 +10,10 @@
 //!   refused (`conflict`) and the client starts again, rather than getting
 //!   pages of two different states.
 //! - **Recovery** (`recovery.report`): this run's and the previous run's
-//!   boot ids; the endpoints restored; what was lost (PCM streams and
-//!   mixers are never restored, nor announcements from a blob); the
+//!   boot ids; the endpoints and mixers restored (a mixer with the same
+//!   id and its participants' settings); what was lost (PCM streams are
+//!   never restored, nor announcements from a blob, nor a mixer's
+//!   participant whose endpoint did not come back); the
 //!   operations whose outcome is unknown. Nothing is reported as restored
 //!   that was not.
 
@@ -215,6 +217,7 @@ impl Control {
             "boot_id": n.boot_id,
             "previous_boot_id": n.previous_boot,
             "restored_endpoints": n.restored,
+            "restored_mixers": n.restored_mixers,
             "lost": n.lost,
             "unknown_operations": unknown,
             "durable": n.ledger.durable(),
@@ -293,6 +296,7 @@ impl Control {
             .map(|(id, (t, m))| (*id, t.clone(), m.participants.clone()))
             .collect();
         saved.recordings = n.recordings.values().cloned().collect::<Vec<Recording>>();
+        saved.mixer_plans = self.mixer_plans();
     }
 
     /// After a restart: what the previous run had and this one does not
@@ -310,9 +314,14 @@ impl Control {
                 .push(json!({"kind": "stream", "stream_id": id, "tenant": tenant,
                 "endpoint_id": ep, "reason": "PCM streams are not restored: start it again"}));
         }
+        // Mixers with a plan are rebuilt (at the first pass); one without
+        // (saved by an older version) is lost.
+        n.pending_mixers.clone_from(&saved.mixer_plans);
         for (id, tenant, parts) in &saved.mixers {
-            n.lost.push(json!({"kind": "mixer", "mixer_id": id, "tenant": tenant,
-                "participants": parts, "reason": "mixers are not restored: create it again and add its participants"}));
+            if !saved.mixer_plans.iter().any(|p| p.id == *id) {
+                n.lost.push(json!({"kind": "mixer", "mixer_id": id, "tenant": tenant,
+                    "participants": parts, "reason": "mixers are not restored: create it again and add its participants"}));
+            }
         }
         for r in &saved.recordings {
             n.recordings.insert(r.id.clone(), r.clone());

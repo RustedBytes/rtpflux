@@ -603,7 +603,7 @@ a core, where two threads per stream (200 threads) used 11.6–12.6%.
 | `mixer.create` | | `mixer_id`, `max_participants` (64) |
 | `mixer.add` | `mixer_id`, `endpoint_id`, `role` (optional) | `participants` |
 | `mixer.remove` | `mixer_id`, `endpoint_id` | `removed` |
-| `mixer.set` | `mixer_id`, `endpoint_id`, `muted`, `gain_db` (−60 to +24), `role`, `whisper_to` | `set` |
+| `mixer.set` | `mixer_id`, `endpoint_id`, `muted`, `deafened`, `input_gain_db` (or `gain_db`, −60 to +24), `output_gain_db` (−60 to +24), `role`, `whisper_to` | `set` |
 | `mixer.destroy` | `mixer_id` | `destroyed` |
 
 A mixer gives each participant the sum of everyone else (N − 1 mixing),
@@ -634,9 +634,75 @@ Every role hears the whole conference.
 reported with `mixer.speaker`. A speaker stays the active one for at
 least 500 ms.
 
+**Per participant.**
+- `muted`: no one hears it.
+- `deafened`: it hears silence, while it is still heard and its RTP
+  still flows.
+- `input_gain_db`: on what it says.
+- `output_gain_db`: on what it hears.
+
 **Participants** may use any codec the relay converts, and may differ
-from each other. An endpoint in a mixer is not bridged, and has no
-stream. In-band key presses of participants give `dtmf.detected`.
+from each other. An endpoint in a mixer is not bridged. In-band key
+presses of participants give `dtmf.detected`.
+
+**Taps.** `stream.start` on a participant makes a **tap**: a PCM stream
+(speech recognition, say) gets a copy of what the participant says, from
+the mixer, decoded at the stream's rate, while the mix goes on.
+- A tap cannot inject (`inject: true` is refused): the mixer plays to
+  the participant.
+- A participant has 4 taps at most.
+- A tap whose queue is full loses copies, never the mix.
+- A tap ends (`stream.ended`) when its participant leaves the mixer.
+
+**Recovery.** Each mixer's desired topology is its plan: its id, tenant,
+and seats (role, `whisper_to`, `muted`, `deafened`, both gains). Every
+successful `mixer.*` operation updates it, and it is saved with the
+state. After a restart, before any request is answered, every planned
+mixer is created again with the **same id**, and each participant whose
+endpoint was restored is seated again with its settings.
+`recovery.report` lists them in `restored_mixers`. A participant whose
+endpoint did not come back is reported in `lost`
+(`kind: "mixer_participant"`). The mixing state itself starts afresh
+(jitter buffers, the active speaker), and taps are not restored, as no
+PCM stream is.
+
+## Media composition
+
+What processes an endpoint's audio is a small graph, built only when
+asked for. An endpoint with none of it stays on the ordinary relay,
+transcoding and XDP paths, untouched.
+
+| Node | Made by | Runs on |
+|---|---|---|
+| Decode, jitter buffer, concealment | a stream, a detector, a mixer seat | the PCM shards, or the mixer's thread |
+| VAD, in-band DTMF | `stream.start` (`vad`, `dtmf`), a mixer seat (DTMF) | the same |
+| Speech-recognition feed (PCM out) | `stream.start` with a `socket` | the PCM shards |
+| Tap on a participant | `stream.start` on a participant | the mixer (copy), the PCM shards (the rest) |
+| Mixing (N − 1, roles, gains) | `mixer.add` | the mixer's thread |
+| Injection (PCM in), encode | `stream.start` with `inject`, a mixer seat | the PCM shards or the mixer, then the media worker |
+| Recording | `recording.start` | the media worker (relayed media only) |
+
+**Rules.**
+- **Ownership.** Each node belongs to the endpoint's tenant, and under
+  `[ha]` to the ownership group its creation proved. A tap or a seat is
+  removed with its endpoint.
+- **No cycles.** A mixer's participants are endpoints, never other
+  mixers. An endpoint has one audio sink at a time: a bridge, a mixer,
+  or its own stream. Taps only read. So no graph can loop.
+- **Atomic changes.** Each change is one operation on the control
+  thread, confirmed by the media workers before its reply. A failed one
+  leaves the graph as it was.
+- **Budgets:**
+  - 64 participants per mixer;
+  - 4 taps per participant;
+  - bounded queues everywhere: 64 packets in, 100 ms out, 240 ms
+    towards a service. A full queue drops and counts, and never blocks
+    a media worker.
+- **Latency:**
+  - a mixed or tapped stream adds the jitter buffer (40 ms target) and
+    one 20 ms frame;
+  - the output to a participant adds its encoder's frame;
+  - injected audio waits in a queue of at most 100 ms.
 
 ## Events
 

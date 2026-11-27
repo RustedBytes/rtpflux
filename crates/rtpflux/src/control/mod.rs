@@ -36,6 +36,7 @@
 mod answer;
 mod args;
 mod audit;
+pub mod conference;
 mod copies;
 mod create;
 mod dtmf_security;
@@ -679,6 +680,9 @@ impl Control {
         self.native_flush_gaps();
         self.ownership_prune();
         self.ivr_prune();
+        if !self.native.pending_mixers.is_empty() {
+            self.rebuild_mixers();
+        }
         let ended = self.relay.take_ended();
         if ended.is_empty() {
             return;

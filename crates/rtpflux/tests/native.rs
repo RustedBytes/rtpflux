@@ -1362,12 +1362,13 @@ fn inventory_and_recovery_report() {
     assert_eq!(report["previous_boot_id"], boot1);
     assert_ne!(report["boot_id"], boot1);
     assert_eq!(report["restored_endpoints"].as_array().unwrap().len(), 6);
-    let lost = report["lost"].as_array().unwrap();
-    assert!(
-        lost.iter()
-            .any(|l| l["kind"] == "mixer" && l["mixer_id"] == mixer),
-        "{report}"
-    );
+    // The mixer is rebuilt, with the same id and its participant.
+    assert_eq!(report["restored_mixers"], json!([mixer]), "{report}");
+    assert!(report["lost"].as_array().unwrap().is_empty(), "{report}");
+    let mixers = api
+        .call("inventory.list", json!({"kind": "mixers"}))
+        .unwrap();
+    assert_eq!(mixers["items"][0]["participants"][0], ids[3].as_str());
     assert_eq!(
         api.call("recording.query", json!({"recording_id": rec_id}))
             .unwrap()["state"],

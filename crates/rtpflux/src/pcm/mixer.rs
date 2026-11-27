@@ -25,6 +25,12 @@
 //! whisperer (heard by one participant only, added to that listener's mix
 //! alone, never to the sum).
 //!
+//! A participant can also be **deafened** (it hears silence, and is still
+//! heard), have an **output gain** (on what it hears; the input gain is on
+//! what it says), and **taps**: PCM streams that get a copy of its packets
+//! (speech recognition on a conference leg), [`MAX_TAPS`] at most. A tap
+//! whose queue is full loses the copy, never the mix.
+//!
 //! At most [`MAX_PARTICIPANTS`]. The mix is wideband (16 kHz): G.722,
 //! Opus and AMR-WB participants hear it so, the others narrowband.
 
@@ -47,6 +53,8 @@ use std::time::{Duration, Instant};
 
 /// Participants of one mixer, at most.
 pub const MAX_PARTICIPANTS: usize = 64;
+/// Taps of one participant, at most.
+pub const MAX_TAPS: usize = 4;
 /// The shortest time a speaker stays the active one.
 pub const SPEAKER_HOLD_MS: u64 = 500;
 /// RTP packets queued per participant for the mixer, at most.
@@ -86,8 +94,16 @@ enum Ask {
     /// Gain in dB.
     Gain(String, i32),
     Role(String, Role),
+    Deaf(String, bool),
+    /// Gain in dB on what it hears.
+    OutGain(String, i32),
+    Tap(String, SyncSender<RtpCopy>),
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent switches: muted, deafened, speaking, gone"
+)]
 struct Participant {
     key: String,
     subject: Subject,
@@ -103,6 +119,10 @@ struct Participant {
     vad: Vad,
     gain_db: i32,
     muted: bool,
+    deaf: bool,
+    out_gain_db: i32,
+    /// Copies of its packets for PCM streams.
+    taps: Vec<SyncSender<RtpCopy>>,
     /// Its voice is detected now.
     speaking: bool,
     /// Its frame's energy (mean square), this frame.
@@ -128,7 +148,13 @@ impl Participant {
     ) -> [i16; MIX_FRAME] {
         loop {
             match self.fork.try_recv() {
-                Ok(pkt) => self.receive.push(&pkt),
+                Ok(pkt) => {
+                    // A copy for each tap; a tap that went away is let go.
+                    self.taps.retain(|t| {
+                        !matches!(t.try_send(pkt.clone()), Err(TrySendError::Disconnected(_)))
+                    });
+                    self.receive.push(&pkt);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.gone = true;
@@ -218,6 +244,9 @@ impl MixerHandle {
             vad: Vad::new(Rate::Hz16000),
             gain_db: 0,
             muted: false,
+            deaf: false,
+            out_gain_db: 0,
+            taps: Vec::new(),
             speaking: false,
             energy: 0,
             gone: false,
@@ -256,6 +285,21 @@ impl MixerHandle {
     /// Participant `key`'s role.
     pub fn role(&self, key: &str, role: Role) {
         let _ = self.asks.send(Ask::Role(key.to_owned(), role));
+    }
+
+    /// Deafen participant `key` (it hears silence), or not.
+    pub fn deafen(&self, key: &str, deaf: bool) {
+        let _ = self.asks.send(Ask::Deaf(key.to_owned(), deaf));
+    }
+
+    /// The gain of what participant `key` hears, in dB.
+    pub fn output_gain(&self, key: &str, db: i32) {
+        let _ = self.asks.send(Ask::OutGain(key.to_owned(), db));
+    }
+
+    /// A copy of participant `key`'s packets into `tap` (a PCM stream's).
+    pub fn tap(&self, key: &str, tap: SyncSender<RtpCopy>) {
+        let _ = self.asks.send(Ask::Tap(key.to_owned(), tap));
     }
 
     /// Participant `key`'s gain, in dB (−60 to +24).
@@ -322,6 +366,23 @@ fn apply(asks: &Receiver<Ask>, parts: &mut Vec<Participant>) {
                     p.role = role;
                 }
             }
+            Ask::Deaf(k, d) => {
+                if let Some(p) = parts.iter_mut().find(|p| p.key == k) {
+                    p.deaf = d;
+                }
+            }
+            Ask::OutGain(k, db) => {
+                if let Some(p) = parts.iter_mut().find(|p| p.key == k) {
+                    p.out_gain_db = db;
+                }
+            }
+            Ask::Tap(k, t) => {
+                if let Some(p) = parts.iter_mut().find(|p| p.key == k)
+                    && p.taps.len() < MAX_TAPS
+                {
+                    p.taps.push(t);
+                }
+            }
         }
     }
 }
@@ -380,6 +441,19 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
                 .is_err()
             {
                 continue;
+            }
+            // Deafened: silence (its packets still flow). Its output gain.
+            if p.deaf {
+                out.fill(0);
+            } else if p.out_gain_db != 0 {
+                let g = i32::from(q8(p.out_gain_db));
+                for s in &mut out {
+                    *s = i16::try_from((i32::from(*s) * g) >> 8).unwrap_or(if *s < 0 {
+                        i16::MIN
+                    } else {
+                        i16::MAX
+                    });
+                }
             }
             let pcm: &[i16] = match &mut p.narrow {
                 Some(r) => {

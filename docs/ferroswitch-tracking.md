@@ -51,7 +51,7 @@ the evidence, and what is left. Updated with every step.
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | done |
 | 9. Detectors without a stream, DTMF send, tones, sensitive digits | P1 | done |
 | 10. Recording pause/resume with identity and state; ACLs, quotas, token rotation, audit | P1 | done |
-| 11. Media graph, conference recovery | P2 | planned |
+| 11. Media graph, conference recovery | P2 | done |
 | 12. Benchmarks against the baseline | all | planned |
 
 ## Step 1: operation ledger and external ids
@@ -543,3 +543,64 @@ loaded test run were made tolerant of it. The slow-consumer test now
 waits for each event instead of stopping after 500 ms of quiet; the
 durable-mode test has a 30 s deadline. Neither showed a logic fault:
 both pass alone, and the events arrived complete and in order.
+
+## Step 11: composition and conference recovery
+
+- Mixer, per participant:
+  - **deafen** (hears silence, still heard);
+  - **output gain**, on what it hears, with `input_gain_db` as an alias
+    of `gain_db`;
+  - **taps**: PCM streams fed a copy of its packets by the mixer, at
+    most 4. "Conference participants can also stream PCM": speech
+    recognition on a conference leg. A tap cannot inject, and it ends
+    when its participant leaves.
+- A PCM stream now ends when nothing can send it packets any more (its
+  call ended, or its participant left), instead of ticking silently.
+- **Conference recovery** (`control/conference.rs`):
+  - each mixer's plan (id, tenant, seats with role, `whisper_to`, mute,
+    deafen, both gains) is kept by every `mixer.*` operation and saved;
+  - after a restart, mixers are rebuilt with the same ids before any
+    request is answered;
+  - `recovery.report` gains `restored_mixers`, and participants whose
+    endpoint did not return are listed as lost;
+  - the mixing state starts afresh, and is documented as resumed, not
+    transparently continued.
+- **The media graph** is documented (`docs/native-api.md`, "Media
+  composition"):
+  - nodes and where they run;
+  - ownership, no cycles (one audio sink per endpoint, taps read-only);
+  - atomic, worker-confirmed changes;
+  - budgets and latency.
+
+  No new graph engine was built: the graph is composed from the existing
+  nodes, and endpoints without any keep the relay, transcode and XDP
+  paths.
+
+Evidence (`tests/conference.rs`):
+- `composition_and_controls`:
+  - mixed codecs (PCMU, PCMA, G.722): B and C hear A, A does not hear
+    itself (N − 1);
+  - B's output gain −20 dB is markedly quieter;
+  - A deafened hears nothing of B;
+  - A muted is heard by no one;
+  - an injecting stream on a participant is refused;
+  - a tap on A gets A's voice while B still hears A;
+  - removing A ends the tap.
+- `attach_detach_and_a_restart`:
+  - three clients add and remove at once (15 rounds each), leaving three
+    participants;
+  - B deafened, C muted with +6 dB;
+  - after a restart: `restored_mixers` holds the same id, nothing is
+    lost, three participants; B still deafened and C still muted, by
+    audio levels;
+  - a new mixer gets a higher id.
+- `tests/native.rs` `inventory_and_recovery_report` now expects the mixer
+  restored (it expected it lost).
+
+Not covered (spec items left as gaps):
+- A conference recording: recording takes only relayed media (step 10a),
+  and a mixer's legs are not relayed. Conference + PCM + recording
+  composition therefore lacks the recording part.
+- Mixer-to-mixer links (cascading) are not supported, by design (no
+  cycles).
+- AEC, AGC, video and T.38 are optional later milestones, per the spec.

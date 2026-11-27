@@ -494,7 +494,9 @@ impl Stream {
             return false;
         }
         self.take_flush();
-        self.fork_tick();
+        if !self.fork_tick() {
+            return false;
+        }
         self.pump();
         self.answer_marks();
         self.write_out()
@@ -502,9 +504,15 @@ impl Stream {
 
     /// The endpoint's audio of the last 20 ms, decoded and analysed, into
     /// frames for the service.
-    fn fork_tick(&mut self) {
-        while let Ok(p) = self.fork.try_recv() {
-            self.receive.push(&p);
+    /// `false` once nothing can send it packets any more (its call ended,
+    /// or, for a tap, its participant left the mixer).
+    fn fork_tick(&mut self) -> bool {
+        loop {
+            match self.fork.try_recv() {
+                Ok(p) => self.receive.push(&p),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+            }
         }
         let drops = self.dropped.load(Ordering::Relaxed);
         if drops != self.reported_drops || self.receive.restarted {
@@ -546,6 +554,7 @@ impl Stream {
             self.out.pending.extend_from_slice(&self.fresh);
             self.frames_out();
         }
+        true
     }
 
     /// The header of a frame to the service.

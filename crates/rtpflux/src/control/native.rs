@@ -457,6 +457,14 @@ pub struct Native {
     pub(super) ivr: HashMap<String, super::ivr::Ivr>,
     /// Requests per second per tenant.
     pub(super) limiter: super::audit::Limiter,
+    /// Each mixer's desired topology (saved; rebuilt after a restart).
+    pub(super) mixer_plans: std::collections::BTreeMap<u32, super::conference::MixerPlan>,
+    /// Planned mixers to rebuild at the next pass (after a restart).
+    pub(super) pending_mixers: Vec<super::conference::MixerPlan>,
+    /// Mixers rebuilt after the restart.
+    pub(super) restored_mixers: Vec<u32>,
+    /// PCM streams that are taps on mixer participants.
+    pub(super) taps: std::collections::HashSet<u32>,
     /// `ng` may not change calls holding native endpoints.
     pub(super) ng_protect: bool,
     /// Under `[ha]`: resource id (an endpoint's, `mixer_id:N`,
@@ -818,6 +826,10 @@ impl Control {
     /// the reply, as JSON text.
     pub fn native_request(&mut self, message: &[u8], origin: &Origin) -> Vec<u8> {
         self.native.expire();
+        // After a restart, the mixers are back before any request sees them.
+        if !self.native.pending_mixers.is_empty() {
+            self.rebuild_mixers();
+        }
         let parsed: Result<Json, _> = serde_json::from_slice(message);
         let Ok(Json::Object(body)) = parsed else {
             return serde_json::to_vec(&reply(
@@ -1123,8 +1135,20 @@ impl Control {
             "recording.stop" => self.native_record(req, false),
             "stream.start" => self.native_stream_start(req),
             "stream.flush" | "stream.detect" | "stream.stop" => self.native_stream(req),
-            "mixer.create" => self.native_mixer_create(req),
-            "mixer.add" | "mixer.remove" | "mixer.set" | "mixer.destroy" => self.native_mixer(req),
+            "mixer.create" => {
+                let r = self.native_mixer_create(req);
+                if let Ok(result) = &r {
+                    self.note_mixer(req, result);
+                }
+                r
+            }
+            "mixer.add" | "mixer.remove" | "mixer.set" | "mixer.destroy" => {
+                let r = self.native_mixer(req);
+                if let Ok(result) = &r {
+                    self.note_mixer(req, result);
+                }
+                r
+            }
             "events.subscribe" => self.native_subscribe(req, origin),
             "events.unsubscribe" => self.native_unsubscribe(req),
             "" => Err(NativeError::invalid("missing op")),
@@ -2359,6 +2383,7 @@ impl Control {
             }
             MediaEventKind::StreamEnded { stream } => {
                 self.native.streams.remove(stream);
+                self.native.taps.remove(stream);
                 ("stream.ended", json!({"stream_id": stream}))
             }
             MediaEventKind::RecordingDone { file, uploaded } => (
@@ -2870,12 +2895,17 @@ impl Control {
                 "the endpoint has a stream already",
             ));
         }
-        let want_inject = socket.is_some()
-            && req
-                .body
-                .get("inject")
-                .and_then(Json::as_bool)
-                .unwrap_or(true);
+        // A conference participant's stream is a tap: the mixer plays to
+        // it, so it injects nothing.
+        let participant = self.in_mixer(&ep.id);
+        let asked_inject = req.body.get("inject").and_then(Json::as_bool);
+        if participant && asked_inject == Some(true) {
+            return Err(NativeError::new(
+                Code::Conflict,
+                "the endpoint is in a mixer, which plays to it: a stream on it is a tap (inject: false)",
+            ));
+        }
+        let want_inject = socket.is_some() && !participant && asked_inject.unwrap_or(true);
         let protocol = match req.u64("protocol")?.unwrap_or(1) {
             1 => 1,
             2 => 2,
@@ -2893,12 +2923,7 @@ impl Control {
             }
             _ => None,
         };
-        if self.in_mixer(&ep.id) {
-            return Err(NativeError::new(
-                Code::Conflict,
-                "the endpoint is in a mixer",
-            ));
-        }
+
         self.native.next_stream = self.native.next_stream.wrapping_add(1).max(1);
         let id = self.native.next_stream;
         let spec = crate::pcm::stream::Spec {
@@ -2920,7 +2945,12 @@ impl Control {
                 format!("socket {}: {e}", name.unwrap_or("(none)")),
             )
         })?;
-        if !self.relay.pcm_stream(leg, Some(end)).map_err(Error::from)? {
+        if participant {
+            if let Err(e) = self.attach_tap(&ep.id, id, end.fork) {
+                handle.stop();
+                return Err(e);
+            }
+        } else if !self.relay.pcm_stream(leg, Some(end)).map_err(Error::from)? {
             handle.stop();
             return Err(NativeError::new(
                 Code::NotFound,
@@ -2934,6 +2964,27 @@ impl Control {
             json!({"stream_id": id, "rate": rate, "inject": inject.is_some(), "protocol": protocol,
             "service": socket_given, "detect": detect_json(detect)}),
         )
+    }
+
+    /// Stream `id` gets a copy of what participant `endpoint` sends, from
+    /// its mixer (a tap).
+    fn attach_tap(
+        &mut self,
+        endpoint: &str,
+        id: u32,
+        fork: std::sync::mpsc::SyncSender<crate::pcm::stream::RtpCopy>,
+    ) -> Result<(), NativeError> {
+        let Some((_, m)) = self
+            .native
+            .mixers
+            .values()
+            .find(|(_, m)| m.participants.iter().any(|p| p == endpoint))
+        else {
+            return Err(NativeError::new(Code::NotFound, "the mixer is gone"));
+        };
+        m.tap(endpoint, fork);
+        self.native.taps.insert(id);
+        Ok(())
     }
 
     /// `stream.flush` (barge-in: the audio queued for the endpoint goes)
@@ -2958,6 +3009,10 @@ impl Control {
         }
         handle.stop();
         self.native.streams.remove(&id);
+        // A tap: the participant's own stream is the mixer's; it stays.
+        if self.native.taps.remove(&id) {
+            return Ok(json!({"stopped": true}));
+        }
         if let Some((leg, _)) = self
             .party_legs(ep.session.as_bytes(), ep.id.as_bytes())
             .unwrap_or_default()
@@ -3127,8 +3182,16 @@ impl Control {
                 if let Some(muted) = req.body.get("muted").and_then(Json::as_bool) {
                     m.mute(&ep.id, muted);
                 }
-                if let Some(db) = req.body.get("gain_db").and_then(Json::as_i64) {
-                    m.gain(&ep.id, i32::try_from(db.clamp(-60, 24)).unwrap_or(0));
+                if let Some(db) = super::conference::gain(req, "input_gain_db")
+                    .or_else(|| super::conference::gain(req, "gain_db"))
+                {
+                    m.gain(&ep.id, db);
+                }
+                if let Some(db) = super::conference::gain(req, "output_gain_db") {
+                    m.output_gain(&ep.id, db);
+                }
+                if let Some(d) = req.body.get("deafened").and_then(Json::as_bool) {
+                    m.deafen(&ep.id, d);
                 }
                 let role = self.mixer_role(req, id)?;
                 if let (Some(role), Some((_, m))) = (role, self.native.mixers.get(&id)) {
@@ -3177,7 +3240,7 @@ impl Control {
     }
 
     /// Endpoint `ep` joins mixer `id`.
-    fn mixer_add(&mut self, id: u32, ep: &Endpoint) -> Result<Json, NativeError> {
+    pub(super) fn mixer_add(&mut self, id: u32, ep: &Endpoint) -> Result<Json, NativeError> {
         if ep.bridged_to.is_some() {
             return Err(NativeError::new(
                 Code::Conflict,
