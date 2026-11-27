@@ -199,6 +199,11 @@ pub struct EventFilter {
     /// Events of `ng` parties too.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub all_parties: bool,
+    /// Begin after this cursor (an event's `event_id`, a subscription's
+    /// `cursor`, an inventory page's watermark): what came after it is
+    /// replayed first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// An event's type.
@@ -208,6 +213,10 @@ pub enum EventKind {
     EndpointFailed,
     EndpointTimeout,
     EndpointDestroyed,
+    /// Some of the endpoint's media events were lost before the relay's
+    /// journal: what it awaited (digits, an announcement's end) is
+    /// indeterminate.
+    EndpointEventsLost,
     BridgeChanged,
     IceConnected,
     DtlsReady,
@@ -237,6 +246,7 @@ impl EventKind {
             "endpoint.failed" => EventKind::EndpointFailed,
             "endpoint.timeout" => EventKind::EndpointTimeout,
             "endpoint.destroyed" => EventKind::EndpointDestroyed,
+            "endpoint.events_lost" => EventKind::EndpointEventsLost,
             "bridge.changed" => EventKind::BridgeChanged,
             "ice.connected" => EventKind::IceConnected,
             "dtls.ready" => EventKind::DtlsReady,
@@ -260,6 +270,10 @@ impl EventKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaEvent {
     pub kind: EventKind,
+    /// `<boot_id>:<global_seq>`: unique, and a cursor to resume after it.
+    pub event_id: Option<String>,
+    /// The run of the relay that gave it.
+    pub boot_id: Option<String>,
     /// The endpoint it is about (`None` for an `ng` party's, or a gap).
     pub endpoint_id: Option<String>,
     pub session_id: Option<String>,
@@ -289,6 +303,8 @@ impl MediaEvent {
         };
         Some(MediaEvent {
             kind,
+            event_id: s("event_id"),
+            boot_id: s("boot_id"),
             endpoint_id: s("endpoint_id"),
             session_id: s("session_id"),
             generation: n("generation"),
@@ -298,21 +314,6 @@ impl MediaEvent {
             operation_id: s("operation_id"),
             data,
         })
-    }
-
-    /// A gap the client itself reports (`reason`), with `missed` events.
-    pub(crate) fn gap(reason: &str, missed: u64) -> Self {
-        MediaEvent {
-            kind: EventKind::Gap,
-            endpoint_id: None,
-            session_id: None,
-            generation: None,
-            seq: None,
-            global_seq: None,
-            time_unix_ms: None,
-            operation_id: None,
-            data: serde_json::json!({"event": "gap", "reason": reason, "missed": missed}),
-        }
     }
 
     /// A key press, if this is one: its digit, how long it was held, and
@@ -327,6 +328,160 @@ impl MediaEvent {
         let inband = self.data.get("source").and_then(Value::as_str) == Some("inband");
         Some((digit, ms, inband))
     }
+}
+
+/// What the relay says of itself (`hello`). Unknown fields are kept in
+/// `extra`, so a newer relay's are not lost.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub versions: Vec<u64>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub guarantees: Guarantees,
+    #[serde(default)]
+    pub capabilities: Value,
+    #[serde(default)]
+    pub limits: Value,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Capabilities {
+    /// Whether the relay has operation `op`.
+    #[must_use]
+    pub fn supports(&self, op: &str) -> bool {
+        self.operations.iter().any(|o| o == op)
+    }
+}
+
+/// What the relay guarantees (`hello`'s `guarantees`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Guarantees {
+    /// `durable` (an operation ledger on disk) or `memory`.
+    #[serde(default)]
+    pub idempotency: Option<String>,
+    #[serde(default)]
+    pub idempotency_retention_ms: Option<u64>,
+    /// `synced_before_reply` (keyed mutations, durable mode) or `periodic`.
+    #[serde(default)]
+    pub state_commit: Option<String>,
+    /// `replayable_within_journal`.
+    #[serde(default)]
+    pub events: Option<String>,
+    #[serde(default)]
+    pub event_journal: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Where an inventory page was taken: a cursor to subscribe from
+/// ([`Watermark::cursor`]) without missing anything after it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Watermark {
+    pub boot_id: String,
+    pub global_seq: u64,
+    pub topology_epoch: u64,
+}
+
+impl Watermark {
+    /// The events cursor at this watermark.
+    #[must_use]
+    pub fn cursor(&self) -> String {
+        format!("{}:{}", self.boot_id, self.global_seq)
+    }
+}
+
+/// A page of the inventory.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InventoryPage {
+    pub kind: String,
+    pub items: Vec<Value>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub total: u64,
+    pub watermark: Watermark,
+}
+
+/// What became of an operation (`operation.query`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationState {
+    Pending,
+    Applied,
+    Failed,
+    /// Begun before a restart, its outcome never recorded.
+    Unknown,
+    /// Older than the relay's ledger keeps.
+    Expired,
+    /// Not known to the ledger.
+    NotFound,
+    Other(String),
+}
+
+/// `operation.query`'s answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationStatus {
+    pub state: OperationState,
+    pub op: Option<String>,
+    pub resources: Vec<String>,
+    /// The reply the operation got (applied or failed).
+    pub reply: Option<Value>,
+    pub durable: bool,
+}
+
+impl OperationStatus {
+    pub(crate) fn from_wire(v: &Value) -> Self {
+        let state = match v.get("status").and_then(Value::as_str).unwrap_or("") {
+            "pending" => OperationState::Pending,
+            "applied" => OperationState::Applied,
+            "failed" => OperationState::Failed,
+            "unknown" => OperationState::Unknown,
+            "expired" => OperationState::Expired,
+            "not_found" => OperationState::NotFound,
+            other => OperationState::Other(other.to_owned()),
+        };
+        OperationStatus {
+            state,
+            op: v.get("op").and_then(Value::as_str).map(str::to_owned),
+            resources: v
+                .get("resources")
+                .and_then(Value::as_array)
+                .map_or_else(Vec::new, |a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                }),
+            reply: v.get("reply").cloned().filter(|r| !r.is_null()),
+            durable: v.get("durable").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+}
+
+/// `recovery.report`'s answer.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecoveryReport {
+    pub boot_id: String,
+    #[serde(default)]
+    pub previous_boot_id: Option<String>,
+    #[serde(default)]
+    pub restored_endpoints: Vec<String>,
+    /// What the restart could not bring back (`kind`, ids, `reason`).
+    #[serde(default)]
+    pub lost: Vec<Value>,
+    /// Operations whose outcome is unknown (`idempotency_key`, `op`,
+    /// `resources`).
+    #[serde(default)]
+    pub unknown_operations: Vec<Value>,
+    #[serde(default)]
+    pub durable: bool,
 }
 
 #[cfg(test)]

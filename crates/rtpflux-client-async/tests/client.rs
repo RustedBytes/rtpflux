@@ -294,7 +294,9 @@ async fn the_client_reconnects_across_a_restart() {
             break e;
         }
     };
-    assert_eq!(gap.data["reason"], "reconnected");
+    // The stream came back from its cursor, which was of the run before:
+    // the relay says so (reconcile with the inventory).
+    assert_eq!(gap.data["reason"], "boot_changed");
     drop((media, events));
     tokio::task::spawn_blocking(move || daemon.stop())
         .await
@@ -303,8 +305,9 @@ async fn the_client_reconnects_across_a_restart() {
 }
 
 /// TCP with a tenant's token (a wrong one is refused at connect), and a
-/// consumer too slow for its events: they are dropped and counted, never
-/// queued without bound.
+/// consumer too slow for its events: the stream pauses and resumes from
+/// its cursor, so it gets every event once, in order, with bounded
+/// memory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_tokens_and_a_slow_event_consumer() {
     let dir = temp_dir("tcp");
@@ -318,11 +321,17 @@ async fn tcp_tokens_and_a_slow_event_consumer() {
     config.event_queue = 2;
     let media = MediaClient::connect(config).await.unwrap();
     let mut events = media
-        .subscribe_events(EventFilter::default())
+        .subscribe_events(EventFilter {
+            types: vec!["endpoint.destroyed".into()],
+            ..EventFilter::default()
+        })
         .await
         .unwrap();
-    // Many events, none read meanwhile.
-    for _ in 0..6 {
+    // Many events, none read meanwhile: the stream stops reading and
+    // comes back from its cursor once there is room. Nothing is lost,
+    // nothing is queued without bound, nothing comes twice.
+    let mut made = Vec::new();
+    for _ in 0..30 {
         let ep = media
             .create_endpoint(CreateEndpointRequest::offering(["PCMU"]))
             .await
@@ -331,19 +340,15 @@ async fn tcp_tokens_and_a_slow_event_consumer() {
             .destroy_endpoint(DestroyEndpointRequest::new(&ep.endpoint_id))
             .await
             .unwrap();
+        made.push(ep.endpoint_id);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut got = Vec::new();
-    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(300), events.next()).await {
-        got.push(e);
+    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), events.next()).await {
+        assert_ne!(e.kind, EventKind::Gap, "{e:?}");
+        got.push(e.endpoint_id.unwrap());
     }
-    let gap = got
-        .iter()
-        .find(|e| e.kind == EventKind::Gap)
-        .expect("a gap");
-    assert_eq!(gap.data["reason"], "overflow");
-    assert!(gap.data["missed"].as_u64().unwrap() > 0);
-    assert!(got.len() <= 4, "bounded: {}", got.len());
+    assert_eq!(got, made, "every destroy, once, in order");
     drop((media, events));
     tokio::task::spawn_blocking(move || daemon.stop())
         .await

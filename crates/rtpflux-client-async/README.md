@@ -60,11 +60,23 @@ Over TCP: `Config::tcp("10.0.0.5:2224", token)`.
     deadlines.
 - **Events on a connection of their own.**
   - A burst of events never delays a reply.
-  - A consumer that falls behind loses events: they are counted, and
-    reported as a `Gap` (`reason: "overflow"`, with `missed`) as soon as
-    there is room.
-  - After a reconnect the client subscribes again and reports a `Gap`
-    with `reason: "reconnected"`. Reconcile with `list_endpoints`.
+  - The stream keeps its position (the last event's `event_id`). After a
+    broken connection, a relay-side overflow, or its own consumer falling
+    behind (it stops reading until there is room), it subscribes again
+    from there. The relay replays from its journal, so each event arrives
+    once and in order, and memory stays bounded.
+  - Only what the relay cannot replay reaches the consumer as a `Gap`:
+    `boot_changed` (the relay restarted), `retention_expired`, or
+    `media_overflow`. Reconcile with `inventory_all` and
+    `recovery_report`.
+- **Reconciliation.** `hello` (typed capabilities and guarantees),
+  `inventory` / `inventory_all` (a consistent snapshot and a watermark to
+  subscribe from), `operation` (an operation key's state), `lookup` (by
+  external id), `renew`, `recovery_report`.
+- **Ordering.** Requests on different pooled connections may run in any
+  order; wait for a reply before sending a request that depends on it.
+  Operation ids stay unique across reconnects, and the client never
+  retries on its own.
 
 The blocking client, `rtpflux-client`, is for tools and prototypes. Its
 requests wait at most `DEFAULT_REQUEST_TIMEOUT` (10 s; `set_request_timeout`

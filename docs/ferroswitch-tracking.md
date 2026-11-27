@@ -45,7 +45,7 @@ the evidence, and what is left. Updated with every step.
 | 2. Inventory, boot id, recovery report | P0 | done |
 | 3. Topology revisions, bridge CAS, half-bridge compensation, renegotiation both ways | P0 | done |
 | 4. Replayable critical events with cursors | P0 | done |
-| 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | planned |
+| 5. Async SDK: capabilities, inventory, operations, cursors, recovery | P0 | done |
 | 6. Cross-repository test: ferrosip `sip-ua` + async SDK + rtpflux | P0 | planned |
 | 7. Fencing epochs issued by an ownership authority | P0-HA | planned |
 | 8. PCM on shared I/O and DSP shards; flush generations | P1 | planned |
@@ -186,3 +186,37 @@ Residual: the journal is in memory. Events of a run do not survive a
 relay restart, which is reported as `boot_changed`, and the terminal
 results are reconciled from the saved state. Events are not persisted
 across power loss by design.
+
+## Step 5: the async SDK
+
+- Typed `hello` (`Capabilities`, `Guarantees`, keeping unknown fields),
+  `inventory` and `inventory_all` (restarting a walk that raced a change),
+  `operation` (`OperationState`), `lookup`, `renew`, `recovery_report`;
+  `MediaEvent` with `event_id` and `boot_id`; `EventFilter::cursor`; error
+  codes `unavailable`, `expired`, `unknown_outcome`.
+- Event streams keep a position and resubscribe from it after a broken
+  connection, a relay overflow, or the consumer falling behind (they stop
+  reading, so memory stays bounded). Repeats are dropped by event number.
+  Only unrecoverable losses reach the consumer as gaps.
+- Bug found and fixed: events the relay writes while a subscription is
+  being made (a replay, a `boot_changed` gap) could come before the
+  subscription's reply and were dropped. They are now delivered first.
+- Documented: ordering across pooled connections, correlation ids unique
+  across reconnects, no automatic retries.
+
+Evidence:
+- `rtpflux-client-async/tests/client.rs`: a slow consumer gets every
+  event once and in order; after a relay restart, `boot_changed`.
+- `tests/typed.rs`: capabilities, operations by key, an external id, a
+  lease, the whole inventory and a subscription from its watermark, the
+  recovery report.
+- `tests/cancel.rs`, against a fake relay:
+  - a request cancelled while queued is never written;
+  - a cancelled request's late reply is not taken for the next request's;
+  - fragmented replies are read;
+  - a request in flight when the connection drops is
+    `Disconnected { sent: true }`, and the client reconnects with new ids;
+  - an unanswered request is `Timeout { sent: true }`, and carries its
+    deadline.
+- `rtpflux/tests/native.rs` `fragmented_and_oversized_frames`: a request
+  written one octet at a time, and a frame over 1 MiB.

@@ -1724,3 +1724,46 @@ fn an_overflowing_subscriber_resumes_without_loss() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Framing on the real server: a request written one octet at a time is
+/// answered; a frame announced over 1 MiB closes that connection, and the
+/// relay goes on serving others.
+#[test]
+fn fragmented_and_oversized_frames() {
+    use std::io::{Read, Write};
+    let dir = temp_dir("framing");
+    let (daemon, sock) = relay(&dir, 63_300, 1);
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    let body = br#"{"v":1,"op":"hello","operation_id":"frag"}"#;
+    let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+    frame.extend_from_slice(body);
+    for b in &frame {
+        s.write_all(&[*b]).unwrap();
+        s.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).unwrap();
+    let mut reply = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut reply).unwrap();
+    let v: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(v["operation_id"], "frag");
+    assert_eq!(v["ok"], true);
+    // Over the limit: closed.
+    let mut big = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    big.set_read_timeout(Some(WAIT)).unwrap();
+    big.write_all(&(2u32 << 20).to_be_bytes()).unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        big.read(&mut buf).unwrap_or(0),
+        0,
+        "the connection is closed"
+    );
+    // Others are still served.
+    let mut api = Client::connect(&sock).unwrap();
+    assert!(api.call("hello", Value::Null).is_ok());
+    drop((s, big, api));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -51,7 +51,26 @@
 //!   [`MediaError::Disconnected`] (`sent: true`), those still queued wait
 //!   for the new connection (within their deadlines).
 //! - **Events** come on a connection of their own
-//!   ([`MediaClient::subscribe_events`]); see [`MediaEventStream`].
+//!   ([`MediaClient::subscribe_events`]), each once, in order, resumed from
+//!   the stream's position after a reconnect or an overflow; see
+//!   [`MediaEventStream`].
+//! - **Ordering.** Requests are spread over the pool's connections, and
+//!   requests on different connections may be run in any order. Each
+//!   connection's requests run in order. A request that depends on another
+//!   (an attach on a create) must wait for that one's reply; that is the
+//!   only ordering the client guarantees.
+//! - **Correlation.** Operation ids are a per-client random prefix and a
+//!   counter: unique across reconnects, so a late reply is never taken for
+//!   another request's. The client never retries on its own; retry with
+//!   the same `idempotency_key` when [`MediaError::outcome_unknown`] says
+//!   to.
+//! - **Reconciliation.** [`MediaClient::hello`] (capabilities, guarantees,
+//!   boot id), [`MediaClient::inventory_all`] (a consistent snapshot and
+//!   its [`Watermark`]: subscribe from [`Watermark::cursor`] to miss
+//!   nothing after it), [`MediaClient::operation`],
+//!   [`MediaClient::lookup`] (by external id), [`MediaClient::renew`],
+//!   [`MediaClient::recovery_report`]. Unknown fields and values are kept
+//!   (`extra`, `Other`): a newer relay does not break the client.
 
 #![forbid(unsafe_code)]
 
@@ -65,9 +84,10 @@ pub use config::{Config, Transport};
 pub use error::{ErrorCode, MediaError};
 pub use events::MediaEventStream;
 pub use types::{
-    ApplyAnswerRequest, AttachBridgeRequest, BridgeResult, CreateEndpointRequest,
-    DestroyEndpointRequest, Endpoint, EventFilter, EventKind, MediaEvent, Negotiation,
-    PrepareRequest, Prepared,
+    ApplyAnswerRequest, AttachBridgeRequest, BridgeResult, Capabilities, CreateEndpointRequest,
+    DestroyEndpointRequest, Endpoint, EventFilter, EventKind, Guarantees, InventoryPage,
+    MediaEvent, Negotiation, OperationState, OperationStatus, PrepareRequest, Prepared,
+    RecoveryReport, Watermark,
 };
 
 use conn::Job;
@@ -386,6 +406,143 @@ impl MediaClient {
     /// See [`MediaError`].
     pub async fn list_endpoints(&self, deadline: Option<Duration>) -> Result<Value, MediaError> {
         self.call("endpoint.list", Map::new(), deadline).await
+    }
+
+    /// `hello`: what the relay has (operations, events, codecs, …) and
+    /// guarantees, and its run's boot id.
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`].
+    pub async fn hello(&self) -> Result<Capabilities, MediaError> {
+        typed(self.call("hello", Map::new(), None).await?)
+    }
+
+    /// One page of the inventory of `kind` (`endpoints`, `bridges`,
+    /// `streams`, `mixers`, `playbacks`, `recordings`), from `cursor`.
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`]; a `conflict` when the inventory changed since
+    /// the cursor's page.
+    pub async fn inventory(
+        &self,
+        kind: &str,
+        cursor: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<InventoryPage, MediaError> {
+        let mut f = Map::new();
+        f.insert("kind".into(), json!(kind));
+        if let Some(c) = cursor {
+            f.insert("cursor".into(), json!(c));
+        }
+        if let Some(l) = limit {
+            f.insert("limit".into(), json!(l));
+        }
+        typed(self.call("inventory.list", f, None).await?)
+    }
+
+    /// The whole inventory of `kind`, as one consistent state, and its
+    /// watermark (subscribe from [`Watermark::cursor`] to miss nothing
+    /// after it). A walk the inventory changed under is started again, at
+    /// most `attempts` times.
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`]; the last `conflict` when every attempt raced a
+    /// change.
+    pub async fn inventory_all(
+        &self,
+        kind: &str,
+        attempts: usize,
+    ) -> Result<(Vec<Value>, Watermark), MediaError> {
+        let mut last = MediaError::Protocol("no attempt".into());
+        'walk: for _ in 0..attempts.max(1) {
+            let mut items = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                match self.inventory(kind, cursor.as_deref(), Some(500)).await {
+                    Ok(page) => {
+                        items.extend(page.items);
+                        match page.next_cursor {
+                            Some(c) => cursor = Some(c),
+                            None => return Ok((items, page.watermark)),
+                        }
+                    }
+                    Err(e) if e.code() == Some(&ErrorCode::Conflict) => {
+                        last = e;
+                        continue 'walk;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// `operation.query`: what became of the operation keyed `key` (pass
+    /// when it was first attempted to tell an expired key from an unknown
+    /// one).
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`].
+    pub async fn operation(
+        &self,
+        key: &str,
+        first_attempt_unix_ms: Option<u64>,
+    ) -> Result<OperationStatus, MediaError> {
+        let mut f = Map::new();
+        f.insert("idempotency_key".into(), json!(key));
+        if let Some(t) = first_attempt_unix_ms {
+            f.insert("first_attempt_unix_ms".into(), json!(t));
+        }
+        let v = self.call("operation.query", f, None).await?;
+        Ok(OperationStatus::from_wire(&v))
+    }
+
+    /// `endpoint.lookup`: the endpoint an external id names, live or
+    /// destroyed (`state_of_id`).
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`]; `not_found` when nothing has it.
+    pub async fn lookup(&self, external_id: &str) -> Result<Value, MediaError> {
+        let mut f = Map::new();
+        f.insert("external_id".into(), json!(external_id));
+        self.call("endpoint.lookup", f, None).await
+    }
+
+    /// `endpoint.renew`: the endpoint's lease again, for `lease` (or its
+    /// own length).
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`].
+    pub async fn renew(
+        &self,
+        endpoint_id: &str,
+        lease: Option<Duration>,
+    ) -> Result<(), MediaError> {
+        let mut f = Map::new();
+        f.insert("endpoint_id".into(), json!(endpoint_id));
+        if let Some(l) = lease {
+            f.insert(
+                "lease_ms".into(),
+                json!(u64::try_from(l.as_millis()).unwrap_or(u64::MAX)),
+            );
+        }
+        self.call("endpoint.renew", f, None).await.map(drop)
+    }
+
+    /// `recovery.report`: what the relay's last restart brought back and
+    /// lost, and the operations whose outcome is unknown.
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`].
+    pub async fn recovery_report(&self) -> Result<RecoveryReport, MediaError> {
+        typed(self.call("recovery.report", Map::new(), None).await?)
     }
 
     /// Subscribe to events matching `filter`, on a connection of its own.
