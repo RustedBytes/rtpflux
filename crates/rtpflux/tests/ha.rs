@@ -328,7 +328,9 @@ fn fencing_by_authority_epochs() {
     let e3 = b
         .call("endpoint.create", with(offer(), "call-3", 1, "ctl-b"))
         .unwrap();
-    std::thread::sleep(Duration::from_millis((short + 100).saturating_sub(now_ms())));
+    std::thread::sleep(Duration::from_millis(
+        (short + 100).saturating_sub(now_ms()),
+    ));
     let destroy = with(
         json!({"endpoint_id": e3["endpoint_id"]}),
         "call-3",
