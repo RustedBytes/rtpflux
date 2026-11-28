@@ -899,9 +899,12 @@ mod tests {
         // Two attempts of 300 ms and a short backoff, then given up.
         let first = got.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let second = got.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // Stamped when each request arrives, while the deadline runs from
+        // before the connection: the first attempt's time to send (a few
+        // ms, more on a loaded machine) falls out of the gap.
         let gap = second.2 - first.2;
         assert!(
-            gap >= std::time::Duration::from_millis(300)
+            gap >= std::time::Duration::from_millis(200)
                 && gap < std::time::Duration::from_millis(900),
             "the first attempt lasted its deadline: {gap:?}"
         );

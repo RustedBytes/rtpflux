@@ -318,7 +318,8 @@ fn fencing_by_authority_epochs() {
         .unwrap();
 
     // A lease that ran out: fail closed until the authority renews it.
-    let short = now_ms() + 1_500;
+    // Room for a loaded machine before it ends; then past its end.
+    let short = now_ms() + 4_000;
     b.call(
         "ownership.claim",
         grant("default", "call-3", 1, "ctl-b", short),
@@ -327,7 +328,7 @@ fn fencing_by_authority_epochs() {
     let e3 = b
         .call("endpoint.create", with(offer(), "call-3", 1, "ctl-b"))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(1_600));
+    std::thread::sleep(Duration::from_millis((short + 100).saturating_sub(now_ms())));
     let destroy = with(
         json!({"endpoint_id": e3["endpoint_id"]}),
         "call-3",
