@@ -535,6 +535,22 @@ impl MediaClient {
         self.call("endpoint.renew", f, None).await.map(drop)
     }
 
+    /// `endpoint.echo`: the endpoint gets its own media back, as it sent
+    /// it (`true`), or no longer (`false`). Returns whether anything
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`]; `conflict` when it is bridged or in a mixer
+    /// (and `bridge.attach` is refused while it echoes).
+    pub async fn echo(&self, endpoint_id: &str, on: bool) -> Result<bool, MediaError> {
+        let mut f = Map::new();
+        f.insert("endpoint_id".into(), json!(endpoint_id));
+        f.insert("echo".into(), json!(on));
+        let v = self.call("endpoint.echo", f, None).await?;
+        Ok(v.get("changed").and_then(Value::as_bool).unwrap_or(false))
+    }
+
     /// `playback.query`: where playback `playback_id` is, or how it
     /// ended (the relay keeps the latest 8192 ends, until it restarts).
     ///

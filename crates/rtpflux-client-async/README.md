@@ -74,6 +74,8 @@ Over TCP: `Config::tcp("10.0.0.5:2224", token)`.
   subscribe from), `operation` (an operation key's state), `lookup` (by
   external id), `renew`, `recovery_report`, `playback` (where a
   playback is, or how it ended: for an end missed while reconnecting).
+- **Echo.** `echo(endpoint_id, true)` sends an endpoint its own media
+  back (an echo test, an RTP loopback); `false` stops it.
 - **Sensitive digits.** `EventFilter { sensitive: true, .. }` asks for
   the digits of endpoints marked sensitive as they are, for the
   controller collecting them; other subscriptions get them redacted.

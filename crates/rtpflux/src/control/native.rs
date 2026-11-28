@@ -55,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 41] = [
+pub const OPERATIONS: [&str; 42] = [
     "hello",
     "ownership.claim",
     "endpoint.create",
@@ -72,6 +72,7 @@ pub const OPERATIONS: [&str; 41] = [
     "recovery.report",
     "recording.query",
     "endpoint.renew",
+    "endpoint.echo",
     "bridge.attach",
     "bridge.detach",
     "playback.start",
@@ -800,7 +801,7 @@ impl Native {
     }
 
     /// The endpoint `id` for `tenant`, or why not.
-    fn get(&self, id: &str, tenant: &str) -> Result<&Endpoint, NativeError> {
+    pub(super) fn get(&self, id: &str, tenant: &str) -> Result<&Endpoint, NativeError> {
         match self.endpoints.get(id) {
             Some(ep) if ep.tenant == tenant => Ok(ep),
             Some(_) => Err(NativeError::new(
@@ -1218,6 +1219,7 @@ impl Control {
             "playback.start" => self.native_play(req, true),
             "playback.stop" => self.native_play(req, false),
             "playback.query" => self.native_playback_query(req),
+            "endpoint.echo" => self.native_echo(req),
             "recording.start" => self.native_record(req, true),
             "recording.stop" => self.native_record(req, false),
             "stream.start" => self.native_stream_start(req),
@@ -1808,6 +1810,9 @@ impl Control {
     fn native_query(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
         let ep = self.endpoint(req)?;
         let mut snap = Self::endpoint_snapshot(&ep);
+        if let Some(o) = snap.as_object_mut() {
+            o.insert("echo".to_owned(), json!(self.echoing(&ep)));
+        }
         let entries = vec![
             (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
             (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
@@ -1934,8 +1939,12 @@ impl Control {
             ));
         }
         if a.id == b.id {
-            return Err(NativeError::invalid("an endpoint bridged to itself"));
+            return Err(NativeError::invalid(
+                "an endpoint bridged to itself (endpoint.echo sends it its media back)",
+            ));
         }
+        self.not_echoing(&a)?;
+        self.not_echoing(&b)?;
         let entries = vec![
             (b"call-id".to_vec(), bytes(a.session.as_bytes())),
             (b"from-tag".to_vec(), bytes(a.id.as_bytes())),
@@ -2703,7 +2712,7 @@ impl Control {
     ///
     /// `timeout` when a worker does not confirm within a second (the change
     /// may still take effect: `endpoint.query` tells).
-    fn confirm(&mut self, eps: &[&Endpoint]) -> Result<(), NativeError> {
+    pub(super) fn confirm(&mut self, eps: &[&Endpoint]) -> Result<(), NativeError> {
         let calls: Vec<crate::relay::CallId> = eps
             .iter()
             .filter_map(|e| self.party_legs(e.session.as_bytes(), e.id.as_bytes()))
@@ -3227,7 +3236,7 @@ impl Control {
     }
 
     /// Whether endpoint `id` is in a mixer.
-    fn in_mixer(&self, id: &str) -> bool {
+    pub(super) fn in_mixer(&self, id: &str) -> bool {
         self.native
             .mixers
             .values()
@@ -3379,6 +3388,7 @@ impl Control {
                 "the endpoint is in a mixer or has a stream",
             ));
         }
+        self.not_echoing(ep)?;
         let (leg, pt, codec, clock) = self.endpoint_audio(ep)?;
         let Some((_, m)) = self.native.mixers.get_mut(&id) else {
             return Err(NativeError::new(Code::NotFound, format!("mixer {id}")));

@@ -305,8 +305,9 @@ impl Control {
 
     /// After an offer of the created party `party` (in the dialog under
     /// `key`): a party joined to another (`connect`) is joined again (a
-    /// re-offer may have changed its sections); any other is parked: its
-    /// media goes nowhere, and nothing reaches the hidden side.
+    /// re-offer may have changed its sections); an echoing one echoes
+    /// again; any other is parked: its media goes nowhere, and nothing
+    /// reaches the hidden side.
     pub(super) fn park_or_rejoin(&mut self, key: &super::SessionKey, party: &super::SessionKey) {
         let peer = self.connections.iter().find_map(|(a, b)| {
             if a == party {
@@ -324,9 +325,16 @@ impl Control {
             }
             return;
         }
+        // An echoing one (`endpoint.echo`) echoes still, on its new
+        // sections.
+        let echoing = self.party_echoing(&party.0, &party.1);
         if let Some(s) = self.sessions.get(key) {
             let states = s.media.clone();
             self.apply_echo(&states, Some([crate::relay::Echo::Discard; 2]), true);
+        }
+        if echoing && let Err(e) = self.set_party_echo(&party.0, &party.1, true) {
+            self.warnings
+                .push(format!("the echo could not be set again: {e}"));
         }
     }
 

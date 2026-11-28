@@ -687,3 +687,10 @@ is now fixed in the relay:
 - **The SDK's event filter could not ask for unredacted digits.** The
   relay already honoured `events.subscribe` with `sensitive: true`, but
   `EventFilter` had no field for it. It now has `sensitive`.
+- **No echo or loopback primitive.** The media workers already had
+  `media echo` for `ng`, but the native API had no way to use it.
+  `endpoint.echo` (`echo: true`/`false`) now sends an endpoint its own
+  RTP back, unchanged. The echo is kept through a renegotiation and a
+  restart, `endpoint.query` reports it, and it is refused together with
+  a bridge or a mixer, in either order. Async SDK:
+  `MediaClient::echo`. Test: `echo::an_endpoint_hears_itself`.

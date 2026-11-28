@@ -40,6 +40,7 @@ pub mod conference;
 mod copies;
 mod create;
 mod dtmf_security;
+mod echo;
 mod error;
 mod features;
 mod ice;

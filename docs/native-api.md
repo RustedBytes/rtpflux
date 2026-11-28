@@ -222,6 +222,7 @@ gives).
 | `endpoint.list` | | `endpoints` (snapshots), `destroyed` (recent tombstones), `global_seq` |
 | `endpoint.lookup` | `external_id` | The live endpoint's snapshot (`state_of_id: "live"`), or the destroyed one's id, generation and reason (`state_of_id: "destroyed"`) while its tombstone is kept |
 | `endpoint.renew` | `endpoint_id`, `lease_ms` (optional) | `lease_ms` |
+| `endpoint.echo` | `endpoint_id`, `echo` (`true`/`false`) | `echo`, `changed` (see [Echo](#echo)) |
 | `ownership.claim` | `group`, `epoch`, `owner`, `lease_expires_unix_ms`, `key_id`, `signature` (see [Exclusive ownership](#exclusive-ownership-ha)) | `group`, `epoch`, `owner`, `lease_expires_unix_ms`, `previous_epoch`, `drained` |
 
 `options` are ng options for the operation (see
@@ -416,6 +417,24 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
   is detached, and told so with `bridge.changed`, reason `replaced`.
 - Bridged endpoints enter the XDP fast path once settled, as connected
   calls do.
+
+## Echo
+
+`endpoint.echo` with `echo: true` sends an endpoint its own media back:
+an echo test, or an RTP loopback for checking a media path.
+- Each RTP packet the endpoint sends comes back to it from the relay's
+  port, unchanged: its own codec, packet time, SSRC and sequence. Its
+  RTCP is dropped, and nothing reaches anyone else.
+- It needs an answered endpoint, and is refused (`conflict`) for one
+  that is bridged or in a mixer. `bridge.attach` and `mixer.add` are
+  refused while it echoes: `echo: false` first.
+- It is kept through a renegotiation and, with a state file, a restart.
+  `endpoint.query` says `echo`.
+- Combining echo with announcements, tones or PCM streams on the same
+  endpoint is not specified (not tested).
+- `echo: false` parks the endpoint again: its media goes nowhere.
+- `ng` has the same per leg: `media echo` (`forward`, `backwards`,
+  `both`, `blackhole`, `off`) in an offer or answer.
 
 ## Announcements and recordings
 
