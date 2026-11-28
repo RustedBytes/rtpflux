@@ -445,7 +445,7 @@ an echo test, or an RTP loopback for checking a media path.
 | `playback.query` | `playback_id` | Its `state`: `playing`, `queued` (with `position`), `completed` or `stopped` (with `reason`, `queued`, `ended_unix_ms`); `endpoint_id`, `generation`, `operation_id`. `not_found` once the relay no longer knows it |
 | `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording`, `recording_id` (starting again while it records gives the same id) |
 | `recording.pause`, `recording.resume` | `endpoint_id` | `recording_id`, `state`, `changed`, `pauses` |
-| `recording.query` | `recording_id` | Its `state` (`active`, `paused`, `pausing`, `stopped`, `completed`, `failed`), `pauses`, `file`, `finalized`, `uploaded`, `upload` (`pending`, `none`, `uploaded`, `failed`), `detail`, start and end times |
+| `recording.query` | `recording_id` (the latest 4096 finished recordings are kept, and every one not finished) | Its `state` (`active`, `paused`, `pausing`, `stopped`, `completed`, `failed`), `pauses`, `file`, `finalized`, `uploaded`, `upload` (`pending`, `none`, `uploaded`, `failed`), `detail`, start and end times |
 
 - An announcement that plays to its end gives `playback.completed`, with
   the `operation_id` of its `playback.start`. One that is stopped, or
@@ -772,6 +772,11 @@ A request naming both is refused (`invalid`).
   track that cannot be written is given up (its file removed, logged),
   never left out of step with the mix. A file name already taken is
   never written into.
+- **A starved mixer.** A mixer thread that falls more than 100 ms behind
+  its schedule (a loaded machine) skips the periods it missed rather than
+  running them back to back, which would burst them at the participants.
+  Its recording keeps the wall-clock timeline: the skipped periods are
+  silence there, counted in `lost_ms`.
 - **Conversion failures.** A section or track that cannot be converted
   keeps its spool, and `recording.completed` (when the rest could be)
   says what in `detail`. With nothing converted, `recording.failed`.

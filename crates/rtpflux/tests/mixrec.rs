@@ -325,8 +325,13 @@ fn the_mix_a_listener_hears() {
         assert!(!has(first, rate, hz), "{hz} Hz is not heard by everyone");
     }
     // After b left, a quiet: silence (the timeline goes on).
-    let quiet = &x[ms(1750.0)..ms(2050.0)];
-    assert!(!has(quiet, rate, 440.0) && !has(quiet, rate, 1300.0));
+    // (Found where it should be, not at a fixed place: on a loaded
+    // machine the talkers' timing drifts by tens of ms.)
+    let quiet = (ms(1300.0)..ms(2600.0))
+        .step_by(ms(50.0))
+        .map(|at| &x[at..at + ms(300.0)])
+        .any(|w| !has(w, rate, 440.0) && !has(w, rate, 1300.0));
+    assert!(quiet, "300 ms of silence while a was quiet");
     // Then a again, alone.
     let last = &x[ms(2400.0)..ms(2900.0)];
     assert!(has(last, rate, 440.0) && !has(last, rate, 1300.0));
@@ -486,6 +491,9 @@ fn pauses_sensitivity_restart_and_keys() {
     // A restart: the mixer back, the recording goes on in a new section.
     drop(api);
     daemon.stop();
+    // The mixer records until the stop is done: on a loaded machine, a
+    // while after `wall_ms`.
+    let wall_stopped_ms = u64::try_from(began.elapsed().as_millis()).unwrap();
     let (daemon, sock) = relay(&dir, 63_200);
     let mut api = Client::connect(&sock).unwrap();
     let report = api.call("recovery.report", Value::Null).unwrap();
@@ -523,13 +531,17 @@ fn pauses_sensitivity_restart_and_keys() {
     assert!(has(&two, rate, 440.0) && has(&two, rate, 1300.0));
     #[allow(clippy::cast_precision_loss)]
     let first_ms = one.len() as f64 * 1000.0 / f64::from(rate);
-    // The wall time from start to restart, less the confirmed pauses
-    // (the stop and its last periods aside).
+    // The wall time from start to the restart, less the confirmed pauses:
+    // between the time before the stop and the time it was done.
     #[allow(clippy::cast_precision_loss)]
-    let expected = (wall_ms - paused_ms) as f64;
+    let (least, most) = (
+        (wall_ms - paused_ms) as f64 - 250.0,
+        (wall_stopped_ms - paused_ms) as f64 + 250.0,
+    );
     assert!(
-        (first_ms - expected).abs() < 250.0,
-        "{first_ms} ms recorded, {expected} expected ({wall_ms} less {paused_ms} paused)"
+        first_ms > least && first_ms < most,
+        "{first_ms} ms recorded, {least}..{most} expected ({wall_ms}..{wall_stopped_ms} less \
+         {paused_ms} paused)"
     );
     let total = done["data"]["duration_ms"].as_u64().unwrap();
     #[allow(

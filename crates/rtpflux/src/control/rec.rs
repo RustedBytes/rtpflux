@@ -10,7 +10,7 @@
 //! state file too, and the paused state survives a restart (the call's
 //! recording state is saved paused).
 
-use super::native::{Code, Endpoint, NativeError, Request};
+use super::native::{Code, Endpoint, NativeError, RecordingState, Request};
 use super::parties::side_of;
 use super::{CallId, Control};
 use crate::lifecycle::RecStep;
@@ -78,12 +78,12 @@ impl Control {
         {
             match (pause, confirmed) {
                 (true, true) => {
-                    r.state = "paused".into();
+                    r.state = RecordingState::Paused;
                     r.pauses.push((now, None));
                 }
-                (true, false) => r.state = "pausing".into(),
+                (true, false) => r.state = RecordingState::Pausing,
                 (false, _) => {
-                    r.state = "active".into();
+                    r.state = RecordingState::Active;
                     if let Some(last) = r.pauses.last_mut()
                         && last.1.is_none()
                     {
@@ -129,7 +129,7 @@ impl Control {
             self.native
                 .recordings
                 .get(r)
-                .is_some_and(|r| matches!(r.state.as_str(), "active" | "paused" | "pausing"))
+                .is_some_and(|r| r.state.going_on())
         }) else {
             return Err(NativeError::new(
                 Code::Conflict,
@@ -140,7 +140,7 @@ impl Control {
         let r = self.native.recordings.get(&rid);
         Ok(json!({
             "recording_id": rid,
-            "state": r.map(|r| r.state.clone()),
+            "state": r.map(|r| r.state),
             "changed": changed,
             "pauses": r.map(|r| r.pauses.clone()),
         }))
@@ -154,7 +154,7 @@ impl Control {
 pub(super) fn recording_json(r: &super::native::Recording) -> Json {
     let mut v = json!(r);
     if let Some(o) = v.as_object_mut() {
-        let ended = matches!(r.state.as_str(), "completed" | "failed");
+        let ended = r.state.ended();
         o.insert("finalized".to_owned(), json!(r.file.is_some()));
         o.insert(
             "upload".to_owned(),

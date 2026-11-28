@@ -17,7 +17,7 @@
 //!   operations whose outcome is unknown. Nothing is reported as restored
 //!   that was not.
 
-use super::native::{Code, NativeError, Recording};
+use super::native::{Code, NativeError, Recording, RecordingState};
 use super::{Control, native};
 use crate::relay::media_events::Subject;
 use serde_json::{Value as Json, json};
@@ -35,6 +35,10 @@ const KINDS: [&str; 6] = [
     "playbacks",
     "recordings",
 ];
+
+/// Finished recordings kept for `recording.query` and the inventory, at
+/// most (the latest to end).
+pub(super) const MAX_FINISHED_RECORDINGS: usize = 4096;
 
 impl native::Native {
     /// A native API state for a new run (its own boot id).
@@ -226,6 +230,29 @@ impl Control {
         })
     }
 
+    /// Keep at most [`MAX_FINISHED_RECORDINGS`] finished recordings (the
+    /// latest to end); one going on, or stopped and not converted yet, is
+    /// never dropped. Without it, every recording ever made would stay in
+    /// memory and be rewritten in every save of the state.
+    pub(super) fn recordings_prune(&mut self) {
+        let n = &mut self.native;
+        let finished = n.recordings.values().filter(|r| r.state.ended()).count();
+        if finished <= MAX_FINISHED_RECORDINGS {
+            return;
+        }
+        let mut ended: Vec<(u64, String)> = n
+            .recordings
+            .values()
+            .filter(|r| r.state.ended())
+            .map(|r| (r.ended_unix_ms.unwrap_or(0), r.id.clone()))
+            .collect();
+        ended.sort_unstable();
+        for (_, id) in ended.iter().take(finished - MAX_FINISHED_RECORDINGS) {
+            n.recordings.remove(id);
+        }
+        self.mark_dirty();
+    }
+
     /// `recording.query`: what became of recording `recording_id`.
     pub(super) fn native_recording(&self, req: &native::Request<'_>) -> Result<Json, NativeError> {
         let id = req.need("recording_id")?;
@@ -266,20 +293,17 @@ impl Control {
                 .native
                 .recordings
                 .values()
-                .filter(|r| {
-                    r.endpoint_id == tag && !matches!(r.state.as_str(), "completed" | "failed")
-                })
+                .filter(|r| r.endpoint_id == tag && !r.state.ended())
                 .max_by_key(|r| r.started_unix_ms)?
                 .id
                 .clone(),
         };
         let r = self.native.recordings.get_mut(&id)?;
         r.state = if file.is_some() {
-            "completed"
+            RecordingState::Completed
         } else {
-            "failed"
-        }
-        .into();
+            RecordingState::Failed
+        };
         r.file = file.cloned();
         r.uploaded = uploaded;
         r.detail = failure.cloned();
@@ -382,5 +406,67 @@ impl Control {
                     .get(&call)
                     .is_some_and(|x| x.playing.iter().any(Option::is_some))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::native::RecordingState;
+
+    fn record(id: &str, state: RecordingState, ended: Option<u64>) -> Recording {
+        Recording {
+            id: id.to_owned(),
+            tenant: "t".into(),
+            endpoint_id: "e".into(),
+            state,
+            file: None,
+            uploaded: None,
+            detail: None,
+            started_unix_ms: 0,
+            ended_unix_ms: ended,
+            pauses: Vec::new(),
+            mixer_id: None,
+            mix: None,
+        }
+    }
+
+    /// The finished recordings beyond the most kept go, the oldest first;
+    /// those going on or not converted yet stay, however old.
+    #[test]
+    fn finished_recordings_are_bounded() {
+        let config = crate::config::Config::from_toml(
+            "[[interface]]\nname = \"lo\"\naddress = \"127.0.0.1\"\n\
+             [ports]\nmin = 24700\nmax = 24715\n[sessions]\nmax = 4\n[runtime]\nworkers = 1\n",
+        )
+        .unwrap();
+        let relay = crate::relay::Relay::start(&config).unwrap();
+        let mut c = Control::new(relay, config.interfaces);
+        let extra = 10;
+        for i in 0..MAX_FINISHED_RECORDINGS + extra {
+            let r = record(
+                &format!("rec-{i}"),
+                RecordingState::Completed,
+                Some(1_000 + u64::try_from(i).unwrap()),
+            );
+            c.native.recordings.insert(r.id.clone(), r);
+        }
+        for (id, state) in [
+            ("going", RecordingState::Active),
+            ("converting", RecordingState::Stopped),
+        ] {
+            c.native
+                .recordings
+                .insert(id.to_owned(), record(id, state, Some(1)));
+        }
+        c.recordings_prune();
+        let n = &c.native.recordings;
+        assert_eq!(n.len(), MAX_FINISHED_RECORDINGS + 2);
+        assert!(n.contains_key("going") && n.contains_key("converting"));
+        assert!(
+            !n.contains_key("rec-0") && !n.contains_key("rec-9"),
+            "the oldest"
+        );
+        assert!(n.contains_key("rec-10"));
     }
 }

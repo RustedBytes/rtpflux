@@ -9,6 +9,7 @@
 //! is left in the relay's inventory, each endpoint's destruction reported
 //! as an event.
 
+#![forbid(unsafe_code)]
 #![allow(
     clippy::similar_names,
     clippy::many_single_char_names,

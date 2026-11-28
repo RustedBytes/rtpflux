@@ -433,6 +433,64 @@ pub fn start(id: u32, events: MediaEvents) -> std::io::Result<MixerHandle> {
     })
 }
 
+/// A mixer's period.
+const PERIOD: Duration = Duration::from_millis(20);
+/// How far behind its schedule a mixer may run before it skips ahead.
+const MAX_BEHIND: Duration = Duration::from_millis(100);
+
+/// When the period due at `next` is more than [`MAX_BEHIND`] late at
+/// `now`, move `next` to the period now due; the periods skipped.
+fn catch_up(next: &mut Instant, now: Instant) -> u64 {
+    let late = now.saturating_duration_since(*next);
+    if late <= MAX_BEHIND {
+        return 0;
+    }
+    let periods = late.as_nanos() / PERIOD.as_nanos();
+    let skipped = u32::try_from(periods).unwrap_or(u32::MAX);
+    *next += PERIOD.saturating_mul(skipped);
+    u64::from(skipped)
+}
+
+/// Far behind (the thread was starved): skip ahead rather than run the
+/// missed periods back to back, which would burst them at the
+/// participants. A recording keeps its timeline: the periods skipped are
+/// lost, silence at their place.
+fn skip_ahead(next: &mut Instant, rec: Option<&mut Recording>) {
+    let skipped = catch_up(next, Instant::now());
+    if skipped > 0
+        && let Some(r) = rec.filter(|r| !r.paused)
+    {
+        r.tick += skipped;
+        r.tap.lost.fetch_add(skipped, Ordering::Relaxed);
+    }
+}
+
+/// The active speaker: the loudest participant speaking, reported when it
+/// changes, held at least [`SPEAKER_HOLD_MS`].
+fn active_speaker(
+    id: u32,
+    parts: &[Participant],
+    (speaker, since): (&mut Option<String>, &mut u64),
+    elapsed: u64,
+    events: &MediaEvents,
+) {
+    let loudest = parts
+        .iter()
+        .filter(|p| p.speaking && !p.muted && p.role == Role::Participant)
+        .max_by_key(|p| p.energy);
+    if let Some(p) = loudest
+        && speaker.as_deref() != Some(p.key.as_str())
+        && elapsed.saturating_sub(*since) >= SPEAKER_HOLD_MS
+    {
+        *speaker = Some(p.key.clone());
+        *since = elapsed;
+        events.emit(
+            p.subject.clone(),
+            MediaEventKind::ActiveSpeaker { mixer: id },
+        );
+    }
+}
+
 /// The gain of `db` in Q8 (unity 256).
 fn q8(db: i32) -> u16 {
     u16::try_from((db_to_q16(db) + 128) >> 8).unwrap_or(u16::MAX)
@@ -517,8 +575,9 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
     let mut acc = [0i32; MIX_FRAME];
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
-        next += Duration::from_millis(20);
+        next += PERIOD;
         apply(asks, &mut parts, &mut rec);
+        skip_ahead(&mut next, rec.as_mut());
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(0);
         if mixer.begin(MIX_FRAME).is_err() {
             break;
@@ -593,22 +652,13 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
                 }
             }
         }
-        // The active speaker.
-        let loudest = parts
-            .iter()
-            .filter(|p| p.speaking && !p.muted && p.role == Role::Participant)
-            .max_by_key(|p| p.energy);
-        if let Some(p) = loudest
-            && speaker.as_deref() != Some(p.key.as_str())
-            && elapsed.saturating_sub(speaker_since) >= SPEAKER_HOLD_MS
-        {
-            speaker = Some(p.key.clone());
-            speaker_since = elapsed;
-            events.emit(
-                p.subject.clone(),
-                MediaEventKind::ActiveSpeaker { mixer: id },
-            );
-        }
+        active_speaker(
+            id,
+            &parts,
+            (&mut speaker, &mut speaker_since),
+            elapsed,
+            events,
+        );
         // Participants whose worker let go (their call ended).
         parts.retain(|p| !p.gone);
     }
@@ -716,6 +766,19 @@ mod tests {
         })));
         assert!(!m.mute("p", true));
         assert!(!m.pause_recording(true, Duration::from_millis(50)));
+    }
+
+    /// A mixer a little late keeps its pace; one far behind skips the
+    /// periods it missed instead of bursting them.
+    #[test]
+    fn far_behind_skips_ahead() {
+        let base = Instant::now();
+        let mut next = base;
+        assert_eq!(catch_up(&mut next, base + Duration::from_millis(90)), 0);
+        assert_eq!(next, base);
+        assert_eq!(catch_up(&mut next, base + Duration::from_millis(1_010)), 50);
+        assert_eq!(next, base + Duration::from_millis(1_000));
+        assert!(base + Duration::from_millis(1_010) - next < PERIOD);
     }
 
     #[test]

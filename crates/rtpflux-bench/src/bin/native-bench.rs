@@ -12,6 +12,7 @@
 //!   long that took (the recovery time after a restart).
 //! - `--pid`: the relay's RSS (resident memory) before and after.
 
+#![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, reason = "a command-line tool's report")]
 
 use clap::Parser;

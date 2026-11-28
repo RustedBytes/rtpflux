@@ -26,13 +26,14 @@
 //!   was; one whose mixer did not is finished with what it holds.
 
 use super::Control;
-use super::native::{Code, NativeError, Recording, Request};
+use super::native::{Code, NativeError, Recording, RecordingState, Request};
 use crate::recording::mixrec::{self, Finish, MixJob, Written};
 use crate::recording::{Channels, Conversion, Format, Job, Meta, Settings};
 use crate::relay::media_events::MediaEventKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -43,6 +44,11 @@ const CONFIRM: Duration = Duration::from_secs(1);
 const QUEUE: usize = 250;
 /// Milliseconds per period.
 const PERIOD_MS: u64 = 20;
+/// Participants a recording lists, at most (later ones are left out).
+const MAX_PARTICIPANTS: usize = 1024;
+/// A participant's intervals, at most: beyond, its last one is reopened
+/// (its comings and goings merge).
+const MAX_INTERVALS: usize = 256;
 /// The options a mixer recording takes.
 const OPTIONS: [&str; 7] = [
     "format",
@@ -78,12 +84,12 @@ pub struct MixRec {
     pub tracks: bool,
     /// The tracks' files, once converted: (endpoint id, file).
     #[serde(default)]
-    pub track_files: Vec<(String, String)>,
+    pub track_files: Vec<(String, PathBuf)>,
     /// The file-name template, and when it started (seconds).
     pub template: String,
     pub started_s: u64,
     /// Each section's spool, in order, and when each began (ms).
-    pub spools: Vec<String>,
+    pub spools: Vec<PathBuf>,
     #[serde(default)]
     pub section_starts: Vec<u64>,
     #[serde(default)]
@@ -98,7 +104,7 @@ pub struct MixRec {
     pub sensitive_hold: bool,
     /// Every section's audio file, once converted.
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Vec<PathBuf>,
 }
 
 /// A mixer recording going on: its writer's counters and hand-over.
@@ -120,15 +126,11 @@ impl Running {
 /// Whether a saved recording is a mixer's that was not finished (to go on
 /// after a restart, or be finished).
 pub(super) fn resumable(r: &Recording) -> bool {
-    r.mixer_id.is_some()
-        && matches!(
-            r.state.as_str(),
-            "active" | "paused" | "pausing" | "stopped"
-        )
+    r.mixer_id.is_some() && (r.state.going_on() || r.state == RecordingState::Stopped)
 }
 
 fn going_on(r: &Recording) -> bool {
-    matches!(r.state.as_str(), "active" | "paused" | "pausing")
+    r.state.going_on()
 }
 
 /// A recording's settings from its `options`: `[recording]`'s format
@@ -307,7 +309,7 @@ impl Control {
                 return Ok(json!({"recording": false, "mixer_id": mixer}));
             };
             self.stop_mixrec(&rid);
-            let state = self.native.recordings.get(&rid).map(|r| r.state.clone());
+            let state = self.native.recordings.get(&rid).map(|r| r.state);
             return Ok(
                 json!({"recording": false, "recording_id": rid, "mixer_id": mixer,
                 "state": state}),
@@ -387,7 +389,7 @@ impl Control {
                 id: rid.clone(),
                 tenant,
                 endpoint_id: String::new(),
-                state: "active".into(),
+                state: RecordingState::Active,
                 file: None,
                 uploaded: None,
                 detail: None,
@@ -492,7 +494,7 @@ impl Control {
             .get_mut(rid)
             .and_then(|r| r.mix.as_mut())
         {
-            mix.spools.push(spool.display().to_string());
+            mix.spools.push(spool);
             mix.section_starts
                 .push(crate::relay::media_events::unix_ms());
         }
@@ -517,7 +519,7 @@ impl Control {
                 .entry("participants".to_owned())
                 .or_insert_with(|| who.join(", "));
         }
-        let spools: Vec<std::path::PathBuf> = mix.spools.iter().map(Into::into).collect();
+        let spools = mix.spools.clone();
         // Every participant's track of every section that may have one.
         let tracks = if mix.tracks {
             spools
@@ -571,7 +573,7 @@ impl Control {
         let Some(r) = self.native.recordings.get_mut(rid) else {
             return;
         };
-        r.state = "stopped".into();
+        r.state = RecordingState::Stopped;
         r.ended_unix_ms.get_or_insert(now);
         if let Some(last) = r.pauses.last_mut()
             && last.1.is_none()
@@ -602,7 +604,7 @@ impl Control {
         if let Err(why) = sent {
             log::warn!("native: recording {rid}: not converted: {why}");
             if let Some(r) = self.native.recordings.get_mut(rid) {
-                r.state = "failed".into();
+                r.state = RecordingState::Failed;
                 r.detail = Some(why.into());
             }
         }
@@ -645,7 +647,7 @@ impl Control {
         Ok(json!({
             "recording_id": rid,
             "mixer_id": mixer,
-            "state": r.map(|r| r.state.clone()),
+            "state": r.map(|r| r.state),
             "changed": changed,
             "pauses": r.map(|r| r.pauses.clone()),
         }))
@@ -657,8 +659,8 @@ impl Control {
         let Some(r) = self.native.recordings.get(rid) else {
             return Ok(false);
         };
-        let paused = matches!(r.state.as_str(), "paused" | "pausing");
-        if paused == pause && r.state != "pausing" {
+        let paused = r.state.paused();
+        if paused == pause && r.state != RecordingState::Pausing {
             return Ok(false);
         }
         let Some((_, m)) = r.mixer_id.and_then(|m| self.native.mixers.get(&m)) else {
@@ -671,16 +673,18 @@ impl Control {
         };
         match (pause, confirmed) {
             (true, true) => {
-                if r.state != "pausing" || r.pauses.last().is_none_or(|p| p.1.is_some()) {
+                if r.state != RecordingState::Pausing
+                    || r.pauses.last().is_none_or(|p| p.1.is_some())
+                {
                     r.pauses.push((now, None));
                 }
-                r.state = "paused".into();
+                r.state = RecordingState::Paused;
             }
-            (true, false) => r.state = "pausing".into(),
+            (true, false) => r.state = RecordingState::Pausing,
             // Not confirmed, the resume may still be taken: capture may go
             // on, so it is never left reported paused.
             (false, _) => {
-                r.state = "active".into();
+                r.state = RecordingState::Active;
                 if let Some(last) = r.pauses.last_mut()
                     && last.1.is_none()
                 {
@@ -735,7 +739,7 @@ impl Control {
         let Some(r) = self.native.recordings.get_mut(&rid) else {
             return;
         };
-        let state = r.state.clone();
+        let state = r.state;
         let Some(mix) = r.mix.as_mut() else {
             return;
         };
@@ -747,11 +751,17 @@ impl Control {
                     last.1 = Some(now);
                 }
             } else if here && !open {
-                p.intervals.push((now, None));
+                let full = p.intervals.len() >= MAX_INTERVALS;
+                match p.intervals.last_mut() {
+                    Some(last) if full => last.1 = None,
+                    _ => p.intervals.push((now, None)),
+                }
             }
         }
         for (id, external_id) in externals {
-            if !mix.participants.iter().any(|p| p.endpoint_id == id) {
+            if mix.participants.len() < MAX_PARTICIPANTS
+                && !mix.participants.iter().any(|p| p.endpoint_id == id)
+            {
                 mix.participants.push(Participation {
                     endpoint_id: id,
                     external_id,
@@ -761,7 +771,7 @@ impl Control {
         }
         let hold = mix.sensitive_hold;
         self.mark_dirty();
-        if sensitive && state == "active" {
+        if sensitive && state == RecordingState::Active {
             match self.pause_mixrec(&rid, true) {
                 Ok(_) => {
                     if let Some(mix) = self
@@ -829,11 +839,10 @@ impl Control {
             _ => return,
         };
         r.state = if file.is_some() {
-            "completed"
+            RecordingState::Completed
         } else {
-            "failed"
-        }
-        .into();
+            RecordingState::Failed
+        };
         r.file.clone_from(&file);
         r.uploaded = uploaded;
         r.detail.clone_from(&failure);
@@ -855,15 +864,13 @@ impl Control {
         mix.files = mix
             .spools
             .iter()
-            .map(|s| {
-                std::path::Path::new(s)
-                    .with_extension(mix.settings.format.extension())
-                    .display()
-                    .to_string()
-            })
-            .filter(|f| std::path::Path::new(f).exists() || uploaded == Some(true))
+            .map(|s| s.with_extension(mix.settings.format.extension()))
+            .filter(|f| f.exists() || uploaded == Some(true))
             .collect();
-        mix.track_files = tracks;
+        mix.track_files = tracks
+            .into_iter()
+            .map(|(e, f)| (e, PathBuf::from(f)))
+            .collect();
         let track_list: Vec<Json> = mix
             .track_files
             .iter()
@@ -905,7 +912,7 @@ impl Control {
                 continue;
             };
             let mixer = r.mixer_id;
-            let (tenant, state) = (r.tenant.clone(), r.state.clone());
+            let (tenant, state) = (r.tenant.clone(), r.state);
             // What the sections before hold.
             if let Some(mix) = r.mix.as_mut() {
                 mix.periods = mix
@@ -916,8 +923,8 @@ impl Control {
                     .sum();
             }
             let back = mixer.is_some_and(|m| self.native.mixers.contains_key(&m));
-            if state == "stopped" || !back {
-                if state != "stopped" {
+            if state == RecordingState::Stopped || !back {
+                if state != RecordingState::Stopped {
                     self.native.lost.push(json!({"kind": "mixer_recording",
                         "recording_id": rid, "mixer_id": mixer, "tenant": tenant,
                         "reason": "its mixer was not restored: finished with what it holds"}));
@@ -925,12 +932,12 @@ impl Control {
                 self.stop_mixrec(&rid);
                 continue;
             }
-            let paused = matches!(state.as_str(), "paused" | "pausing");
+            let paused = state.paused();
             if let Some(r) = self.native.recordings.get_mut(&rid)
                 && paused
             {
                 // Its new section starts paused: the pause holds.
-                r.state = "paused".into();
+                r.state = RecordingState::Paused;
             }
             let Some(dir) = self.recording_dir.clone() else {
                 self.stop_mixrec(&rid);

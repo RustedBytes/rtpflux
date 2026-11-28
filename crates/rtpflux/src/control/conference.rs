@@ -23,12 +23,37 @@ use super::native::{Code, NativeError, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
+/// What a seat's participant is in the conference (in the state file as
+/// these lowercase words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatRole {
+    /// Hears everyone, heard by everyone.
+    Participant,
+    /// Hears everyone, heard by no one.
+    Listen,
+    /// Hears everyone, heard by `whisper_to` only.
+    Whisper,
+}
+
+impl SeatRole {
+    /// The role a request names (`participant`, `listen`, `whisper`).
+    #[must_use]
+    pub fn of_name(name: &str) -> Option<Self> {
+        match name {
+            "participant" => Some(Self::Participant),
+            "listen" => Some(Self::Listen),
+            "whisper" => Some(Self::Whisper),
+            _ => None,
+        }
+    }
+}
+
 /// A participant's place in a mixer's plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seat {
     pub endpoint_id: String,
-    /// `participant`, `listen` or `whisper`.
-    pub role: String,
+    pub role: SeatRole,
     /// The participant a whisperer is heard by.
     #[serde(default)]
     pub whisper_to: Option<String>,
@@ -91,7 +116,7 @@ impl Control {
                     p.seats.retain(|s| s.endpoint_id != ep);
                     let mut seat = Seat {
                         endpoint_id: ep,
-                        role: "participant".into(),
+                        role: SeatRole::Participant,
                         whisper_to: None,
                         muted: false,
                         deafened: false,
@@ -162,7 +187,7 @@ impl Control {
             let mut seated = Vec::new();
             // Participants first, so a whisperer's listener is there.
             let mut seats = plan.seats.clone();
-            seats.sort_by_key(|s| s.role == "whisper");
+            seats.sort_by_key(|s| s.role == SeatRole::Whisper);
             for seat in &seats {
                 match self.reseat(plan.id, &plan.tenant, seat) {
                     Ok(()) => seated.push(seat.clone()),
@@ -209,10 +234,12 @@ impl Control {
         let Some((_, m)) = self.native.mixers.get(&id) else {
             return Err(NativeError::new(Code::NotFound, "the mixer is gone"));
         };
-        let role = match (seat.role.as_str(), &seat.whisper_to) {
-            ("listen", _) => Role::Listen,
-            ("whisper", Some(to)) => Role::Whisper(to.clone()),
-            _ => Role::Participant,
+        let role = match (seat.role, &seat.whisper_to) {
+            (SeatRole::Listen, _) => Role::Listen,
+            (SeatRole::Whisper, Some(to)) => Role::Whisper(to.clone()),
+            // A whisperer with no one to whisper to (a plan saved so by
+            // hand) is heard by everyone rather than by no one.
+            (SeatRole::Whisper, None) | (SeatRole::Participant, _) => Role::Participant,
         };
         let taken = m.role(&ep.id, role)
             & m.mute(&ep.id, seat.muted)
@@ -229,9 +256,12 @@ impl Control {
 
 /// A seat as `mixer.add` or `mixer.set` asks.
 fn set_seat(seat: &mut Seat, req: &Request<'_>) {
-    if let Some(role) = req.str("role") {
-        role.clone_into(&mut seat.role);
-        seat.whisper_to = req.str("whisper_to").map(str::to_owned);
+    // The request was checked before it ran (`mixer_role`).
+    if let Some(role) = req.str("role").and_then(SeatRole::of_name) {
+        seat.role = role;
+        seat.whisper_to = (role == SeatRole::Whisper)
+            .then(|| req.str("whisper_to").map(str::to_owned))
+            .flatten();
     }
     if let Some(m) = req.body.get("muted").and_then(Json::as_bool) {
         seat.muted = m;

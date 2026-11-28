@@ -9,6 +9,8 @@
 //!
 //! `OBJECT` defaults to the release build of `rtpflux-xdp-ebpf`.
 
+#![forbid(unsafe_code)]
+
 use rtpflux_xdp::loader::{FastPath, XDP_DROP, XDP_PASS, XDP_REDIRECT, XDP_TX};
 use rtpflux_xdp::testframe::{Spec, build, ip_checksum_ok, udp_checksum_ok};
 use rtpflux_xdp_common::{

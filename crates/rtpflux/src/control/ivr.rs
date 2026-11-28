@@ -29,14 +29,23 @@ pub(super) const QUEUE_MAX: usize = 16;
 /// Finished playbacks whose end is kept (the latest), at most.
 pub(super) const ENDED_MAX: usize = 8192;
 
+/// How a playback ended (`completed` or `stopped` on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PlaybackOutcome {
+    /// It played to its end.
+    Completed,
+    /// It was stopped, replaced, interrupted, or its endpoint destroyed.
+    Stopped,
+}
+
 /// How a finished playback ended.
 #[derive(Debug, Clone)]
 pub(super) struct PlaybackEnd {
     tenant: String,
     endpoint_id: String,
     generation: u64,
-    /// `completed` or `stopped`.
-    state: &'static str,
+    state: PlaybackOutcome,
     reason: Option<String>,
     operation_id: Option<String>,
     queued: bool,
@@ -71,9 +80,9 @@ impl Ended {
             endpoint_id: ep.id.clone(),
             generation: ep.generation,
             state: if ty == "playback.completed" {
-                "completed"
+                PlaybackOutcome::Completed
             } else {
-                "stopped"
+                PlaybackOutcome::Stopped
             },
             reason: data.get("reason").and_then(Json::as_str).map(str::to_owned),
             operation_id: operation_id.map(str::to_owned),

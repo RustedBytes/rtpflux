@@ -704,6 +704,7 @@ impl Control {
         self.native_flush_gaps();
         self.ownership_prune();
         self.ivr_prune();
+        self.recordings_prune();
         if !self.native.pending_mixers.is_empty() || self.native.mixrec_pending {
             self.rebuild_mixers();
         }

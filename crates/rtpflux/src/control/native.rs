@@ -291,17 +291,49 @@ pub(super) struct Endpoint {
     pub(super) topology_state: Option<&'static str>,
 }
 
+/// Where a recording is in its life (in the state file and on the wire
+/// as these lowercase words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingState {
+    Active,
+    /// The media workers (or the mixer) confirmed they stopped writing.
+    Paused,
+    /// Asked to pause, not confirmed: capture may go on.
+    Pausing,
+    /// Asked to stop, its files not made yet.
+    Stopped,
+    Completed,
+    Failed,
+}
+
+impl RecordingState {
+    /// Recording, or paused: not stopped yet.
+    #[must_use]
+    pub fn going_on(self) -> bool {
+        matches!(self, Self::Active | Self::Paused | Self::Pausing)
+    }
+
+    /// Paused, or asked to pause (capture may go on).
+    #[must_use]
+    pub fn paused(self) -> bool {
+        matches!(self, Self::Paused | Self::Pausing)
+    }
+
+    /// Its outcome is known.
+    #[must_use]
+    pub fn ended(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
 /// A recording of an endpoint: what became of it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Recording {
     pub id: String,
     pub tenant: String,
     pub endpoint_id: String,
-    /// `active`, `paused` (the media workers confirmed they stopped
-    /// writing), `pausing` (asked to pause, not confirmed: capture may
-    /// go on), `stopped` (asked to stop, not finished yet), `completed`
-    /// or `failed`.
-    pub state: String,
+    pub state: RecordingState,
     pub file: Option<String>,
     pub uploaded: Option<bool>,
     pub detail: Option<String>,
@@ -520,7 +552,8 @@ pub struct Native {
     /// The highest `global_seq` evicted from the journal (a cursor at or
     /// before it cannot be resumed).
     pub(super) journal_evicted: u64,
-    /// Recordings: id → what became of it.
+    /// Recordings: id → what became of it. Those finished are kept up to
+    /// [`super::inventory::MAX_FINISHED_RECORDINGS`], the oldest dropped.
     pub(super) recordings: HashMap<String, Recording>,
     /// What the last restart could not bring back.
     pub(super) lost: Vec<Json>,
@@ -1794,7 +1827,7 @@ impl Control {
             .recording
             .as_ref()
             .and_then(|id| self.native.recordings.get(id))
-            .filter(|r| matches!(r.state.as_str(), "active" | "paused" | "pausing"))
+            .filter(|r| r.state.going_on())
         else {
             return;
         };
@@ -1812,7 +1845,7 @@ impl Control {
             return;
         }
         if let Some(r) = self.native.recordings.get_mut(&id) {
-            r.state = "stopped".into();
+            r.state = RecordingState::Stopped;
             r.ended_unix_ms = Some(crate::relay::media_events::unix_ms());
         }
     }
@@ -2209,7 +2242,7 @@ impl Control {
             self.native
                 .recordings
                 .get(id)
-                .is_some_and(|r| matches!(r.state.as_str(), "active" | "paused" | "pausing"))
+                .is_some_and(|r| r.state.going_on())
         });
         let id = if start {
             // Started again while it records: the same recording.
@@ -2221,7 +2254,7 @@ impl Control {
                         id: id.clone(),
                         tenant: ep.tenant.clone(),
                         endpoint_id: ep.id.clone(),
-                        state: "active".into(),
+                        state: RecordingState::Active,
                         file: None,
                         uploaded: None,
                         detail: None,
@@ -2241,7 +2274,7 @@ impl Control {
                 );
             };
             if let Some(r) = self.native.recordings.get_mut(&id) {
-                r.state = "stopped".into();
+                r.state = RecordingState::Stopped;
                 r.ended_unix_ms = Some(now);
             }
             id
@@ -3414,10 +3447,10 @@ impl Control {
         let Some(role) = req.str("role") else {
             return Ok(None);
         };
-        Ok(Some(match role {
-            "participant" => Role::Participant,
-            "listen" => Role::Listen,
-            "whisper" => {
+        Ok(Some(match super::conference::SeatRole::of_name(role) {
+            Some(super::conference::SeatRole::Participant) => Role::Participant,
+            Some(super::conference::SeatRole::Listen) => Role::Listen,
+            Some(super::conference::SeatRole::Whisper) => {
                 let to = req.need("whisper_to")?;
                 let known = self
                     .native
@@ -3432,9 +3465,9 @@ impl Control {
                 }
                 Role::Whisper(to.to_owned())
             }
-            other => {
+            None => {
                 return Err(NativeError::invalid(format!(
-                    "role: {other} (participant, listen or whisper)"
+                    "role: {role} (participant, listen or whisper)"
                 )));
             }
         }))
