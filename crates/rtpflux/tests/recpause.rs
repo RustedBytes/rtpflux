@@ -26,7 +26,7 @@ fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
-fn relay(dir: &Path) -> (Daemon, PathBuf) {
+fn relay(dir: &Path, min: u16) -> (Daemon, PathBuf) {
     let sock = dir.join("api.sock");
     let rec = dir.join("rec");
     std::fs::create_dir_all(&rec).unwrap();
@@ -39,8 +39,8 @@ fn relay(dir: &Path) -> (Daemon, PathBuf) {
         name = "lo"
         address = "127.0.0.1"
         [ports]
-        min = 62700
-        max = 62763
+        min = {min}
+        max = {}
         [sessions]
         max = 12
         state_file = "{}"
@@ -51,6 +51,7 @@ fn relay(dir: &Path) -> (Daemon, PathBuf) {
         format = "pcap"
         "#,
         sock.display(),
+        min + 63,
         dir.join("state.json").display(),
         rec.display(),
     ))
@@ -116,7 +117,7 @@ fn talker(
 #[allow(clippy::too_many_lines)] // One recording's life, through a restart.
 fn pauses_are_confirmed_and_hold_nothing() {
     let dir = temp_dir("pause");
-    let (daemon, sock) = relay(&dir);
+    let (daemon, sock) = relay(&dir, 62_700);
     let mut api = Client::connect(&sock).unwrap();
     let caller = UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = caller.local_addr().unwrap().port();
@@ -210,7 +211,7 @@ fn pauses_are_confirmed_and_hold_nothing() {
     let paused2 = p["pauses"][1][0].as_u64().unwrap();
     drop(api);
     daemon.stop();
-    let (daemon, sock) = relay(&dir);
+    let (daemon, sock) = relay(&dir, 62_700);
     let mut api = Client::connect(&sock).unwrap();
     let q = api
         .call("recording.query", json!({"recording_id": rid}))
@@ -270,6 +271,90 @@ fn pauses_are_confirmed_and_hold_nothing() {
         before >= 10 && between >= 10 && after >= 10,
         "{before} {between} {after}"
     );
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An endpoint destroyed while it records: the recording ends with it,
+/// its file finished and reported, and `recording.query` still answers.
+#[test]
+fn destroying_the_endpoint_finishes_its_recording() {
+    let dir = temp_dir("destroy");
+    let (daemon, sock) = relay(&dir, 62_800);
+    let mut api = Client::connect(&sock).unwrap();
+    let caller = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = caller.local_addr().unwrap().port();
+    let sdp = format!(
+        "v=0\r\no=- 7 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+    );
+    let opts = json!({"flags": ["trust-address"], "endpoint-learning": "off"});
+    let ep = api
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": sdp, "options": opts}),
+        )
+        .unwrap();
+    let id = ep["endpoint_id"].as_str().unwrap().to_owned();
+    let relay_port: u16 = ep["sdp"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("m=audio "))
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let callee = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let cport = callee.local_addr().unwrap().port();
+    let csdp = sdp.replace(&format!("m=audio {port} "), &format!("m=audio {cport} "));
+    let peer = api
+        .call(
+            "endpoint.create",
+            json!({"remote_sdp": csdp, "options": opts}),
+        )
+        .unwrap();
+    api.call(
+        "bridge.attach",
+        json!({"endpoint_id": id, "peer_endpoint_id": peer["endpoint_id"]}),
+    )
+    .unwrap();
+    let (to, stop) = (
+        Arc::new(AtomicU16::new(relay_port)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let talking = talker(caller, to, Arc::clone(&stop));
+    api.call(
+        "events.subscribe",
+        json!({"types": ["recording.completed", "recording.failed"]}),
+    )
+    .unwrap();
+    let rid = api
+        .call("recording.start", json!({"endpoint_id": id}))
+        .unwrap()["recording_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Destroyed, never stopped.
+    api.call("endpoint.destroy", json!({"endpoint_id": id}))
+        .unwrap();
+    let done = api
+        .wait_event("recording.completed", WAIT)
+        .unwrap()
+        .expect("completed after the destroy");
+    assert_eq!(done["data"]["recording_id"], rid.as_str());
+    assert_eq!(done["endpoint_id"], id.as_str());
+    stop.store(true, Ordering::Relaxed);
+    talking.join().unwrap();
+    let q = api
+        .call("recording.query", json!({"recording_id": rid}))
+        .unwrap();
+    assert_eq!(q["state"], "completed", "{q}");
+    assert!(pcap_times(Path::new(q["file"].as_str().unwrap())).len() >= 10);
+
     drop(api);
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();

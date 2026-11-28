@@ -5,7 +5,8 @@
 //! - `tone.start` and `tone.stop`: a tone with a cadence (ringback, a
 //!   beep);
 //! - playback queues and interruption (`playback.start` with `queue` and
-//!   `stop_on`);
+//!   `stop_on`), and `playback.query`: how a playback ended, for a
+//!   controller that missed its event (reconnecting);
 //! - `dtmf.policy`: which DTMF sources reach the events, and how
 //!   duplicates are dropped;
 //! - `endpoint.sensitive`: sensitive digits (a PIN, a card number) kept
@@ -21,10 +22,69 @@ use crate::relay::{SILENCE, SINE, ToneMode, Tones};
 use rtpflux_core::g711::PT_PCMA;
 use rtpflux_core::rtp::Pt;
 use serde_json::{Map, Value as Json, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Playbacks waiting behind the current one, at most.
 pub(super) const QUEUE_MAX: usize = 16;
+/// Finished playbacks whose end is kept (the latest), at most.
+pub(super) const ENDED_MAX: usize = 8192;
+
+/// How a finished playback ended.
+#[derive(Debug, Clone)]
+pub(super) struct PlaybackEnd {
+    tenant: String,
+    endpoint_id: String,
+    generation: u64,
+    /// `completed` or `stopped`.
+    state: &'static str,
+    reason: Option<String>,
+    operation_id: Option<String>,
+    queued: bool,
+    ended_unix_ms: u64,
+}
+
+/// Finished playbacks, the latest [`ENDED_MAX`] (in memory: a restart
+/// loses them, and says so with `endpoint.events_lost`).
+#[derive(Debug, Default)]
+pub(super) struct Ended {
+    by_id: HashMap<String, PlaybackEnd>,
+    order: VecDeque<String>,
+}
+
+impl Ended {
+    /// Playback `id` of `ep` ended: event `ty` with `data`.
+    pub(super) fn note(
+        &mut self,
+        id: &str,
+        ep: &Endpoint,
+        ty: &str,
+        operation_id: Option<&str>,
+        data: &Json,
+    ) {
+        while self.order.len() >= ENDED_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+        let end = PlaybackEnd {
+            tenant: ep.tenant.clone(),
+            endpoint_id: ep.id.clone(),
+            generation: ep.generation,
+            state: if ty == "playback.completed" {
+                "completed"
+            } else {
+                "stopped"
+            },
+            reason: data.get("reason").and_then(Json::as_str).map(str::to_owned),
+            operation_id: operation_id.map(str::to_owned),
+            queued: data.get("queued").and_then(Json::as_bool) == Some(true),
+            ended_unix_ms: crate::relay::media_events::unix_ms(),
+        };
+        if self.by_id.insert(id.to_owned(), end).is_none() {
+            self.order.push_back(id.to_owned());
+        }
+    }
+}
 /// A key reported by two sources within this is one press (ms).
 const DEDUP_MS: u64 = 1000;
 /// The most keys one `dtmf.send` plays.
@@ -135,6 +195,59 @@ fn narrow<T: TryFrom<u64>>(v: u64) -> Result<T, NativeError> {
 }
 
 impl Control {
+    /// `playback.query`: where playback `playback_id` is (`playing`,
+    /// `queued`), or how it ended (`completed`, `stopped` with its
+    /// `reason`).
+    pub(super) fn native_playback_query(&self, req: &Request<'_>) -> Result<Json, NativeError> {
+        let id = req.need("playback_id")?;
+        let n = &self.native;
+        let mine = |tenant: &str| {
+            if tenant == req.tenant {
+                Ok(())
+            } else {
+                Err(NativeError::new(
+                    Code::Unauthorized,
+                    format!("playback {id}: another tenant's"),
+                ))
+            }
+        };
+        if let Some(ep) = n
+            .endpoints
+            .values()
+            .find(|e| e.playback.as_ref().is_some_and(|p| p.0 == id))
+        {
+            mine(&ep.tenant)?;
+            return Ok(json!({"playback_id": id, "state": "playing",
+                "endpoint_id": ep.id, "generation": ep.generation,
+                "operation_id": ep.playback.as_ref().and_then(|p| p.1.as_ref())}));
+        }
+        for (ep_id, ivr) in &n.ivr {
+            let Some(at) = ivr.queue.iter().position(|q| q.id == id) else {
+                continue;
+            };
+            let Some(ep) = n.endpoints.get(ep_id) else {
+                continue;
+            };
+            mine(&ep.tenant)?;
+            return Ok(json!({"playback_id": id, "state": "queued",
+                "endpoint_id": ep.id, "generation": ep.generation, "position": at + 1,
+                "operation_id": ivr.queue.get(at).and_then(|q| q.operation_id.as_ref())}));
+        }
+        match n.playbacks_ended.by_id.get(id) {
+            Some(e) => {
+                mine(&e.tenant)?;
+                Ok(json!({"playback_id": id, "state": e.state,
+                    "endpoint_id": e.endpoint_id, "generation": e.generation,
+                    "reason": e.reason, "queued": e.queued,
+                    "operation_id": e.operation_id, "ended_unix_ms": e.ended_unix_ms}))
+            }
+            None => Err(NativeError::new(
+                Code::NotFound,
+                format!("playback {id} (or its end is no longer kept)"),
+            )),
+        }
+    }
+
     fn ivr_endpoint(&self, req: &Request<'_>) -> Result<Endpoint, NativeError> {
         let id = req.need("endpoint_id")?;
         match self.native.endpoints.get(id) {

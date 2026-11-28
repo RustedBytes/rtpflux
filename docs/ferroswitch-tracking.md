@@ -659,3 +659,31 @@ Evidence:
   100).
 - Memory note: the ledger keeps about 4.6 KB per keyed operation for its
   retention, bounded by `ledger_quota`.
+
+## Follow-up: gaps Ferroswitch found while integrating
+
+Ferroswitch reported three gaps and worked around each on its side. Each
+is now fixed in the relay:
+
+- **A recording never finished when its endpoint was destroyed.** The
+  call ended, but the outcome looked its endpoint up and found nothing,
+  so `recording.completed` never came and the record stayed `active`.
+  `endpoint.destroy` now stops the recording first (`stop recording`),
+  and an outcome that arrives after the endpoint is gone goes to its
+  tenant as the destroyed endpoint's event (found by its tombstone,
+  without `seq`). `recording.query` finds the record by the endpoint it
+  was of. Test: `recpause::destroying_the_endpoint_finishes_its_recording`.
+  Ferroswitch's own stop before teardown is no longer needed, but does
+  no harm.
+- **Finished playbacks were not kept**, so a controller that missed
+  `playback.completed` while reconnecting could not tell completed from
+  stopped. The relay now keeps how the latest 8192 playbacks ended (in
+  memory) and answers `playback.query` (`playing`, `queued`,
+  `completed`, `stopped` with its `reason`). A destroyed endpoint's
+  playback and queue now end with `playback.stopped`
+  (`reason: "endpoint_destroyed"`) before `endpoint.destroyed`. The
+  async SDK has `MediaClient::playback`. Test:
+  `ivr::playback_ends_are_kept`.
+- **The SDK's event filter could not ask for unredacted digits.** The
+  relay already honoured `events.subscribe` with `sensitive: true`, but
+  `EventFilter` had no field for it. It now has `sensitive`.

@@ -86,8 +86,8 @@ pub use events::MediaEventStream;
 pub use types::{
     ApplyAnswerRequest, AttachBridgeRequest, BridgeResult, Capabilities, CreateEndpointRequest,
     DestroyEndpointRequest, Endpoint, EventFilter, EventKind, Guarantees, InventoryPage,
-    MediaEvent, Negotiation, OperationState, OperationStatus, PrepareRequest, Prepared,
-    RecoveryReport, Watermark,
+    MediaEvent, Negotiation, OperationState, OperationStatus, PlaybackState, PlaybackStatus,
+    PrepareRequest, Prepared, RecoveryReport, Watermark,
 };
 
 use conn::Job;
@@ -533,6 +533,18 @@ impl MediaClient {
             );
         }
         self.call("endpoint.renew", f, None).await.map(drop)
+    }
+
+    /// `playback.query`: where playback `playback_id` is, or how it
+    /// ended (the relay keeps the latest 8192 ends, until it restarts).
+    ///
+    /// # Errors
+    ///
+    /// See [`MediaError`]; `not_found` when the relay no longer knows it.
+    pub async fn playback(&self, playback_id: &str) -> Result<PlaybackStatus, MediaError> {
+        let mut f = Map::new();
+        f.insert("playback_id".into(), json!(playback_id));
+        typed(self.call("playback.query", f, None).await?)
     }
 
     /// `recovery.report`: what the relay's last restart brought back and

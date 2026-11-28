@@ -535,3 +535,97 @@ fn playback_queues_and_barge_in() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// How each playback ended stays queryable (`playback.query`), for a
+/// controller that missed the event; an endpoint destroyed mid-playback
+/// stops it, and what was queued, before `endpoint.destroyed`.
+#[test]
+fn playback_ends_are_kept() {
+    let dir = temp_dir("ends");
+    let (daemon, sock) = relay(&dir, 62_600, "");
+    let mut api = Client::connect(&sock).unwrap();
+    let mut ev = Events::new(
+        &sock,
+        &json!({"types": ["playback.completed", "playback.stopped", "endpoint.destroyed"]}),
+    );
+    let caller = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (id, _) = endpoint(&mut api, &caller);
+    let (short, long) = (dir.join("short.wav"), dir.join("long.wav"));
+    wav(&short, 300);
+    wav(&long, 5000);
+    let file = |p: &Path| p.display().to_string();
+    let query = |api: &mut Client, pb: &Value| {
+        api.call("playback.query", json!({"playback_id": pb["playback_id"]}))
+            .unwrap()
+    };
+
+    let p1 = api
+        .call(
+            "playback.start",
+            json!({"endpoint_id": id, "file": file(&short)}),
+        )
+        .unwrap();
+    ev.take("playback.completed", |d| {
+        d["playback_id"] == p1["playback_id"]
+    });
+    let q = query(&mut api, &p1);
+    assert_eq!(
+        (q["state"].as_str(), q["endpoint_id"].as_str()),
+        (Some("completed"), Some(id.as_str())),
+        "{q}"
+    );
+    assert!(q["ended_unix_ms"].as_u64().is_some());
+
+    let p2 = api
+        .call(
+            "playback.start",
+            json!({"endpoint_id": id, "file": file(&long)}),
+        )
+        .unwrap();
+    let p3 = api
+        .call(
+            "playback.start",
+            json!({"endpoint_id": id, "file": file(&short), "queue": true}),
+        )
+        .unwrap();
+    assert_eq!(query(&mut api, &p2)["state"], "playing");
+    let q = query(&mut api, &p3);
+    assert_eq!(
+        (q["state"].as_str(), q["position"].as_u64()),
+        (Some("queued"), Some(1))
+    );
+
+    // Destroyed while it plays: both stop first.
+    api.call("endpoint.destroy", json!({"endpoint_id": id}))
+        .unwrap();
+    let stopped = ev.take("playback.stopped", |d| {
+        d["playback_id"] == p2["playback_id"]
+    });
+    assert_eq!(stopped["data"]["reason"], "endpoint_destroyed");
+    let dropped = ev.take("playback.stopped", |d| {
+        d["playback_id"] == p3["playback_id"]
+    });
+    assert_eq!(dropped["data"]["reason"], "endpoint_destroyed");
+    let destroyed = ev.take("endpoint.destroyed", |_| true);
+    assert!(
+        destroyed["seq"].as_u64() > dropped["seq"].as_u64(),
+        "after them"
+    );
+    let q = query(&mut api, &p2);
+    assert_eq!(
+        (q["state"].as_str(), q["reason"].as_str()),
+        (Some("stopped"), Some("endpoint_destroyed"))
+    );
+    let q = query(&mut api, &p3);
+    assert_eq!(
+        (q["state"].as_str(), q["queued"].as_bool()),
+        (Some("stopped"), Some(true))
+    );
+    assert_eq!(
+        code(api.call("playback.query", json!({"playback_id": "pb-none"}))),
+        "not_found"
+    );
+    drop((api, ev));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -257,7 +257,20 @@ impl Control {
             }
             Subject::Leg(..) => return None,
         };
-        let id = self.native.endpoints.get(&tag)?.recording.clone()?;
+        // Its endpoint's, or (destroyed) its last one not finished.
+        let id = match self.native.endpoints.get(&tag) {
+            Some(ep) => ep.recording.clone()?,
+            None => self
+                .native
+                .recordings
+                .values()
+                .filter(|r| {
+                    r.endpoint_id == tag && !matches!(r.state.as_str(), "completed" | "failed")
+                })
+                .max_by_key(|r| r.started_unix_ms)?
+                .id
+                .clone(),
+        };
         let r = self.native.recordings.get_mut(&id)?;
         r.state = if file.is_some() {
             "completed"

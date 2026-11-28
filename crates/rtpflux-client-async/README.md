@@ -72,7 +72,11 @@ Over TCP: `Config::tcp("10.0.0.5:2224", token)`.
 - **Reconciliation.** `hello` (typed capabilities and guarantees),
   `inventory` / `inventory_all` (a consistent snapshot and a watermark to
   subscribe from), `operation` (an operation key's state), `lookup` (by
-  external id), `renew`, `recovery_report`.
+  external id), `renew`, `recovery_report`, `playback` (where a
+  playback is, or how it ended: for an end missed while reconnecting).
+- **Sensitive digits.** `EventFilter { sensitive: true, .. }` asks for
+  the digits of endpoints marked sensitive as they are, for the
+  controller collecting them; other subscriptions get them redacted.
 - **Ordering.** Requests on different pooled connections may run in any
   order; wait for a reply before sending a request that depends on it.
   Operation ids stay unique across reconnects, and the client never

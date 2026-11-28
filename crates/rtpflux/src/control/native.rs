@@ -55,7 +55,7 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 const MIN_LEASE_MS: u64 = 1000;
 
 /// The operations of version 1.
-pub const OPERATIONS: [&str; 40] = [
+pub const OPERATIONS: [&str; 41] = [
     "hello",
     "ownership.claim",
     "endpoint.create",
@@ -76,6 +76,7 @@ pub const OPERATIONS: [&str; 40] = [
     "bridge.detach",
     "playback.start",
     "playback.stop",
+    "playback.query",
     "dtmf.send",
     "dtmf.policy",
     "tone.start",
@@ -455,6 +456,8 @@ pub struct Native {
     /// Endpoints' IVR state: DTMF policy, sensitive digits, playback
     /// queues.
     pub(super) ivr: HashMap<String, super::ivr::Ivr>,
+    /// How finished playbacks ended, the latest [`super::ivr::ENDED_MAX`].
+    pub(super) playbacks_ended: super::ivr::Ended,
     /// Requests per second per tenant.
     pub(super) limiter: super::audit::Limiter,
     /// Each mixer's desired topology (saved; rebuilt after a restart).
@@ -1214,6 +1217,7 @@ impl Control {
             "bridge.detach" => self.native_detach(req),
             "playback.start" => self.native_play(req, true),
             "playback.stop" => self.native_play(req, false),
+            "playback.query" => self.native_playback_query(req),
             "recording.start" => self.native_record(req, true),
             "recording.stop" => self.native_record(req, false),
             "stream.start" => self.native_stream_start(req),
@@ -1372,6 +1376,13 @@ impl Control {
         let Some(ep) = self.native.endpoints.get_mut(id) else {
             return;
         };
+        if matches!(ty, "playback.completed" | "playback.stopped")
+            && let Some(pb) = data.get("playback_id").and_then(Json::as_str)
+        {
+            self.native
+                .playbacks_ended
+                .note(pb, &*ep, ty, operation_id, &data);
+        }
         ep.seq += 1;
         let mut ev = json!({
             "event": ty,
@@ -1690,6 +1701,9 @@ impl Control {
             return;
         };
         if reason != "ended" {
+            // A recording ends with it, finished and reported (its outcome
+            // arrives after `endpoint.destroyed`), not dropped unwritten.
+            self.stop_recording_of(&ep);
             // Its dialog with the hidden side, by the key it is under (an
             // unanswered offer of the relay's has no to-tag yet: its own
             // tag would not find it).
@@ -1707,6 +1721,16 @@ impl Control {
         if let Some(peer) = ep.bridged_to.clone() {
             self.set_bridge(&peer, None, "peer_destroyed", None);
         }
+        // Its playback, and those queued, end before it does.
+        if let Some((pb, op)) = ep.playback.clone() {
+            self.endpoint_event(
+                id,
+                "playback.stopped",
+                op.as_deref(),
+                json!({"playback_id": pb, "reason": "endpoint_destroyed"}),
+            );
+        }
+        self.drop_queue(id, "endpoint_destroyed");
         // Its streams end; it leaves its mixer.
         self.native.streams.retain(|_, (e, h)| {
             if e == id {
@@ -1727,6 +1751,36 @@ impl Control {
         self.native.endpoints.remove(id);
         self.native.topology_epoch += 1;
         log::info!("native: endpoint {id} destroyed ({reason})");
+    }
+
+    /// Stop `ep`'s recording, if one is going on (active or paused):
+    /// the media workers finish its file, and the outcome is reported.
+    fn stop_recording_of(&mut self, ep: &Endpoint) {
+        let Some(r) = ep
+            .recording
+            .as_ref()
+            .and_then(|id| self.native.recordings.get(id))
+            .filter(|r| matches!(r.state.as_str(), "active" | "paused" | "pausing"))
+        else {
+            return;
+        };
+        let id = r.id.clone();
+        let entries = vec![
+            (b"call-id".to_vec(), bytes(ep.session.as_bytes())),
+            (b"from-tag".to_vec(), bytes(ep.id.as_bytes())),
+        ];
+        if let Err(e) = self.ng_run(b"stop recording", entries) {
+            log::warn!(
+                "native: endpoint {}: its recording {id} not stopped: {}",
+                ep.id,
+                e.message
+            );
+            return;
+        }
+        if let Some(r) = self.native.recordings.get_mut(&id) {
+            r.state = "stopped".into();
+            r.ended_unix_ms = Some(crate::relay::media_events::unix_ms());
+        }
     }
 
     fn native_destroy(&mut self, req: &Request<'_>) -> Result<Json, NativeError> {
@@ -2518,6 +2572,19 @@ impl Control {
             }
             self.endpoint_event(&id, ty, None, data);
             self.ivr_interrupt(&id, ty);
+        } else if ty.starts_with("recording.")
+            && let Some(t) = self.native.tombs.get(&id)
+        {
+            // A recording's outcome after its endpoint was destroyed: to
+            // its tenant still, as the endpoint's (without `seq`).
+            self.native.publish(json!({
+                "event": ty,
+                "endpoint_id": id,
+                "session_id": String::from_utf8_lossy(&call),
+                "tenant": t.tenant,
+                "generation": t.generation,
+                "data": data,
+            }));
         } else {
             self.native.publish(json!({
                 "event": ty,
@@ -3361,6 +3428,7 @@ pub(super) fn mutates(op: &str) -> bool {
             | "inventory.list"
             | "recovery.report"
             | "recording.query"
+            | "playback.query"
             | "events.subscribe"
             | "events.unsubscribe"
     )

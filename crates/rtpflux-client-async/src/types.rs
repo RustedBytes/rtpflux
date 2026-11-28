@@ -199,6 +199,11 @@ pub struct EventFilter {
     /// Events of `ng` parties too.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub all_parties: bool,
+    /// Digits the endpoint marked sensitive (`endpoint.sensitive`) as
+    /// they are, not redacted: for the controller collecting them. Other
+    /// subscribers, and the logs, never see them.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
     /// Begin after this cursor (an event's `event_id`, a subscription's
     /// `cursor`, an inventory page's watermark): what came after it is
     /// replayed first.
@@ -428,6 +433,43 @@ pub enum OperationState {
     Other(String),
 }
 
+/// Where a playback is, or how it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackState {
+    Playing,
+    Queued,
+    Completed,
+    Stopped,
+    #[serde(other)]
+    Other,
+}
+
+/// `playback.query`'s answer: for a playback whose end event was missed
+/// (across a reconnect).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PlaybackStatus {
+    pub playback_id: String,
+    pub state: PlaybackState,
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// Why it stopped (`request`, `replaced`, `dtmf`, `speech`,
+    /// `interrupted`, `failed`, `endpoint_destroyed`).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Its place in the queue (1 is next).
+    #[serde(default)]
+    pub position: Option<u64>,
+    /// It ended while still queued (it never played).
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub ended_unix_ms: Option<u64>,
+}
+
 /// `operation.query`'s answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationStatus {
@@ -520,5 +562,35 @@ mod tests {
         assert_eq!(g.data["missed"], 4);
         assert!(MediaEvent::from_wire(&serde_json::json!({"ok": true})).is_none());
         assert_eq!(EventKind::parse("x.y"), EventKind::Other("x.y".into()));
+    }
+
+    #[test]
+    fn sensitive_filter_and_playback_status() {
+        let f = EventFilter {
+            sensitive: true,
+            ..EventFilter::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({"sensitive": true})
+        );
+        assert_eq!(
+            serde_json::to_value(EventFilter::default()).unwrap(),
+            serde_json::json!({}),
+            "left out unless asked"
+        );
+        let p: PlaybackStatus = serde_json::from_value(serde_json::json!({
+            "playback_id": "pb-1", "state": "stopped", "endpoint_id": "e",
+            "generation": 3, "reason": "endpoint_destroyed", "queued": true,
+            "operation_id": null, "ended_unix_ms": 5}))
+        .unwrap();
+        assert_eq!(
+            (p.state, p.reason.as_deref(), p.queued),
+            (PlaybackState::Stopped, Some("endpoint_destroyed"), true)
+        );
+        let q: PlaybackStatus = serde_json::from_value(serde_json::json!({
+            "playback_id": "pb-2", "state": "paused", "endpoint_id": "e"}))
+        .unwrap();
+        assert_eq!(q.state, PlaybackState::Other, "a later state");
     }
 }

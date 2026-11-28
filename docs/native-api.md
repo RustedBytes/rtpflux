@@ -217,7 +217,7 @@ gives).
 | `endpoint.prepare` | `endpoint_id`; `remote_sdp` (the remote side's re-offer), or `codecs` / `options` (the relay's re-offer), whichever side offered first | `pending_revision`, `sdp_type`, `sdp` |
 | `endpoint.commit` | `endpoint_id`, `revision`; after the relay's re-offer, `sdp` (the answer) | `revision` |
 | `endpoint.abort` | `endpoint_id`, `revision` | `revision` (the committed one) |
-| `endpoint.destroy` | `endpoint_id` | `destroyed`, or `already: true` |
+| `endpoint.destroy` | `endpoint_id` | `destroyed`, or `already: true`. Its playback and queue stop first (`playback.stopped`, `reason: "endpoint_destroyed"`); its recording is stopped and finished, its outcome reported after `endpoint.destroyed` |
 | `endpoint.query` | `endpoint_id` | The endpoint's snapshot, and `media` (its streams, statistics, RTCP, DTMF, as ng `query` reports them) |
 | `endpoint.list` | | `endpoints` (snapshots), `destroyed` (recent tombstones), `global_seq` |
 | `endpoint.lookup` | `external_id` | The live endpoint's snapshot (`state_of_id: "live"`), or the destroyed one's id, generation and reason (`state_of_id: "destroyed"`) while its tombstone is kept |
@@ -423,6 +423,7 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
 |---|---|---|
 | `playback.start` | `endpoint_id`, `file` or `blob_base64`, `repeat_times`, `start_pos`, `duration`, `repeat_duration`, `queue` (wait behind the current one), `stop_on` (`["dtmf", "speech"]`) | `playback_id`, `duration_ms`; queued: `queued`, `position` |
 | `playback.stop` | `endpoint_id` | `stopped`, `playback_id` (the queue goes too) |
+| `playback.query` | `playback_id` | Its `state`: `playing`, `queued` (with `position`), `completed` or `stopped` (with `reason`, `queued`, `ended_unix_ms`); `endpoint_id`, `generation`, `operation_id`. `not_found` once the relay no longer knows it |
 | `recording.start`, `recording.stop` | `endpoint_id`, `options` (`format`, `channels`, …) | `recording`, `recording_id` (starting again while it records gives the same id) |
 | `recording.pause`, `recording.resume` | `endpoint_id` | `recording_id`, `state`, `changed`, `pauses` |
 | `recording.query` | `recording_id` | Its `state` (`active`, `paused`, `pausing`, `stopped`, `completed`, `failed`), `pauses`, `file`, `finalized`, `uploaded`, `upload` (`pending`, `none`, `uploaded`, `failed`), `detail`, start and end times |
@@ -442,6 +443,10 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
   current playback and drops the queue (`reason: "replaced"`). The relay
   does the stopping, without a round trip to the controller. Digit
   collection and timeouts stay with the controller.
+- **Missed ends.** A controller that missed a playback's end (it was
+  reconnecting) asks `playback.query`. The relay keeps how the latest
+  8192 playbacks ended, in memory: after a restart they are gone, as
+  the endpoint's `endpoint.events_lost` says.
 
 ## IVR: keys, tones, detectors and sensitive digits
 
@@ -502,6 +507,13 @@ Attaching joins two endpoints with ng's [`connect`](control-protocol.md#connect)
   `recording_id` among the operation's resources (`operation.query`).
 - Only relayed media is recorded: an endpoint bridged to no one records
   nothing.
+- **Destroying the endpoint** stops its recording (active or paused),
+  and the media workers finish its file. The outcome
+  (`recording.completed` or `recording.failed`) arrives after
+  `endpoint.destroyed`, as the destroyed endpoint's event (without
+  `seq`), and `recording.query` keeps answering. An endpoint that ends
+  otherwise (`timeout`, `ended`) has its recording finished with its
+  call, reported the same way.
 - A finished recording gives `recording.completed` once its audio file is
   written (`file`), with `uploaded` saying whether the S3 upload worked
   (`null` without uploads). A recording whose conversion failed gives
@@ -741,7 +753,7 @@ subscriber sees only its own tenant's events.
 | `ice.connected`, `dtls.ready` | |
 | `dtmf.detected` | `digit`, `code`, `duration_ms`, `rtp_timestamp`, `source`, `start_unix_ms`, `end_unix_ms`; `sensitive`, or `redacted` with `digit` and `code` `null` |
 | `playback.completed` | `playback_id` |
-| `playback.stopped` | `playback_id`, `reason` (`request`, `replaced`, `dtmf`, `speech`, `interrupted`, `failed`), `queued` |
+| `playback.stopped` | `playback_id`, `reason` (`request`, `replaced`, `dtmf`, `speech`, `interrupted`, `failed`, `endpoint_destroyed`), `queued` |
 | `recording.completed`, `recording.failed` | `file`, `uploaded`, `section`; a recording whose file the worker cannot open fails at once, with `reason: "recording"` and a `detail` |
 | `speech.started`, `speech.ended` | (an endpoint with a PCM stream) |
 | `stream.mark` | `stream_id`, `mark`, `generation`, `played_ms`, `flushed`, `boundary` (`rtp_sent`) |
