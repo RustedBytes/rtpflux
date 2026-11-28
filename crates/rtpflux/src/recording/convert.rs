@@ -220,6 +220,7 @@ pub fn run(
                     file,
                     uploaded,
                     tracks: Vec::new(),
+                    errors: Vec::new(),
                 },
             );
         }

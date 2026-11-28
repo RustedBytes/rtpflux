@@ -31,7 +31,8 @@ impl Control {
             })
     }
 
-    /// The party's media echoed (`on`), or parked (dropped, both ways).
+    /// The party's media echoed (`on`), or parked (dropped, both ways),
+    /// in every section or, on an error, as it was.
     pub(super) fn set_party_echo(
         &mut self,
         call: &[u8],
@@ -39,14 +40,30 @@ impl Control {
         on: bool,
     ) -> Result<(), Error> {
         let legs = self.party_legs(call, tag).ok_or(Error::UnknownCallOrTag)?;
+        // In every section or in none: (call, the modes it had).
+        let mut done: Vec<(crate::relay::CallId, [u8; 2])> = Vec::new();
         for ((id, leg), _) in legs.into_iter().flatten() {
             let mut modes = [Echo::Discard; 2];
             if on {
                 modes[usize::from(leg == CallLeg::B)] = Echo::Echo;
             }
-            if !self.relay.echo(id, modes)? {
-                return Err(Error::UnknownCallOrTag);
+            let before = self.extras.get(&id).map_or([0, 0], |x| x.echo);
+            let changed = match self.relay.echo(id, modes) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(Error::UnknownCallOrTag),
+                Err(e) => Err(Error::from(e)),
+            };
+            if let Err(e) = changed {
+                // The sections changed before it are put back.
+                for (id, was) in done.into_iter().rev() {
+                    if let Err(undo) = self.relay.echo(id, was.map(Echo::of_code)) {
+                        log::warn!("echo: call {id}: putting its media echo back: {undo}");
+                    }
+                    self.extras.entry(id).or_default().echo = was;
+                }
+                return Err(e);
             }
+            done.push((id, before));
             // Kept with the call's extras, for a restart.
             self.extras.entry(id).or_default().echo = modes.map(Echo::code);
         }

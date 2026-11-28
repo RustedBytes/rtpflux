@@ -82,8 +82,10 @@ pub struct MixRec {
     /// The file-name template, and when it started (seconds).
     pub template: String,
     pub started_s: u64,
-    /// Each section's spool, in order.
+    /// Each section's spool, in order, and when each began (ms).
     pub spools: Vec<String>,
+    #[serde(default)]
+    pub section_starts: Vec<u64>,
     #[serde(default)]
     pub participants: Vec<Participation>,
     /// Periods written and lost in the sections before this one.
@@ -105,6 +107,14 @@ pub struct Running {
     lost: Arc<AtomicU64>,
     written: Arc<Written>,
     finish: Finish,
+}
+
+impl Running {
+    /// Periods lost so far: the queue had no room for them, or the writer
+    /// could not write them.
+    fn lost(&self) -> u64 {
+        self.lost.load(Ordering::Relaxed) + self.written.failed.load(Ordering::Relaxed)
+    }
 }
 
 /// Whether a saved recording is a mixer's that was not finished (to go on
@@ -339,6 +349,26 @@ impl Control {
                 "recording is not configured (no converter)",
             ));
         }
+        let rid = self.new_mixrec(mixer, settings, extras, metadata);
+        if let Err(e) = self.open_section(&rid, &dir, false) {
+            self.native.recordings.remove(&rid);
+            return Err(e);
+        }
+        self.mixrec_sync(mixer);
+        self.native.topology_epoch += 1;
+        self.mark_dirty();
+        log::info!("native: mixer {mixer}: recording {rid}");
+        Ok(json!({"recording": true, "recording_id": rid, "mixer_id": mixer}))
+    }
+
+    /// The record of a new recording of mixer `mixer`; its id.
+    fn new_mixrec(
+        &mut self,
+        mixer: u32,
+        settings: Settings,
+        extras: Extras,
+        metadata: BTreeMap<String, String>,
+    ) -> String {
         let rid = super::native::random_id("rec-");
         let tenant = self
             .native
@@ -374,6 +404,7 @@ impl Control {
                     template,
                     started_s: now / 1000,
                     spools: Vec::new(),
+                    section_starts: Vec::new(),
                     participants: Vec::new(),
                     periods: 0,
                     lost: 0,
@@ -382,15 +413,7 @@ impl Control {
                 }),
             },
         );
-        if let Err(e) = self.open_section(&rid, &dir, false) {
-            self.native.recordings.remove(&rid);
-            return Err(e);
-        }
-        self.mixrec_sync(mixer);
-        self.native.topology_epoch += 1;
-        self.mark_dirty();
-        log::info!("native: mixer {mixer}: recording {rid}");
-        Ok(json!({"recording": true, "recording_id": rid, "mixer_id": mixer}))
+        rid
     }
 
     /// A new section of recording `rid` (its first, or the next after a
@@ -407,6 +430,18 @@ impl Control {
         let (Some(mixer), Some(mix)) = (r.mixer_id, r.mix.as_mut()) else {
             return Err(NativeError::new(Code::Internal, "not a mixer recording"));
         };
+        // The mixer first: nothing is made for one that is gone.
+        if !self
+            .native
+            .mixers
+            .get(&mixer)
+            .is_some_and(|(_, m)| m.running())
+        {
+            return Err(NativeError::new(
+                Code::NotFound,
+                format!("mixer {mixer} is not running"),
+            ));
+        }
         let section = mix.spools.len() + 1;
         let base = section_name(&mix.template, (mixer, rid, mix.started_s), section, "");
         let spool = mixrec::spool_path(dir, &base);
@@ -431,17 +466,36 @@ impl Control {
         )
         .map_err(|e| NativeError::new(Code::Internal, format!("recording: {e}")))?;
         let (include_whispers, tracks) = (mix.include_whispers, mix.tracks);
-        mix.spools.push(spool.display().to_string());
-        let Some((_, m)) = self.native.mixers.get(&mixer) else {
-            return Err(NativeError::new(Code::NotFound, format!("mixer {mixer}")));
-        };
-        m.record(Some(crate::pcm::mixer::MixTap {
-            blocks: tx,
-            include_whispers,
-            tracks,
-            lost: Arc::clone(&running.lost),
-            paused,
-        }));
+        let taken = self.native.mixers.get(&mixer).is_some_and(|(_, m)| {
+            m.record(Some(crate::pcm::mixer::MixTap {
+                blocks: tx,
+                include_whispers,
+                tracks,
+                lost: Arc::clone(&running.lost),
+                paused,
+            }))
+        });
+        if !taken {
+            // Its writer ends with the queue (nothing set to convert); the
+            // empty spool goes.
+            if let Err(e) = std::fs::remove_file(&spool) {
+                log::warn!("recording: removing {}: {e}", spool.display());
+            }
+            return Err(NativeError::new(
+                Code::NotFound,
+                format!("mixer {mixer} stopped"),
+            ));
+        }
+        if let Some(mix) = self
+            .native
+            .recordings
+            .get_mut(rid)
+            .and_then(|r| r.mix.as_mut())
+        {
+            mix.spools.push(spool.display().to_string());
+            mix.section_starts
+                .push(crate::relay::media_events::unix_ms());
+        }
         self.native.mixrecs.insert(rid.to_owned(), running);
         Ok(())
     }
@@ -503,6 +557,7 @@ impl Control {
             mix: Some(MixJob {
                 recording_id: r.id.clone(),
                 spools,
+                starts: mix.section_starts.clone(),
                 tracks,
             }),
         })
@@ -535,23 +590,28 @@ impl Control {
         let mixer = r.mixer_id;
         let job = Self::mixrec_job(r);
         let jobs = self.relay.recording_jobs();
-        match (job, jobs) {
+        let sent = match (job, jobs) {
             (Some(job), Some(jobs)) => match self.native.mixrecs.get(rid) {
                 Some(run) => mixrec::hand_over(&run.finish, job, jobs),
                 // No writer (its mixer did not come back after a restart).
-                None => {
-                    let _ = jobs.send(job);
-                }
+                None => jobs.send(job).map_err(|_| "no recording converter"),
             },
-            _ => {
-                if let Some(r) = self.native.recordings.get_mut(rid) {
-                    r.state = "failed".into();
-                    r.detail = Some("no recording converter".into());
-                }
+            (None, _) => Err("not a mixer recording"),
+            (_, None) => Err("no recording converter"),
+        };
+        if let Err(why) = sent {
+            log::warn!("native: recording {rid}: not converted: {why}");
+            if let Some(r) = self.native.recordings.get_mut(rid) {
+                r.state = "failed".into();
+                r.detail = Some(why.into());
             }
         }
-        if let Some((_, m)) = mixer.and_then(|m| self.native.mixers.get(&m)) {
-            m.record(None);
+        // A mixer that stopped has let its recording go already (its
+        // writer handed the job over then).
+        if let Some((_, m)) = mixer.and_then(|m| self.native.mixers.get(&m))
+            && !m.record(None)
+        {
+            log::debug!("native: recording {rid}: its mixer had stopped");
         }
         self.native.topology_epoch += 1;
         self.mark_dirty();
@@ -617,7 +677,9 @@ impl Control {
                 r.state = "paused".into();
             }
             (true, false) => r.state = "pausing".into(),
-            (false, true) => {
+            // Not confirmed, the resume may still be taken: capture may go
+            // on, so it is never left reported paused.
+            (false, _) => {
                 r.state = "active".into();
                 if let Some(last) = r.pauses.last_mut()
                     && last.1.is_none()
@@ -625,7 +687,6 @@ impl Control {
                     last.1 = Some(now);
                 }
             }
-            (false, false) => {}
         }
         self.mark_dirty();
         if confirmed {
@@ -750,11 +811,12 @@ impl Control {
                 file,
                 uploaded,
                 tracks,
+                errors,
             } => (
                 "recording.completed",
                 file.clone(),
                 *uploaded,
-                None,
+                (!errors.is_empty()).then(|| errors.join("; ")),
                 tracks.clone(),
             ),
             MediaEventKind::Failed { reason, .. } => (
@@ -782,7 +844,7 @@ impl Control {
         };
         if let Some(run) = run {
             mix.periods += run.written.periods.load(Ordering::Relaxed);
-            mix.lost += run.lost.load(Ordering::Relaxed);
+            mix.lost += run.lost();
         }
         if mix.lost > 0 {
             log::warn!(
@@ -817,7 +879,7 @@ impl Control {
             "section": mix.spools.len(),
             "duration_ms": mix.periods * PERIOD_MS,
             "lost_ms": mix.lost * PERIOD_MS,
-            "reason": failure.as_ref().map(|_| "recording"),
+            "reason": file.is_none().then_some("recording"),
             "detail": failure,
         });
         let event = json!({"event": ty, "mixer_id": r.mixer_id, "tenant": r.tenant, "data": data});
@@ -901,10 +963,7 @@ impl Control {
         o.remove("endpoint_id");
         o.remove("mix");
         let (periods, lost) = self.native.mixrecs.get(&r.id).map_or((0, 0), |run| {
-            (
-                run.written.periods.load(Ordering::Relaxed),
-                run.lost.load(Ordering::Relaxed),
-            )
+            (run.written.periods.load(Ordering::Relaxed), run.lost())
         });
         o.insert("participants".into(), json!(mix.participants));
         o.insert("lost_ms".into(), json!((mix.lost + lost) * PERIOD_MS));
@@ -937,7 +996,7 @@ impl Control {
     pub(super) fn recording_to_save(&self, r: &Recording) -> Recording {
         let mut out = r.clone();
         if let (Some(mix), Some(run)) = (out.mix.as_mut(), self.native.mixrecs.get(&r.id)) {
-            mix.lost += run.lost.load(Ordering::Relaxed);
+            mix.lost += run.lost();
         }
         out
     }

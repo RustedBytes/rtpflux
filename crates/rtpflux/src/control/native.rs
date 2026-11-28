@@ -3165,7 +3165,9 @@ impl Control {
         else {
             return Err(NativeError::new(Code::NotFound, "the mixer is gone"));
         };
-        m.tap(endpoint, fork);
+        if !m.tap(endpoint, fork) {
+            return Err(NativeError::new(Code::Internal, "the mixer has stopped"));
+        }
         self.native.taps.insert(id);
         Ok(())
     }
@@ -3347,8 +3349,10 @@ impl Control {
             "mixer.add" => {
                 let role = self.mixer_role(req, id)?;
                 let r = self.mixer_add(id, &ep)?;
-                if let (Some(role), Some((_, m))) = (role, self.native.mixers.get(&id)) {
-                    m.role(&ep.id, role);
+                if let (Some(role), Some((_, m))) = (role, self.native.mixers.get(&id))
+                    && !m.role(&ep.id, role)
+                {
+                    return Err(mixer_stopped(id));
                 }
                 Ok(r)
             }
@@ -3370,23 +3374,29 @@ impl Control {
                 if !m.participants.contains(&ep.id) {
                     return Err(NativeError::new(Code::NotFound, "not a participant"));
                 }
+                // Each change taken by the mixer's thread, or the mixer has
+                // stopped: never reported set when nothing was.
+                let mut taken = true;
                 if let Some(muted) = req.body.get("muted").and_then(Json::as_bool) {
-                    m.mute(&ep.id, muted);
+                    taken &= m.mute(&ep.id, muted);
                 }
                 if let Some(db) = super::conference::gain(req, "input_gain_db")
                     .or_else(|| super::conference::gain(req, "gain_db"))
                 {
-                    m.gain(&ep.id, db);
+                    taken &= m.gain(&ep.id, db);
                 }
                 if let Some(db) = super::conference::gain(req, "output_gain_db") {
-                    m.output_gain(&ep.id, db);
+                    taken &= m.output_gain(&ep.id, db);
                 }
                 if let Some(d) = req.body.get("deafened").and_then(Json::as_bool) {
-                    m.deafen(&ep.id, d);
+                    taken &= m.deafen(&ep.id, d);
                 }
                 let role = self.mixer_role(req, id)?;
                 if let (Some(role), Some((_, m))) = (role, self.native.mixers.get(&id)) {
-                    m.role(&ep.id, role);
+                    taken &= m.role(&ep.id, role);
+                }
+                if !taken {
+                    return Err(mixer_stopped(id));
                 }
                 Ok(json!({"set": true}))
             }
@@ -3471,6 +3481,14 @@ impl Control {
         self.confirm(&[ep])?;
         Ok(json!({"mixer_id": id, "participants": participants}))
     }
+}
+
+/// A change asked of a mixer whose thread has stopped (it failed).
+fn mixer_stopped(id: u32) -> NativeError {
+    NativeError::new(
+        Code::Internal,
+        format!("mixer {id} has stopped: destroy it and create it again"),
+    )
 }
 
 /// An endpoint's audio: its leg, payload type, codec and RTP clock.

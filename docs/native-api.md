@@ -766,6 +766,17 @@ A request naming both is refused (`invalid`).
   never waits for it. A period the queue has no room for is lost:
   silence at its place in the file, counted in `lost_ms`, and logged
   once per recording.
+- **Write failures** (a full disk) never leave half a period in the
+  spool, so the audio after them stays in place. The periods not written
+  count in `lost_ms` and become silence once writing works again. A
+  track that cannot be written is given up (its file removed, logged),
+  never left out of step with the mix. A file name already taken is
+  never written into.
+- **Conversion failures.** A section or track that cannot be converted
+  keeps its spool, and `recording.completed` (when the rest could be)
+  says what in `detail`. With nothing converted, `recording.failed`.
+  Converting again after a restart (one that came before the outcome was
+  saved) counts the sections already made.
 - **A restart.** A recording whose mixer is rebuilt goes on in a new
   section (a new file, `section` one more): the downtime is between the
   files, not silence inside one. A paused one stays paused.

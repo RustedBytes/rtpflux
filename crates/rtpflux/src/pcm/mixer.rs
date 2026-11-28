@@ -240,8 +240,20 @@ pub struct MixerHandle {
     pub id: u32,
     asks: Sender<Ask>,
     stop: Arc<AtomicBool>,
+    /// Set when its thread ends, however it ends.
+    thread_done: Arc<AtomicBool>,
     /// The participants' keys.
     pub participants: Vec<String>,
+}
+
+/// Sets its flag when dropped: at the end of a mixer's thread, a panic
+/// included.
+struct Done(Arc<AtomicBool>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Ask {
@@ -312,48 +324,63 @@ impl MixerHandle {
         })
     }
 
-    /// Remove participant `key`.
+    /// Remove participant `key`; whether it was one.
     pub fn remove(&mut self, key: &str) -> bool {
         let had = self.participants.iter().any(|k| k == key);
         self.participants.retain(|k| k != key);
+        // A mixer that stopped has let go of everyone already.
         let _ = self.asks.send(Ask::Remove(key.to_owned()));
         had
     }
 
+    /// Whether the mixer's thread is still running (it stops when told,
+    /// or if it failed): a change asked of a stopped mixer does nothing.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        !self.thread_done.load(Ordering::Relaxed)
+    }
+
     /// Mute (or unmute) participant `key`: the others stop hearing it.
-    pub fn mute(&self, key: &str, muted: bool) {
-        let _ = self.asks.send(Ask::Mute(key.to_owned(), muted));
+    #[must_use]
+    pub fn mute(&self, key: &str, muted: bool) -> bool {
+        self.asks.send(Ask::Mute(key.to_owned(), muted)).is_ok()
     }
 
     /// Participant `key`'s role.
-    pub fn role(&self, key: &str, role: Role) {
-        let _ = self.asks.send(Ask::Role(key.to_owned(), role));
+    #[must_use]
+    pub fn role(&self, key: &str, role: Role) -> bool {
+        self.asks.send(Ask::Role(key.to_owned(), role)).is_ok()
     }
 
     /// Deafen participant `key` (it hears silence), or not.
-    pub fn deafen(&self, key: &str, deaf: bool) {
-        let _ = self.asks.send(Ask::Deaf(key.to_owned(), deaf));
+    #[must_use]
+    pub fn deafen(&self, key: &str, deaf: bool) -> bool {
+        self.asks.send(Ask::Deaf(key.to_owned(), deaf)).is_ok()
     }
 
     /// The gain of what participant `key` hears, in dB.
-    pub fn output_gain(&self, key: &str, db: i32) {
-        let _ = self.asks.send(Ask::OutGain(key.to_owned(), db));
+    #[must_use]
+    pub fn output_gain(&self, key: &str, db: i32) -> bool {
+        self.asks.send(Ask::OutGain(key.to_owned(), db)).is_ok()
     }
 
     /// A copy of participant `key`'s packets into `tap` (a PCM stream's).
-    pub fn tap(&self, key: &str, tap: SyncSender<RtpCopy>) {
-        let _ = self.asks.send(Ask::Tap(key.to_owned(), tap));
+    #[must_use]
+    pub fn tap(&self, key: &str, tap: SyncSender<RtpCopy>) -> bool {
+        self.asks.send(Ask::Tap(key.to_owned(), tap)).is_ok()
     }
 
     /// Participant `key`'s gain, in dB (−60 to +24).
-    pub fn gain(&self, key: &str, db: i32) {
-        let _ = self.asks.send(Ask::Gain(key.to_owned(), db));
+    #[must_use]
+    pub fn gain(&self, key: &str, db: i32) -> bool {
+        self.asks.send(Ask::Gain(key.to_owned(), db)).is_ok()
     }
 
     /// Record the mix into `tap` (`None`: stop recording; the queue's
-    /// sender is let go, after the last block).
-    pub fn record(&self, tap: Option<MixTap>) {
-        let _ = self.asks.send(Ask::Record(tap));
+    /// sender is let go, after the last block). Whether the mixer took it (false: it has stopped).
+    #[must_use]
+    pub fn record(&self, tap: Option<MixTap>) -> bool {
+        self.asks.send(Ask::Record(tap)).is_ok()
     }
 
     /// Pause (or resume) the recording, waiting at most `wait` for the
@@ -389,13 +416,19 @@ pub fn start(id: u32, events: MediaEvents) -> std::io::Result<MixerHandle> {
     let (asks, rx) = channel();
     let stop = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&stop);
+    let thread_done = Arc::new(AtomicBool::new(false));
+    let done = Done(Arc::clone(&thread_done));
     std::thread::Builder::new()
         .name("rtpflux-mixer".to_owned())
-        .spawn(move || run(id, &rx, &s, &events))?;
+        .spawn(move || {
+            let _done = done;
+            run(id, &rx, &s, &events);
+        })?;
     Ok(MixerHandle {
         id,
         asks,
         stop,
+        thread_done,
         participants: Vec::new(),
     })
 }
@@ -659,6 +692,30 @@ mod tests {
         mixer.begin(MIX_FRAME).unwrap();
         record(&mut r, &mixer, &[], &mut acc);
         assert_eq!(rx.try_recv().unwrap().tick, 3, "numbered on");
+    }
+
+    /// A mixer whose thread has ended says so, and takes no recording.
+    #[test]
+    fn a_stopped_mixer_says_so() {
+        let (events, _inbox) = crate::relay::media_events::channel().unwrap();
+        let m = start(1, events).unwrap();
+        assert!(m.running());
+        m.stop();
+        let end = Instant::now() + Duration::from_secs(2);
+        while m.running() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!m.running());
+        let (tx, _rx) = sync_channel(1);
+        assert!(!m.record(Some(MixTap {
+            blocks: tx,
+            include_whispers: false,
+            tracks: false,
+            lost: Arc::default(),
+            paused: false,
+        })));
+        assert!(!m.mute("p", true));
+        assert!(!m.pause_recording(true, Duration::from_millis(50)));
     }
 
     #[test]

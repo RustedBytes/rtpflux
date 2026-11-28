@@ -88,6 +88,9 @@ pub enum MediaEventKind {
         /// A mixer recording's per-participant tracks: (endpoint id,
         /// file).
         tracks: Vec<(String, String)>,
+        /// What of a mixer recording could not be converted (its spool
+        /// kept), when the rest could.
+        errors: Vec<String>,
     },
 }
 

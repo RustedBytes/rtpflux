@@ -40,8 +40,10 @@ pub const SPOOL: &str = "mixpcm";
 pub struct MixJob {
     /// The native API's recording id.
     pub recording_id: String,
-    /// The spools, section after section.
+    /// The spools, section after section, and when each began (ms since
+    /// the epoch).
     pub spools: Vec<PathBuf>,
+    pub starts: Vec<u64>,
     /// The participants' tracks: (section from 1, endpoint id, spool).
     /// One that was never written (no such spool) is skipped.
     pub tracks: Vec<(usize, String, PathBuf)>,
@@ -65,31 +67,50 @@ pub type Finish = Arc<Mutex<Handover>>;
 
 /// The recording ends: `job` goes to `jobs` once the writer has written
 /// everything (at once if it is already done).
-pub fn hand_over(finish: &Finish, job: super::Job, jobs: Sender<super::Job>) {
-    let Ok(mut h) = finish.lock() else {
-        return;
-    };
-    if h.writer_done {
-        drop(h);
-        let _ = jobs.send(job);
-    } else {
-        h.job = Some((job, jobs));
-    }
-}
-
-/// Counters a writer keeps: periods written (silence included).
-#[derive(Debug, Default)]
-pub struct Written {
-    pub periods: AtomicU64,
-}
-
-/// Start the writer of one section: the blocks from `blocks` into the
-/// spool at `path` (created; appended to if it exists), until the queue
-/// closes; then the job in `finish`, if any, goes to the converter.
 ///
 /// # Errors
 ///
-/// When the spool cannot be opened or the thread started.
+/// When it went at once and no converter is left to take it.
+pub fn hand_over(
+    finish: &Finish,
+    job: super::Job,
+    jobs: Sender<super::Job>,
+) -> Result<(), &'static str> {
+    // A writer that panicked holding the lock leaves the hand-over as it
+    // was: still usable.
+    let mut h = finish
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if h.writer_done {
+        drop(h);
+        jobs.send(job).map_err(|_| "no recording converter")
+    } else {
+        h.job = Some((job, jobs));
+        Ok(())
+    }
+}
+
+/// Counters a writer keeps.
+#[derive(Debug, Default)]
+pub struct Written {
+    /// Periods in the spool (silence included).
+    pub periods: AtomicU64,
+    /// Periods of the mix that could not be written (a full disk): lost,
+    /// silence in their place once writing works again.
+    pub failed: AtomicU64,
+}
+
+/// Bytes per period in a spool.
+const PERIOD_BYTES: u64 = (BLOCK_SAMPLES * 2) as u64;
+
+/// Start the writer of one section: the blocks from `blocks` into the
+/// spool at `path` (a new file: one that exists is never written into),
+/// until the queue closes; then the job in `finish`, if any, goes to the
+/// converter.
+///
+/// # Errors
+///
+/// When the spool cannot be created or the thread started.
 pub fn spawn_writer(
     path: &Path,
     blocks: Receiver<MixBlock>,
@@ -98,13 +119,20 @@ pub fn spawn_writer(
     tracks: Option<TrackPath>,
 ) -> std::io::Result<()> {
     let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+        .write(true)
+        .create_new(true)
         .open(path)?;
-    let path = path.to_owned();
-    std::thread::Builder::new()
+    let owned = path.to_owned();
+    let spawned = std::thread::Builder::new()
         .name("rtpflux-mixrec".to_owned())
-        .spawn(move || write(&path, file, &blocks, &written, &finish, tracks.as_ref()))?;
+        .spawn(move || {
+            let mut spool = Out::new(file, owned);
+            write(&mut spool, &blocks, &written, &finish, tracks.as_ref());
+        });
+    if let Err(e) = spawned {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -115,19 +143,140 @@ fn le(pcm: &[i16; BLOCK_SAMPLES], out: &mut [u8; BLOCK_SAMPLES * 2]) {
     }
 }
 
-/// Write `data`, logging the first failure only (the timeline goes on).
-fn put(file: &mut impl std::io::Write, data: &[u8], path: &Path, failed: &mut bool) {
-    if let Err(e) = file.write_all(data)
-        && !*failed
-    {
-        log::warn!("recording: {}: {e}", path.display());
-        *failed = true;
+/// A spool being written, a whole period at a time: a write that fails
+/// part way (a full disk) is cut back off, so the file always holds whole
+/// periods and every sample stays in its place.
+struct Out {
+    file: File,
+    path: PathBuf,
+    /// Periods in the file.
+    periods: u64,
+    /// A failure was logged (once per file).
+    logged: bool,
+}
+
+impl Out {
+    fn new(file: File, path: PathBuf) -> Self {
+        Out {
+            file,
+            path,
+            periods: 0,
+            logged: false,
+        }
+    }
+
+    /// Append one period; whether it was written.
+    fn put(&mut self, data: &[u8; BLOCK_SAMPLES * 2]) -> bool {
+        match self.file.write_all(data) {
+            Ok(()) => {
+                self.periods += 1;
+                true
+            }
+            Err(e) => {
+                if !self.logged {
+                    log::warn!("recording: {}: {e}", self.path.display());
+                    self.logged = true;
+                }
+                // Whatever part of it went in, out again.
+                let whole = self.periods * PERIOD_BYTES;
+                let undone = self.file.set_len(whole).and_then(|()| {
+                    use std::io::Seek as _;
+                    self.file.seek(std::io::SeekFrom::Start(whole)).map(drop)
+                });
+                if let Err(e) = undone {
+                    log::warn!("recording: {}: {e}", self.path.display());
+                }
+                false
+            }
+        }
+    }
+
+    /// Bring the file to `tick` periods with silence (periods lost on the
+    /// way, or written when writing works again).
+    fn fill_to(&mut self, tick: u64) {
+        let silence = [0u8; BLOCK_SAMPLES * 2];
+        while self.periods < tick && self.put(&silence) {}
+    }
+
+    /// On the disk; logged if not.
+    fn sync(&mut self) {
+        if let Err(e) = self.file.sync_data() {
+            log::warn!("recording: {}: {e}", self.path.display());
+        }
+    }
+}
+
+/// A participant's track, buffered: on its first failure it is given up
+/// (its file removed), never left with samples out of place.
+struct Track {
+    out: BufWriter<File>,
+    path: PathBuf,
+}
+
+impl Track {
+    /// A new track file at `path` with `periods` of silence (it was not
+    /// there yet); `None` (logged) when it cannot be made.
+    fn open(path: PathBuf, periods: u64) -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut t = match file {
+            Ok(f) => Track {
+                out: BufWriter::with_capacity(64 * 1024, f),
+                path,
+            },
+            Err(e) => {
+                log::warn!("recording: track {}: {e}", path.display());
+                return None;
+            }
+        };
+        let silence = [0u8; BLOCK_SAMPLES * 2];
+        for _ in 0..periods {
+            if !t.put(&silence) {
+                return None;
+            }
+        }
+        Some(t)
+    }
+
+    /// Append one period; false (the track given up) on failure.
+    fn put(&mut self, data: &[u8]) -> bool {
+        if let Err(e) = self.out.write_all(data) {
+            self.give_up(&e);
+            return false;
+        }
+        true
+    }
+
+    fn give_up(&self, e: &std::io::Error) {
+        log::warn!(
+            "recording: track {}: {e}; the track is given up",
+            self.path.display()
+        );
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            log::warn!("recording: removing {}: {e}", self.path.display());
+        }
+    }
+
+    /// Flush and sync; false (the track given up) on failure.
+    fn finish(mut self) -> bool {
+        match self
+            .out
+            .flush()
+            .and_then(|()| self.out.get_ref().sync_data())
+        {
+            Ok(()) => true,
+            Err(e) => {
+                self.give_up(&e);
+                false
+            }
+        }
     }
 }
 
 fn write(
-    path: &Path,
-    mut file: File,
+    spool: &mut Out,
     blocks: &Receiver<MixBlock>,
     written: &Written,
     finish: &Finish,
@@ -135,76 +284,67 @@ fn write(
 ) {
     let silence = [0u8; BLOCK_SAMPLES * 2];
     let mut bytes = [0u8; BLOCK_SAMPLES * 2];
+    // The next period expected, and the mix's periods not written.
     let mut next = 0u64;
-    let mut failed = false;
-    // The tracks open so far: their files, and whether they had this
-    // period.
-    let mut tracks: HashMap<Arc<str>, (BufWriter<File>, PathBuf)> = HashMap::new();
+    let mut failed = 0u64;
+    let mut tracks: HashMap<Arc<str>, Track> = HashMap::new();
+    // Tracks given up: not opened again.
+    let mut given_up: Vec<Arc<str>> = Vec::new();
     for block in blocks {
         // Periods lost on the way: silence in their place, on every track.
-        while next < block.tick {
-            put(&mut file, &silence, path, &mut failed);
-            for (t, p) in tracks.values_mut() {
-                put(t, &silence, p, &mut failed);
-            }
-            next += 1;
+        spool.fill_to(block.tick);
+        for _ in next..block.tick {
+            tracks.retain(|_, t| t.put(&silence));
         }
         le(&block.pcm, &mut bytes);
-        put(&mut file, &bytes, path, &mut failed);
+        if spool.periods != block.tick || !spool.put(&bytes) {
+            failed += 1;
+        }
         if let Some(track_path) = track_path {
             for (key, pcm) in &block.tracks {
-                if !tracks.contains_key(key) {
-                    let p = track_path(key);
-                    match File::create(&p) {
-                        Ok(f) => {
-                            // Silence from the section's start.
-                            let mut w = BufWriter::with_capacity(64 * 1024, f);
-                            for _ in 0..block.tick {
-                                put(&mut w, &silence, &p, &mut failed);
-                            }
-                            tracks.insert(Arc::clone(key), (w, p));
+                if !tracks.contains_key(key) && !given_up.contains(key) {
+                    // Silence from the section's start.
+                    match Track::open(track_path(key), block.tick) {
+                        Some(t) => {
+                            tracks.insert(Arc::clone(key), t);
                         }
-                        Err(e) => {
-                            if !failed {
-                                log::warn!("recording: {}: {e}", p.display());
-                                failed = true;
-                            }
-                            continue;
-                        }
+                        None => given_up.push(Arc::clone(key)),
                     }
                 }
-                if let Some((t, p)) = tracks.get_mut(key) {
+                if let Some(t) = tracks.get_mut(key) {
                     le(pcm, &mut bytes);
-                    put(t, &bytes, p, &mut failed);
+                    if !t.put(&bytes) {
+                        tracks.remove(key);
+                        given_up.push(Arc::clone(key));
+                    }
                 }
             }
             // Those that left (or were not in this period): silence.
-            for (key, (t, p)) in &mut tracks {
-                if !block.tracks.iter().any(|(k, _)| k == key) {
-                    put(t, &silence, p, &mut failed);
-                }
-            }
+            tracks.retain(|key, t| block.tracks.iter().any(|(k, _)| k == key) || t.put(&silence));
         }
         next = block.tick + 1;
-        written.periods.store(next, Ordering::Relaxed);
+        written.periods.store(spool.periods, Ordering::Relaxed);
+        written.failed.store(failed, Ordering::Relaxed);
     }
-    let _ = file.sync_data();
-    drop(file);
-    for (mut t, p) in tracks.into_values() {
-        if let Err(e) = t.flush().and_then(|()| t.get_ref().sync_data()) {
-            log::warn!("recording: {}: {e}", p.display());
-        }
+    spool.sync();
+    for t in tracks.into_values() {
+        t.finish();
     }
-    let job = finish.lock().ok().and_then(|mut h| {
+    let job = {
+        let mut h = finish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         h.writer_done = true;
         h.job.take()
-    });
+    };
     if let Some((job, jobs)) = job
         && jobs.send(job).is_err()
     {
+        // The relay is stopping: the recording is converted when it is
+        // back (a stopped recording in the state is converted again).
         log::warn!(
-            "recording: {}: no converter left, not converted",
-            path.display()
+            "recording: {}: no converter left, not converted now",
+            spool.path.display()
         );
     }
 }
@@ -222,6 +362,9 @@ struct Spool {
     raw: Vec<u8>,
     done: bool,
     frames: u64,
+    /// A read that failed: the conversion fails with it (never a file
+    /// silently cut short).
+    error: Option<std::io::Error>,
 }
 
 impl Spool {
@@ -238,6 +381,7 @@ impl Spool {
             raw: vec![0; BLOCK_SAMPLES * 2],
             done: false,
             frames: 0,
+            error: None,
         })
     }
 
@@ -249,8 +393,14 @@ impl Spool {
         let mut got = 0;
         while got < self.raw.len() {
             match self.reader.read(&mut self.raw[got..]) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.error = Some(e);
+                    self.done = true;
+                    return false;
+                }
             }
         }
         if got < 2 {
@@ -310,7 +460,7 @@ struct Report<'a> {
 /// When the spool cannot be read, or the files written.
 pub fn convert_section(
     spool: &Path,
-    section: usize,
+    (section, started_ms): (usize, u64),
     job: &MixJob,
     settings: &Settings,
     meta: &super::Meta,
@@ -322,14 +472,11 @@ pub fn convert_section(
     let part = out.with_extension(format!("{}.part", settings.format.extension()));
     let mut meta = meta.clone();
     meta.section = section;
-    let started = std::fs::metadata(spool)
-        .and_then(|m| m.created().or_else(|_| m.modified()))
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
-    let tags = super::naming::tags(&meta, started);
+    let tags = super::naming::tags(&meta, started_ms);
     let mut src = Spool::open(spool, settings.sample_rate, settings.channels.count())?;
-    if let Err(e) = super::encode::encode(&mut src, settings, &tags, &part) {
+    let encoded = super::encode::encode(&mut src, settings, &tags, &part)
+        .and_then(|()| src.error.take().map_or(Ok(()), Err));
+    if let Err(e) = encoded {
         let _ = std::fs::remove_file(&part);
         return Err(e);
     }
@@ -359,10 +506,61 @@ pub fn convert_section(
     Ok((out, json))
 }
 
-/// Convert every section of `job`, keep the files in `store`, and report
-/// the outcome as recording `job.recording_id`'s: the first section's
-/// file (and every section's, in order), whether it was all uploaded.
-/// The spools go once converted; a failed section keeps its spool.
+/// What became of one spool.
+enum Converted {
+    /// Its audio file and report, made now.
+    Made(PathBuf, PathBuf),
+    /// Made before (its spool gone, its audio there): converted again
+    /// after a restart that came before its outcome was saved.
+    Before(PathBuf),
+    /// Never written (a track of a participant that was not there).
+    Nothing,
+    Failed(String),
+}
+
+/// Convert `spool` (its section and start), its spool removed once done.
+fn convert_one(
+    spool: &Path,
+    at: (usize, u64),
+    job: &MixJob,
+    settings: &Settings,
+    meta: &super::Meta,
+) -> Converted {
+    if !spool.exists() {
+        let out = spool.with_extension(settings.format.extension());
+        return if out.exists() {
+            Converted::Before(out)
+        } else {
+            Converted::Nothing
+        };
+    }
+    match convert_section(spool, at, job, settings, meta) {
+        Ok((out, json)) => {
+            log::info!(
+                "recording: {} written ({})",
+                out.display(),
+                job.recording_id
+            );
+            if let Err(e) = std::fs::remove_file(spool) {
+                log::warn!("recording: removing {}: {e}", spool.display());
+            }
+            Converted::Made(out, json)
+        }
+        Err(e) => {
+            log::warn!(
+                "recording: converting {}: {e}; the spool is kept",
+                spool.display()
+            );
+            Converted::Failed(format!("{}: {e}", spool.display()))
+        }
+    }
+}
+
+/// Convert every section of `job` (and its tracks), keep the files in
+/// `store`, and report the outcome as recording `job.recording_id`'s: the
+/// first section's file, the tracks', whether all was uploaded, and what
+/// could not be converted (its spool kept). With no audio at all, it
+/// failed.
 pub(super) fn run(
     job: &MixJob,
     conversion: &super::Conversion,
@@ -372,52 +570,45 @@ pub(super) fn run(
     use crate::relay::media_events::{MediaEventKind, Subject};
     let mut audio = Vec::new();
     let mut keep = Vec::new();
-    let mut failure = None;
+    let mut errors = Vec::new();
+    let start = |section: usize| job.starts.get(section - 1).copied().unwrap_or(0);
     for (i, spool) in job.spools.iter().enumerate() {
-        if !spool.exists() {
-            continue;
-        }
-        match convert_section(spool, i + 1, job, &conversion.settings, &conversion.meta) {
-            Ok((out, json)) => {
-                log::info!(
-                    "recording: {} written ({})",
-                    out.display(),
-                    job.recording_id
-                );
-                let _ = std::fs::remove_file(spool);
+        match convert_one(
+            spool,
+            (i + 1, start(i + 1)),
+            job,
+            &conversion.settings,
+            &conversion.meta,
+        ) {
+            Converted::Made(out, json) => {
                 keep.push(out.clone());
                 keep.push(json);
                 audio.push(out);
             }
-            Err(e) => {
-                log::warn!(
-                    "recording: converting {}: {e}; the spool is kept",
-                    spool.display()
-                );
-                failure = Some(e.to_string());
-            }
+            Converted::Before(out) => audio.push(out),
+            Converted::Nothing => {}
+            Converted::Failed(e) => errors.push(e),
         }
     }
     let mut tracks = Vec::new();
     for (section, endpoint, spool) in &job.tracks {
-        if !spool.exists() {
-            continue;
-        }
         let mut meta = conversion.meta.clone();
         meta.metadata.insert("track".to_owned(), endpoint.clone());
-        match convert_section(spool, *section, job, &conversion.settings, &meta) {
-            Ok((out, json)) => {
-                let _ = std::fs::remove_file(spool);
+        match convert_one(
+            spool,
+            (*section, start(*section)),
+            job,
+            &conversion.settings,
+            &meta,
+        ) {
+            Converted::Made(out, json) => {
                 keep.push(out.clone());
                 keep.push(json);
                 tracks.push((endpoint.clone(), out.display().to_string()));
             }
-            Err(e) => {
-                log::warn!(
-                    "recording: converting {}: {e}; the spool is kept",
-                    spool.display()
-                );
-            }
+            Converted::Before(out) => tracks.push((endpoint.clone(), out.display().to_string())),
+            Converted::Nothing => {}
+            Converted::Failed(e) => errors.push(e),
         }
     }
     let left = store.keep(&keep, &conversion.meta);
@@ -426,20 +617,25 @@ pub(super) fn run(
         return;
     };
     let subject = Subject::Recording(job.recording_id.clone());
-    match (audio.first(), failure) {
-        (Some(first), _) => ev.emit(
+    match audio.first() {
+        Some(first) => ev.emit(
             subject,
             MediaEventKind::RecordingDone {
                 file: Some(first.display().to_string()),
                 uploaded,
                 tracks,
+                errors,
             },
         ),
-        (None, failure) => ev.emit(
+        None => ev.emit(
             subject,
             MediaEventKind::Failed {
                 what: "recording",
-                reason: failure.unwrap_or_else(|| "no audio was recorded".to_owned()),
+                reason: if errors.is_empty() {
+                    "no audio was recorded".to_owned()
+                } else {
+                    errors.join("; ")
+                },
             },
         ),
     }
@@ -522,7 +718,7 @@ mod tests {
             last: true,
             mix: None,
         };
-        hand_over(&finish, job, jobs_tx);
+        hand_over(&finish, job, jobs_tx).unwrap();
         drop(tx);
         jobs_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -541,6 +737,121 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// A full disk: every period fails, is counted, and nothing half
+    /// written stays; the job still goes at the end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_disk_is_counted_and_leaves_no_partial_period() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut out = Out::new(file, PathBuf::from("/dev/full"));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for t in [0, 1, 4] {
+            tx.send(block(t, 7)).unwrap();
+        }
+        drop(tx);
+        let written = Written::default();
+        let finish: Finish = Arc::default();
+        write(&mut out, &rx, &written, &finish, None);
+        assert_eq!(out.periods, 0);
+        assert_eq!(
+            written.failed.load(Ordering::Relaxed),
+            3,
+            "three periods of the mix not written (the lost ones are the mixer's)"
+        );
+        assert!(finish.lock().unwrap().writer_done);
+    }
+
+    /// A track whose file name is taken is given up: the other file is
+    /// never written into.
+    #[test]
+    fn a_taken_track_name_is_left_alone() {
+        let d = dir("taken");
+        let taken = d.join("t.mixpcm");
+        std::fs::write(&taken, b"someone else's").unwrap();
+        assert!(Track::open(taken.clone(), 3).is_none());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+        let fresh = Track::open(d.join("u.mixpcm"), 2).unwrap();
+        assert!(fresh.finish());
+        assert_eq!(
+            std::fs::metadata(d.join("u.mixpcm")).unwrap().len(),
+            2 * PERIOD_BYTES
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The hand-over to a converter that is gone fails, never silently.
+    #[test]
+    fn a_hand_over_with_no_converter_fails() {
+        let finish: Finish = Arc::default();
+        finish.lock().unwrap().writer_done = true;
+        let (jobs, gone) = std::sync::mpsc::channel();
+        drop(gone);
+        let job = super::super::Job {
+            pcap: PathBuf::new(),
+            conversion: super::super::Conversion {
+                settings: Settings::default(),
+                meta: super::super::Meta {
+                    call_id: "mixer-1".into(),
+                    from_tag: "rec-x".into(),
+                    to_tag: None,
+                    section: 1,
+                    left_port: 0,
+                    opus_pts: Vec::new(),
+                    amr_pts: Vec::new(),
+                    amr_wb_pts: Vec::new(),
+                    metadata: std::collections::BTreeMap::new(),
+                    mixer_id: Some(1),
+                },
+            },
+            last: true,
+            mix: None,
+        };
+        assert!(hand_over(&finish, job, jobs).is_err());
+    }
+
+    /// A section converted before (its spool gone, its audio there) counts
+    /// as converted: converting again after a restart does not fail it.
+    #[test]
+    fn a_section_converted_before_counts() {
+        let d = dir("before");
+        let spool = d.join("m.mixpcm");
+        std::fs::write(spool.with_extension("wav"), b"RIFF").unwrap();
+        let job = MixJob {
+            recording_id: "rec-1".into(),
+            spools: vec![spool.clone()],
+            starts: vec![0],
+            tracks: Vec::new(),
+        };
+        let settings = Settings {
+            format: Format::Wav,
+            ..Settings::default()
+        };
+        let meta = super::super::Meta {
+            call_id: "mixer-1".into(),
+            from_tag: "rec-1".into(),
+            to_tag: None,
+            section: 1,
+            left_port: 0,
+            opus_pts: Vec::new(),
+            amr_pts: Vec::new(),
+            amr_wb_pts: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            mixer_id: Some(1),
+        };
+        assert!(matches!(
+            convert_one(&spool, (1, 0), &job, &settings, &meta),
+            Converted::Before(_)
+        ));
+        assert!(matches!(
+            convert_one(&d.join("none.mixpcm"), (1, 0), &job, &settings, &meta),
+            Converted::Nothing
+        ));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     /// A spool becomes a WAV of the asked rate and channels, of its
     /// length; a pcap is refused.
     #[test]
@@ -555,6 +866,7 @@ mod tests {
         let job = MixJob {
             recording_id: "rec-1".into(),
             spools: vec![spool.clone()],
+            starts: vec![1_795_000_000_000],
             tracks: Vec::new(),
         };
         let meta = super::super::Meta {
@@ -575,7 +887,8 @@ mod tests {
             sample_rate: 48_000,
             ..Settings::default()
         };
-        let (out, json) = convert_section(&spool, 1, &job, &settings, &meta).unwrap();
+        let (out, json) =
+            convert_section(&spool, (1, 1_795_000_000_000), &job, &settings, &meta).unwrap();
         let wav = std::fs::read(&out).unwrap();
         assert_eq!(&wav[..4], b"RIFF");
         assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2, "stereo");
@@ -594,7 +907,7 @@ mod tests {
             format: Format::Pcap,
             ..settings
         };
-        assert!(convert_section(&spool, 1, &job, &pcap, &meta).is_err());
+        assert!(convert_section(&spool, (1, 1_795_000_000_000), &job, &pcap, &meta).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

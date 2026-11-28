@@ -214,12 +214,16 @@ impl Control {
             ("whisper", Some(to)) => Role::Whisper(to.clone()),
             _ => Role::Participant,
         };
-        m.role(&ep.id, role);
-        m.mute(&ep.id, seat.muted);
-        m.deafen(&ep.id, seat.deafened);
-        m.gain(&ep.id, seat.input_gain_db);
-        m.output_gain(&ep.id, seat.output_gain_db);
-        Ok(())
+        let taken = m.role(&ep.id, role)
+            & m.mute(&ep.id, seat.muted)
+            & m.deafen(&ep.id, seat.deafened)
+            & m.gain(&ep.id, seat.input_gain_db)
+            & m.output_gain(&ep.id, seat.output_gain_db);
+        if taken {
+            Ok(())
+        } else {
+            Err(NativeError::new(Code::Internal, "the mixer has stopped"))
+        }
     }
 }
 

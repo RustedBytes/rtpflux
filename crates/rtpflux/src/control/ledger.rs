@@ -315,10 +315,13 @@ impl Ledger {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
-        if let Some(dir) = path.parent()
-            && let Ok(d) = std::fs::File::open(dir)
+        // The rename on the disk too. Not fatal: until it is, a crash
+        // leaves the file it replaced, which holds every entry kept here
+        // and more.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+            && let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all())
         {
-            let _ = d.sync_all();
+            log::warn!("ledger: syncing {}: {e}", dir.display());
         }
         let f = std::fs::OpenOptions::new()
             .append(true)
