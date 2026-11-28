@@ -195,8 +195,12 @@ keep_pcap = false
 storage = "local"
 # File names, without the extension: text (letters, digits, . - _ @) and
 # {call_id}, {from_tag}, {to_tag}, {section}, {date}, {time} (UTC) and
-# {timestamp}. A name a file already has gets -2, -3, ..., never reused.
+# {timestamp}; for a conference mixer's recording (native API) also
+# {mixer_id}, {recording_id} and {track}. A name a file already has gets
+# -2, -3, ..., never reused.
 file_name = "{call_id}-{from_tag}-{section}"
+# Conference mixers recorded at once (native API), at most.
+max_mixer_recordings = 64
 
 # Used with storage = "s3".
 [recording.s3]

@@ -204,6 +204,10 @@ pub struct EventFilter {
     /// subscribers, and the logs, never see them.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
+    /// The mixers whose own events (`mixer.destroyed`, a mixer
+    /// recording's outcome) are wanted; empty: every mixer's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mixer_ids: Vec<u64>,
     /// Begin after this cursor (an event's `event_id`, a subscription's
     /// `cursor`, an inventory page's watermark): what came after it is
     /// replayed first.
@@ -237,6 +241,8 @@ pub enum EventKind {
     StreamFlushed,
     StreamEnded,
     MixerSpeaker,
+    /// A mixer was destroyed (its recording's outcome comes after).
+    MixerDestroyed,
     /// Events were missed (`missed` in the data, or `reason:
     /// "reconnected"` after the event connection was made again):
     /// reconcile with `endpoint.list`.
@@ -268,6 +274,7 @@ impl EventKind {
             "stream.flushed" => EventKind::StreamFlushed,
             "stream.ended" => EventKind::StreamEnded,
             "mixer.speaker" => EventKind::MixerSpeaker,
+            "mixer.destroyed" => EventKind::MixerDestroyed,
             "gap" => EventKind::Gap,
             other => EventKind::Other(other.to_owned()),
         }
@@ -282,8 +289,12 @@ pub struct MediaEvent {
     pub event_id: Option<String>,
     /// The run of the relay that gave it.
     pub boot_id: Option<String>,
-    /// The endpoint it is about (`None` for an `ng` party's, or a gap).
+    /// The endpoint it is about (`None` for an `ng` party's, a mixer's
+    /// own event, or a gap).
     pub endpoint_id: Option<String>,
+    /// The mixer a mixer's own event is about (`mixer.destroyed`, a mixer
+    /// recording's outcome).
+    pub mixer_id: Option<u64>,
     pub session_id: Option<String>,
     pub generation: Option<u64>,
     /// Per endpoint, and across all events: a jump is a gap.
@@ -314,6 +325,7 @@ impl MediaEvent {
             event_id: s("event_id"),
             boot_id: s("boot_id"),
             endpoint_id: s("endpoint_id"),
+            mixer_id: n("mixer_id"),
             session_id: s("session_id"),
             generation: n("generation"),
             seq: n("seq"),

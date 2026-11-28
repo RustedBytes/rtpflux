@@ -1,5 +1,6 @@
 //! Writing the mixed audio: WAV (16-bit PCM), FLAC, Ogg Opus (RFC 7845)
-//! and, with the `mp3` feature, MP3. Each pulls blocks from the [`Mixer`],
+//! and, with the `mp3` feature, MP3. Each pulls blocks from a [`Pcm`]
+//! source (a call's [`Mixer`], or a conference mixer's spool),
 //! so memory does not grow with the call's length (FLAC keeps its
 //! compressed stream until the end).
 //!
@@ -7,6 +8,7 @@
 //! form: a `LIST`/`INFO` chunk (WAV), a `VORBIS_COMMENT` block (FLAC),
 //! `OpusTags` comments (Opus), an ID3v2.4 tag (MP3).
 
+#[cfg(doc)]
 use super::mix::Mixer;
 use super::settings::{Format, Settings};
 use std::fs::File;
@@ -20,6 +22,20 @@ fn other(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// Where the audio comes from: frames at the settings' rate and channel
+/// count (interleaved).
+pub(super) trait Pcm {
+    /// Append up to `frames` frames to `out`; returns how many. 0: the
+    /// end.
+    fn fill(&mut self, frames: usize, out: &mut Vec<i16>) -> usize;
+}
+
+impl Pcm for super::mix::Mixer {
+    fn fill(&mut self, frames: usize, out: &mut Vec<i16>) -> usize {
+        super::mix::Mixer::fill(self, frames, out)
+    }
+}
+
 /// Tags: (name, value), names in upper case.
 pub(super) type Tags = [(String, String)];
 
@@ -29,7 +45,7 @@ pub(super) type Tags = [(String, String)];
 ///
 /// I/O errors, or an encoder refusing its settings.
 pub(super) fn encode(
-    mixer: &mut Mixer,
+    mixer: &mut impl Pcm,
     settings: &Settings,
     tags: &Tags,
     path: &Path,
@@ -168,7 +184,7 @@ fn id3(tags: &Tags) -> Vec<u8> {
     tag
 }
 
-fn wav(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
+fn wav(mixer: &mut impl Pcm, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
     let channels = u16::try_from(settings.channels.count()).map_err(other)?;
     let rate = settings.sample_rate;
     let mut w = BufWriter::new(File::create(path)?);
@@ -215,15 +231,15 @@ fn wav(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std:
 }
 
 /// The mixer as a FLAC encoder's sample source.
-struct FlacSource<'m> {
-    mixer: &'m mut Mixer,
+struct FlacSource<'m, P: Pcm> {
+    mixer: &'m mut P,
     channels: usize,
     rate: usize,
     block: Vec<i16>,
     wide: Vec<i32>,
 }
 
-impl flacenc::source::Source for FlacSource<'_> {
+impl<P: Pcm> flacenc::source::Source for FlacSource<'_, P> {
     fn channels(&self) -> usize {
         self.channels
     }
@@ -253,7 +269,12 @@ impl flacenc::source::Source for FlacSource<'_> {
 /// FLAC, written frame by frame as it is encoded (not the whole stream in
 /// memory first): the header goes first, each frame after it, and the
 /// header again at the end with the totals (its size does not change).
-fn flac(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
+fn flac(
+    mixer: &mut impl Pcm,
+    settings: &Settings,
+    tags: &Tags,
+    path: &Path,
+) -> std::io::Result<()> {
     use flacenc::component::BitRepr as _;
     use flacenc::error::Verify as _;
     use flacenc::source::Source as _;
@@ -340,7 +361,12 @@ fn opus_tags(tags: &Tags) -> Vec<u8> {
     t
 }
 
-fn opus(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
+fn opus(
+    mixer: &mut impl Pcm,
+    settings: &Settings,
+    tags: &Tags,
+    path: &Path,
+) -> std::io::Result<()> {
     use ogg::writing::PacketWriteEndInfo;
     let channels = settings.channels.count();
     let rate = settings.sample_rate;
@@ -400,7 +426,7 @@ fn opus(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std
 }
 
 #[cfg(feature = "mp3")]
-fn mp3(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
+fn mp3(mixer: &mut impl Pcm, settings: &Settings, tags: &Tags, path: &Path) -> std::io::Result<()> {
     use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
     let bitrate = match settings.bitrate {
         8 => Bitrate::Kbps8,
@@ -459,7 +485,7 @@ fn mp3(mixer: &mut Mixer, settings: &Settings, tags: &Tags, path: &Path) -> std:
 }
 
 #[cfg(not(feature = "mp3"))]
-fn mp3(_: &mut Mixer, _: &Settings, _: &Tags, _: &Path) -> std::io::Result<()> {
+fn mp3(_: &mut impl Pcm, _: &Settings, _: &Tags, _: &Path) -> std::io::Result<()> {
     Err(other("this build has no MP3 support (cargo feature `mp3`)"))
 }
 

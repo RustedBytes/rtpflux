@@ -11,6 +11,7 @@ pub mod activity;
 pub mod convert;
 mod encode;
 mod mix;
+pub mod mixrec;
 pub mod naming;
 mod read;
 mod resample;
@@ -260,6 +261,7 @@ impl Recorder {
                 pcap: self.file.path.clone(),
                 conversion,
                 last,
+                mix: None,
             };
             match &self.writer {
                 // After the writes still queued.

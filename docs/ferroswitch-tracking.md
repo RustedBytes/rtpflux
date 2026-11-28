@@ -694,3 +694,46 @@ is now fixed in the relay:
   restart, `endpoint.query` reports it, and it is refused together with
   a bridge or a mixer, in either order. Async SDK:
   `MediaClient::echo`. Test: `echo::an_endpoint_hears_itself`.
+
+## Recording a conference mixer
+
+Spec: "recording a conference mixer (rtpflux)", proposed 2026-11-28
+(Ferroswitch upstream issue rtpflux 9). `recording.*` take a `mixer_id`
+(see native-api.md, "Recording a mixer").
+
+How it runs:
+- The mixer thread computes what a `listen` participant hears and hands
+  each 20 ms period to a 5 s queue (`pcm::mixer::MixTap`). It never waits:
+  a full queue loses the period and counts it.
+- A writer thread spools the periods (raw 16 kHz PCM, one file per
+  section). Lost periods are written as silence at their place.
+- At the end, the existing conversion thread turns each section into the
+  chosen format and rate. The encoders now take any PCM source
+  (`recording::encode::Pcm`).
+- Storage (local, S3, webhook) and the outcome events are the endpoint
+  recordings'. The outcome is routed by `Subject::Recording(id)`.
+
+Covered by the spec's acceptance list:
+
+| # | Status | Evidence |
+|---|---|---|
+| 1 | done | `mixrec::the_mix_a_listener_hears`: tones per party (Goertzel), duration within 40 ms of start→stop |
+| 2 | done | same test: muted, listener and whisperer absent; `include_whispers` adds the whisperer (mutation-checked) |
+| 3 | done | same test: a participant leaving, silence in the middle, `participants` intervals |
+| 4 | done, but the timeout branch is not tested | `mixrec::pauses_sensitivity_restart_and_keys`: confirmed pause, the section shorter by the pauses (mutation-checked). A pause the mixer does not confirm in time is not provoked by any test |
+| 5 | done | same test: a sensitive participant pauses it; the controller's pause survives sensitivity going away |
+| 6 | done | first test: `mixer.destroyed` then `recording.completed`; `recording.query` answers |
+| 7 | partly | same test: a restart goes on in section 2, listed in `restored_mixer_recordings`, a file per section. The "mixer not restored" path (finished, reported `lost`) is implemented but not tested |
+| 8 | unit level | `pcm::mixer` test: a full queue loses and counts, numbering goes on; `recording::mixrec` test: the writer fills lost periods with silence. No end-to-end run with a deliberately slow writer |
+| 9 | not tested | `[ha]` fencing is the generic one: a request naming `mixer_id` must prove the mixer's group |
+| 10 | done | same test: one recording for one key; `operation.query` lists its `recording_id` |
+| 11 | not tested | same storage code path as endpoint recordings |
+| 12 | not done | `tracks: true` (P1) is refused with `unsupported` |
+| 13 | not done | no load run (50 mixers × 5) yet |
+
+Also added:
+- `mixer.destroyed` event;
+- mixer events (with `mixer_id`, no `endpoint_id`) reach subscriptions that name no endpoints or sessions, filtered by `mixer_ids`;
+- the `{mixer_id}`, `{recording_id}` and `{track}` file-name placeholders;
+- `[recording] max_mixer_recordings` (64);
+- the async SDK has `EventKind::MixerDestroyed`, `MediaEvent::mixer_id` and `EventFilter::mixer_ids`.

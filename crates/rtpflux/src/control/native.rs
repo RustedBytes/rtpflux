@@ -101,7 +101,7 @@ pub const OPERATIONS: [&str; 42] = [
 ];
 
 /// The events of version 1.
-pub const EVENTS: [&str; 20] = [
+pub const EVENTS: [&str; 21] = [
     "endpoint.ready",
     "endpoint.failed",
     "endpoint.timeout",
@@ -122,6 +122,7 @@ pub const EVENTS: [&str; 20] = [
     "stream.flushed",
     "stream.ended",
     "mixer.speaker",
+    "mixer.destroyed",
 ];
 
 /// An error's kind, on the wire.
@@ -310,6 +311,11 @@ pub struct Recording {
     /// confirmed them (the recording holds nothing in between).
     #[serde(default)]
     pub pauses: Vec<(u64, Option<u64>)>,
+    /// A conference mixer's recording (`endpoint_id` is empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<super::mixrec::MixRec>,
 }
 
 /// An endpoint destroyed: by whom, its generation, and when.
@@ -332,6 +338,9 @@ struct Filter {
     all_parties: bool,
     /// Sensitive digits as they are (others get them redacted).
     sensitive: bool,
+    /// The mixers whose own events (`mixer.destroyed`, a mixer
+    /// recording's) it wants; none: every mixer of the tenant.
+    mixers: Vec<u64>,
 }
 
 impl Filter {
@@ -350,6 +359,16 @@ impl Filter {
                     && (self.sessions.is_empty()
                         || field("session_id")
                             .is_some_and(|s| self.sessions.iter().any(|x| x == s)))
+            }
+            // A mixer's own event: unless the filter names endpoints or
+            // sessions only.
+            None if event.get("mixer_id").is_some() => {
+                let mixer = event.get("mixer_id").and_then(Json::as_u64);
+                if self.mixers.is_empty() {
+                    self.endpoints.is_empty() && self.sessions.is_empty()
+                } else {
+                    mixer.is_some_and(|m| self.mixers.contains(&m))
+                }
             }
             None => self.all_parties && self.endpoints.is_empty(),
         }
@@ -457,6 +476,14 @@ pub struct Native {
     /// Endpoints' IVR state: DTMF policy, sensitive digits, playback
     /// queues.
     pub(super) ivr: HashMap<String, super::ivr::Ivr>,
+    /// Mixer recordings going on: their writers' counters and hand-over.
+    pub(super) mixrecs: HashMap<String, super::mixrec::Running>,
+    /// Mixer recordings restored, to resume at the first pass.
+    pub(super) mixrec_pending: bool,
+    /// Conference mixers recorded at once, at most.
+    pub(super) max_mixer_recordings: usize,
+    /// Mixer recordings resumed after the restart.
+    pub(super) restored_mixer_recordings: Vec<String>,
     /// How finished playbacks ended, the latest [`super::ivr::ENDED_MAX`].
     pub(super) playbacks_ended: super::ivr::Ended,
     /// Requests per second per tenant.
@@ -822,7 +849,7 @@ impl Native {
     }
 
     /// Hand `event` to the subscribers that want it.
-    fn publish(&mut self, mut event: Json) {
+    pub(super) fn publish(&mut self, mut event: Json) {
         self.global_seq += 1;
         let seq = self.global_seq;
         let journaled = event.get("event").and_then(Json::as_str) != Some("gap");
@@ -913,8 +940,9 @@ impl Control {
     /// the reply, as JSON text.
     pub fn native_request(&mut self, message: &[u8], origin: &Origin) -> Vec<u8> {
         self.native.expire();
-        // After a restart, the mixers are back before any request sees them.
-        if !self.native.pending_mixers.is_empty() {
+        // After a restart, the mixers (and their recordings) are back
+        // before any request sees them.
+        if !self.native.pending_mixers.is_empty() || self.native.mixrec_pending {
             self.rebuild_mixers();
         }
         let parsed: Result<Json, _> = serde_json::from_slice(message);
@@ -1740,8 +1768,12 @@ impl Control {
             }
             e != id
         });
+        let mixers = self.mixers_of(id);
         for (_, m) in self.native.mixers.values_mut() {
             m.remove(id);
+        }
+        for m in mixers {
+            self.mixrec_sync(m);
         }
         self.endpoint_event(
             id,
@@ -2156,6 +2188,12 @@ impl Control {
     }
 
     fn native_record(&mut self, req: &Request<'_>, start: bool) -> Result<Json, NativeError> {
+        if req.body.contains_key("mixer_id") {
+            if req.body.contains_key("endpoint_id") {
+                return Err(NativeError::invalid("endpoint_id or mixer_id, not both"));
+            }
+            return self.native_mixrec(req, start);
+        }
         let ep = self.endpoint(req)?;
         let mut entries = if start { options(req)? } else { Vec::new() };
         entries.push((b"call-id".to_vec(), bytes(ep.session.as_bytes())));
@@ -2190,6 +2228,8 @@ impl Control {
                         started_unix_ms: now,
                         ended_unix_ms: None,
                         pauses: Vec::new(),
+                        mixer_id: None,
+                        mix: None,
                     },
                 );
                 id
@@ -2251,6 +2291,10 @@ impl Control {
                 .get("sensitive")
                 .and_then(Json::as_bool)
                 .unwrap_or(false),
+            mixers: match req.body.get("mixer_ids") {
+                Some(Json::Array(a)) => a.iter().filter_map(Json::as_u64).collect(),
+                _ => Vec::new(),
+            },
         };
         self.native.next_subscription += 1;
         let id = self.native.next_subscription;
@@ -2420,6 +2464,9 @@ impl Control {
                             .as_bytes()
                             .to_vec(),
                     )),
+                    // A mixer recording's outcome: `recording.query` has it
+                    // from the record.
+                    Subject::Recording(_) => None,
                 };
                 if let Some((_, tag)) = party
                     && let Ok(id) = String::from_utf8(tag)
@@ -2473,6 +2520,10 @@ impl Control {
     }
 
     fn media_event(&mut self, e: &MediaEvent) {
+        if let Subject::Recording(id) = &e.subject {
+            self.mixrec_outcome(id, &e.kind);
+            return;
+        }
         if let Some((id, pb, op)) = self.note_playback_end(e) {
             self.endpoint_event(
                 &id,
@@ -2561,6 +2612,7 @@ impl Control {
                     .unwrap_or(from_tag);
                 Some((call_id.as_bytes().to_vec(), tag.as_bytes().to_vec()))
             }
+            Subject::Recording(_) => None,
         };
         let Some((call, tag)) = party else {
             return;
@@ -3273,10 +3325,18 @@ impl Control {
             None => return Err(NativeError::new(Code::NotFound, format!("mixer {id}"))),
         }
         if req.op == "mixer.destroy" {
-            let Some((_, m)) = self.native.mixers.remove(&id) else {
+            // Its recording ends first (its outcome comes after
+            // `mixer.destroyed`).
+            if let Some(rid) = self.mixer_recording(id) {
+                self.stop_mixrec(&rid);
+            }
+            let Some((tenant, m)) = self.native.mixers.remove(&id) else {
                 return Ok(json!({"destroyed": false}));
             };
             m.stop();
+            self.native
+                .publish(json!({"event": "mixer.destroyed", "mixer_id": id,
+                "tenant": tenant, "data": {"mixer_id": id, "reason": "request"}}));
             for key in &m.participants {
                 if let Some(ep) = self.native.endpoints.get(key).cloned()
                     && let Ok((leg, ..)) = self.endpoint_audio(&ep)

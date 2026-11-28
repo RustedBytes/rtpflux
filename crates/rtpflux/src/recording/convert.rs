@@ -34,6 +34,9 @@ pub struct Meta {
     /// `metadata`): in the JSON and the audio file's tags.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub metadata: std::collections::BTreeMap<String, String>,
+    /// A conference mixer's recording (its spool, not a pcap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer_id: Option<u32>,
 }
 
 impl Meta {
@@ -71,6 +74,8 @@ pub struct Job {
     pub pcap: PathBuf,
     pub conversion: Conversion,
     pub last: bool,
+    /// A mixer recording's sections (then `pcap` is unused).
+    pub mix: Option<super::mixrec::MixJob>,
 }
 
 /// One party, in the JSON file.
@@ -216,6 +221,10 @@ pub fn run(
         }
     };
     for job in jobs {
+        if let Some(mix) = &job.mix {
+            super::mixrec::run(mix, &job.conversion, store, events);
+            continue;
+        }
         if !job.last && resumable {
             log::debug!("recording: {} kept, to be continued", job.pcap.display());
             continue;
@@ -345,9 +354,11 @@ mod tests {
                     amr_pts: Vec::new(),
                     amr_wb_pts: Vec::new(),
                     metadata: std::collections::BTreeMap::new(),
+                    mixer_id: None,
                 },
             },
             last: false,
+            mix: None,
         };
         let wav = output_path(&pcap, Format::Wav);
         for (resumable, converted) in [(true, false), (false, true)] {
@@ -404,6 +415,7 @@ mod tests {
                 amr_pts: Vec::new(),
                 amr_wb_pts: Vec::new(),
                 metadata: std::collections::BTreeMap::new(),
+                mixer_id: None,
             },
         };
         let e = convert(&pcap, &c).unwrap_err();

@@ -33,6 +33,15 @@
 //!
 //! At most [`MAX_PARTICIPANTS`]. The mix is wideband (16 kHz): G.722,
 //! Opus and AMR-WB participants hear it so, the others narrowband.
+//!
+//! A mixer can be **recorded** ([`MixerHandle::record`]): each period, the
+//! mix a listener hears (the sum of the participants heard by everyone,
+//! through a limiter of its own; whisperers too with `include_whispers`)
+//! goes to the recording's bounded queue as one [`MixBlock`], numbered by
+//! its period. A full queue drops the block and counts it: the conference
+//! never waits for the recording. A pause ([`MixerHandle::pause_recording`])
+//! is answered once the mixer has taken it: no block after the answer
+//! belongs to the pause.
 
 use super::receive::Receive;
 use super::stream::{Encoded, INJECT_QUEUE, MAX_ENCODED, RtpCopy, WorkerEnd, encoder_for};
@@ -86,8 +95,34 @@ pub enum Role {
     Whisper(String),
 }
 
+/// One period of a recorded mix: its number (from 0, counted while
+/// recording and not paused) and its 20 ms at 16 kHz.
+#[derive(Clone, Copy)]
+pub struct MixBlock {
+    pub tick: u64,
+    pub pcm: [i16; MIX_FRAME],
+}
+
+/// Samples per [`MixBlock`], and their rate.
+pub const BLOCK_SAMPLES: usize = MIX_FRAME;
+pub const BLOCK_RATE: u32 = MIX_RATE;
+
+/// Where a mixer's recording goes.
+pub struct MixTap {
+    pub blocks: SyncSender<MixBlock>,
+    /// Whisperers in the recording too (compliance).
+    pub include_whispers: bool,
+    /// Blocks the queue had no room for.
+    pub lost: Arc<AtomicU64>,
+    /// Starts paused (a paused recording restored after a restart).
+    pub paused: bool,
+}
+
 /// What the control side asks of a mixer thread.
 enum Ask {
+    Record(Option<MixTap>),
+    /// Pause (or resume) the recording; answered once taken.
+    RecordPause(bool, SyncSender<()>),
     Add(Box<Participant>),
     Remove(String),
     Mute(String, bool),
@@ -307,6 +342,23 @@ impl MixerHandle {
         let _ = self.asks.send(Ask::Gain(key.to_owned(), db));
     }
 
+    /// Record the mix into `tap` (`None`: stop recording; the queue's
+    /// sender is let go, after the last block).
+    pub fn record(&self, tap: Option<MixTap>) {
+        let _ = self.asks.send(Ask::Record(tap));
+    }
+
+    /// Pause (or resume) the recording, waiting at most `wait` for the
+    /// mixer to take it; whether it did.
+    #[must_use]
+    pub fn pause_recording(&self, pause: bool, wait: Duration) -> bool {
+        let (tx, rx) = sync_channel(1);
+        if self.asks.send(Ask::RecordPause(pause, tx)).is_err() {
+            return false;
+        }
+        rx.recv_timeout(wait).is_ok()
+    }
+
     /// Stop the mixer.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -345,10 +397,32 @@ fn q8(db: i32) -> u16 {
     u16::try_from((db_to_q16(db) + 128) >> 8).unwrap_or(u16::MAX)
 }
 
+/// A mixer's recording, on its thread.
+struct Recording {
+    tap: MixTap,
+    paused: bool,
+    tick: u64,
+    limiter: Limiter,
+}
+
 /// Apply what the control side asked.
-fn apply(asks: &Receiver<Ask>, parts: &mut Vec<Participant>) {
+fn apply(asks: &Receiver<Ask>, parts: &mut Vec<Participant>, rec: &mut Option<Recording>) {
     while let Ok(a) = asks.try_recv() {
         match a {
+            Ask::Record(tap) => {
+                *rec = tap.map(|tap| Recording {
+                    paused: tap.paused,
+                    tap,
+                    tick: 0,
+                    limiter: Limiter::new(Rate::Hz16000),
+                });
+            }
+            Ask::RecordPause(pause, done) => {
+                if let Some(r) = rec {
+                    r.paused = pause;
+                }
+                let _ = done.try_send(());
+            }
             Ask::Add(p) => parts.push(*p),
             Ask::Remove(k) => parts.retain(|p| p.key != k),
             Ask::Mute(k, m) => {
@@ -398,10 +472,12 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
     let mut next = start;
     let mut speaker: Option<String> = None;
     let mut speaker_since = 0u64;
+    let mut rec: Option<Recording> = None;
+    let mut acc = [0i32; MIX_FRAME];
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
         next += Duration::from_millis(20);
-        apply(asks, &mut parts);
+        apply(asks, &mut parts, &mut rec);
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(0);
         if mixer.begin(MIX_FRAME).is_err() {
             break;
@@ -430,6 +506,10 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
                 _ => None,
             })
             .collect();
+        // The recording: what a listener hears.
+        if let Some(r) = rec.as_mut().filter(|r| !r.paused) {
+            record(r, &mixer, &parts, &mut acc);
+        }
         // Each one hears the others.
         for (i, p) in parts.iter_mut().enumerate() {
             let whisper = whispers
@@ -493,9 +573,72 @@ fn run(id: u32, asks: &Receiver<Ask>, stop: &AtomicBool, events: &MediaEvents) {
     }
 }
 
+/// This period's mix into recording `r`: the sum (participants heard by
+/// everyone), whisperers too if asked, limited; a full queue loses it.
+fn record(
+    r: &mut Recording,
+    mixer: &Mixer<MAX_PARTICIPANTS>,
+    parts: &[Participant],
+    acc: &mut [i32; MIX_FRAME],
+) {
+    for (a, &s) in acc.iter_mut().zip(mixer.sum()) {
+        *a = s;
+    }
+    if r.tap.include_whispers {
+        for p in parts
+            .iter()
+            .filter(|p| !p.muted && matches!(p.role, Role::Whisper(_)))
+        {
+            let g = i32::from(q8(p.gain_db));
+            for (a, &x) in acc.iter_mut().zip(&p.frame) {
+                *a = a.wrapping_add((i32::from(x) * g) >> 8);
+            }
+        }
+    }
+    let mut block = MixBlock {
+        tick: r.tick,
+        pcm: [0; MIX_FRAME],
+    };
+    r.limiter.process(acc, &mut block.pcm);
+    r.tick += 1;
+    if let Err(TrySendError::Full(_)) = r.tap.blocks.try_send(block) {
+        r.tap.lost.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording whose queue is full loses the period and counts it;
+    /// the periods go on being numbered (the writer fills the gap).
+    #[test]
+    fn a_full_recording_queue_loses_and_counts() {
+        let (tx, rx) = sync_channel(1);
+        let lost = Arc::new(AtomicU64::new(0));
+        let mut r = Recording {
+            tap: MixTap {
+                blocks: tx,
+                include_whispers: false,
+                lost: Arc::clone(&lost),
+                paused: false,
+            },
+            paused: false,
+            tick: 0,
+            limiter: Limiter::new(Rate::Hz16000),
+        };
+        let mut mixer: Box<Mixer<MAX_PARTICIPANTS>> = Box::default();
+        let mut acc = [0i32; MIX_FRAME];
+        for _ in 0..3 {
+            mixer.begin(MIX_FRAME).unwrap();
+            record(&mut r, &mixer, &[], &mut acc);
+        }
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "no room for two");
+        assert_eq!(rx.try_recv().unwrap().tick, 0);
+        mixer.begin(MIX_FRAME).unwrap();
+        record(&mut r, &mixer, &[], &mut acc);
+        assert_eq!(rx.try_recv().unwrap().tick, 3, "numbered on");
+    }
 
     #[test]
     fn unity_gain_is_256() {

@@ -50,6 +50,7 @@ mod keys;
 pub mod ledger;
 mod legacy;
 mod media;
+mod mixrec;
 pub mod native;
 mod offer;
 mod opts;
@@ -570,6 +571,12 @@ impl Control {
         self.recording_meta = metadata;
     }
 
+    /// Conference mixers recorded at once, at most
+    /// (`[recording] max_mixer_recordings`).
+    pub fn set_max_mixer_recordings(&mut self, max: usize) {
+        self.native.max_mixer_recordings = max;
+    }
+
     /// Write the dialogs to `path` after every change ([`Control::save`]).
     pub fn set_state_file(&mut self, path: Option<std::path::PathBuf>) {
         // The tombstones' own file, next to it ([`tomblog`]).
@@ -697,7 +704,7 @@ impl Control {
         self.native_flush_gaps();
         self.ownership_prune();
         self.ivr_prune();
-        if !self.native.pending_mixers.is_empty() {
+        if !self.native.pending_mixers.is_empty() || self.native.mixrec_pending {
             self.rebuild_mixers();
         }
         let ended = self.relay.take_ended();

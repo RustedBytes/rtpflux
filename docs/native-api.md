@@ -635,7 +635,7 @@ a core, where two threads per stream (200 threads) used 11.6–12.6%.
 | `mixer.add` | `mixer_id`, `endpoint_id`, `role` (optional) | `participants` |
 | `mixer.remove` | `mixer_id`, `endpoint_id` | `removed` |
 | `mixer.set` | `mixer_id`, `endpoint_id`, `muted`, `deafened`, `input_gain_db` (or `gain_db`, −60 to +24), `output_gain_db` (−60 to +24), `role`, `whisper_to` | `set` |
-| `mixer.destroy` | `mixer_id` | `destroyed` |
+| `mixer.destroy` | `mixer_id` | `destroyed`; `mixer.destroyed` follows (its recording, if any, is stopped first) |
 
 A mixer gives each participant the sum of everyone else (N − 1 mixing),
 on a thread of its own. Every 20 ms it does the following:
@@ -697,6 +697,79 @@ endpoint did not come back is reported in `lost`
 (jitter buffers, the active speaker), and taps are not restored, as no
 PCM stream is.
 
+### Recording a mixer
+
+The recording operations take a `mixer_id` instead of an `endpoint_id`.
+A request naming both is refused (`invalid`).
+
+| Operation | Fields | Result |
+|---|---|---|
+| `recording.start` | `mixer_id`, `options` (`format`, `sample_rate`, `channels`, `bitrate`, `include_whispers`, `metadata`) | `recording`, `recording_id`, `mixer_id` |
+| `recording.stop` | `mixer_id` | `recording`, `recording_id`, `mixer_id`, `state` (`stopped` until the files are made) |
+| `recording.pause`, `recording.resume` | `mixer_id` | `recording_id`, `mixer_id`, `state`, `changed`, `pauses` |
+| `recording.query` | `recording_id` | As an endpoint recording's, with `mixer_id` instead of `endpoint_id`, and `participants`, `duration_ms`, `lost_ms`, `section`, `files`, `options` |
+
+- **What is recorded** is what a `listen` participant hears: every
+  participant heard by everyone, at its input gain, through a limiter.
+  Muted, `listen` and `whisper` participants are not in it, unless
+  `include_whispers: true` adds the whisperers (for compliance). A
+  deafened participant is in it: deafening changes what it hears, not
+  what it says. Output gains do not apply.
+- **The timeline** is continuous from start to stop, one 20 ms period at
+  a time at the mixer's 16 kHz, resampled to `sample_rate`: silence when
+  no one speaks, participants joining and leaving change the sum, not
+  the timeline. The mix is taken in the same period the participants
+  hear it, and recording adds no latency to the conference.
+- **Options.** `format` and `sample_rate` default to `[recording]`'s; a
+  `[recording] format` of `pcap` gives WAV (a mixer has no packets, and
+  `format: "pcap"` is refused). `channels` is `mono` (the default) or
+  `stereo` (the same mix on both). `metadata` adds tags to
+  `[recording.metadata]`'s. `tracks` (one file per participant) is not
+  supported yet: refused with `unsupported`. Any other option is
+  `invalid`.
+- **One at a time.** Starting again while a mixer records gives the same
+  `recording_id`. At most `[recording] max_mixer_recordings` (64)
+  mixers record at once; beyond, `exhausted`. With an `idempotency_key`
+  the operation is in the ledger, and `operation.query` lists its
+  `recording_id`.
+- **Pauses** count once the mixer has taken them, as an endpoint
+  recording's once its media workers have: `paused` then, with the time
+  in `pauses`; if the mixer does not confirm within a second, `timeout`
+  and the recording stays `pausing`. A pause holds nothing: the file is
+  shorter by it. While any participant's endpoint is sensitive
+  (`endpoint.sensitive`), the recording is paused, and resumed when none
+  is, unless the controller paused it itself.
+- **Participants**: each endpoint that was in the mixer while it
+  recorded, with its `external_id` and its `[joined_at, left_at]`
+  intervals (ms since the epoch). The list is also in the files' tags
+  (`PARTICIPANTS`), with `MIXER_ID` and `RECORDING_ID`.
+- **The end.** `recording.stop` (or `mixer.destroy`) ends it; its writer
+  writes what is queued, and the audio is converted like an endpoint
+  recording's: the file in `[recording] dir` with its JSON report,
+  stored locally or on S3, with the upload webhook. Then
+  `recording.completed` (or `recording.failed`), a mixer event (see
+  [Events](#events)): `recording_id`, `mixer_id`, `file` (the first
+  section's), `files` (every section's), `uploaded`, `section`,
+  `duration_ms`, `lost_ms`. After `mixer.destroy` it comes after
+  `mixer.destroyed`, and `recording.query` keeps answering.
+- **File names**: `[recording] file_name` with `{mixer_id}`,
+  `{recording_id}` and `{track}` (empty for the mix); with the default
+  `file_name`, a mixer recording is called
+  `mixer-{mixer_id}-{recording_id}-{section}{track}`.
+- **Backpressure.** The mixer hands each period to a queue of 5 s and
+  never waits for it. A period the queue has no room for is lost:
+  silence at its place in the file, counted in `lost_ms`, and logged
+  once per recording.
+- **A restart.** A recording whose mixer is rebuilt goes on in a new
+  section (a new file, `section` one more): the downtime is between the
+  files, not silence inside one. A paused one stays paused.
+  `recovery.report` lists them in `restored_mixer_recordings`. One
+  whose mixer did not come back is finished with what it holds, and
+  reported in `lost` (`kind: "mixer_recording"`).
+- **Tenancy and `[ha]`**: the mixer must be the requester's
+  (`unauthorized`), and under `[ha]` the request must prove the mixer's
+  group, as every operation naming a `mixer_id`.
+
 ## Media composition
 
 What processes an endpoint's audio is a small graph, built only when
@@ -711,7 +784,7 @@ transcoding and XDP paths, untouched.
 | Tap on a participant | `stream.start` on a participant | the mixer (copy), the PCM shards (the rest) |
 | Mixing (N − 1, roles, gains) | `mixer.add` | the mixer's thread |
 | Injection (PCM in), encode | `stream.start` with `inject`, a mixer seat | the PCM shards or the mixer, then the media worker |
-| Recording | `recording.start` | the media worker (relayed media only) |
+| Recording | `recording.start` | the media worker (relayed media only); a mixer's: the mixer (copy), a writer thread, then the conversion thread |
 
 **Rules.**
 - **Ownership.** Each node belongs to the endpoint's tenant, and under
@@ -747,7 +820,13 @@ transcoding and XDP paths, untouched.
 - `all_parties`: also events about ng parties, which are not endpoints;
   these carry `call_id` and `tag` instead of `endpoint_id`;
 - `sensitive`: sensitive digits as they are, not redacted (see
-  [IVR](#ivr-keys-tones-detectors-and-sensitive-digits)).
+  [IVR](#ivr-keys-tones-detectors-and-sensitive-digits));
+- `mixer_ids`: the mixers whose own events are wanted.
+
+A mixer's own events (`mixer.destroyed`, a mixer recording's
+`recording.completed` and `recording.failed`) carry `mixer_id` and no
+`endpoint_id`. A subscription gets them unless it names only
+`endpoint_ids` or `session_ids`; with `mixer_ids`, only those mixers'.
 
 The reply has `subscription_id` and the current `global_seq`. Events then
 arrive on the same connection, between replies, until the connection
@@ -779,6 +858,7 @@ subscriber sees only its own tenant's events.
 | `stream.flushed` | `stream_id`, `generation`, `played_ms` |
 | `stream.ended` | `stream_id` |
 | `mixer.speaker` | `mixer_id` |
+| `mixer.destroyed` | `mixer_id`, `reason` (a mixer event) |
 | `gap` | `missed` (and `source: "media"` when the relay's own queue overflowed) |
 
 **DTMF.**

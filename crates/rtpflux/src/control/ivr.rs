@@ -468,10 +468,15 @@ impl Control {
             }
             false
         };
-        let ivr = self.native.ivr.entry(ep.id).or_default();
+        let ivr = self.native.ivr.entry(ep.id.clone()).or_default();
         ivr.sensitive = on;
         ivr.recording_paused = on && (paused || ivr.recording_paused);
-        Ok(json!({"sensitive": on, "recording_paused": ivr.recording_paused}))
+        let recording_paused = ivr.recording_paused;
+        // The recordings of the mixers it is in follow.
+        for m in self.mixers_of(&ep.id) {
+            self.mixrec_sync(m);
+        }
+        Ok(json!({"sensitive": on, "recording_paused": recording_paused}))
     }
 
     /// Whether an endpoint's event `ty` is delivered, by its DTMF policy,

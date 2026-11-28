@@ -102,6 +102,8 @@ pub enum Subject {
         from_tag: String,
         section: usize,
     },
+    /// A native API recording by its id (a conference mixer's).
+    Recording(String),
 }
 
 /// One event: what it concerns, and when (Unix milliseconds).

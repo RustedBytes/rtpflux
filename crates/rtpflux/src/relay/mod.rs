@@ -264,6 +264,13 @@ fn shard_ports(
 }
 
 impl Relay {
+    /// Where finished recordings go to be converted (none without a
+    /// converter).
+    #[must_use]
+    pub fn recording_jobs(&self) -> Option<std::sync::mpsc::Sender<crate::recording::Job>> {
+        self.converter.as_ref().map(|(jobs, _)| jobs.clone())
+    }
+
     /// Start one worker per shard. Buffers, tables and queues are allocated
     /// here, once.
     ///

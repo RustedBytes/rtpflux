@@ -319,6 +319,9 @@ impl Control {
                         to_tag: to_tag.as_deref(),
                         section: i + 1,
                         unix_s: super::unix_now(),
+                        mixer_id: None,
+                        recording_id: None,
+                        track: "",
                     };
                     let base = crate::recording::naming::render(&template, &fields);
                     let path = free_path(&dir, &base, file);
@@ -586,6 +589,7 @@ pub(super) fn recording_spec(
             amr_pts: st.amr.iter().flatten().map(|p| p.get()).collect(),
             amr_wb_pts: st.amr_wb.iter().flatten().map(|p| p.get()).collect(),
             metadata,
+            mixer_id: None,
         },
     });
     crate::recording::Spec { path, conversion }

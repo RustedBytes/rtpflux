@@ -606,6 +606,7 @@ fn control_for(relay: Relay, config: &Config) -> Control {
         &config.recording.file_name,
         config.recording.metadata.clone(),
     );
+    control.set_max_mixer_recordings(config.recording.max_mixer_recordings);
     let restored = control.restore();
     if restored > 0 {
         log::info!("restored {restored} call(s) from the saved state");

@@ -114,6 +114,12 @@ impl Control {
         req: &Request<'_>,
         pause: bool,
     ) -> Result<Json, NativeError> {
+        if req.body.contains_key("mixer_id") {
+            if req.body.contains_key("endpoint_id") {
+                return Err(NativeError::invalid("endpoint_id or mixer_id, not both"));
+            }
+            return self.native_mixrec_pause(req, pause);
+        }
         let id = req.need("endpoint_id")?;
         let ep = match self.native.endpoints.get(id) {
             Some(ep) if ep.tenant == req.tenant => ep.clone(),

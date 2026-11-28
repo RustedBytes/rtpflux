@@ -118,6 +118,8 @@ impl Control {
             _ => {}
         }
         self.mark_dirty();
+        // Its recording's participants (and sensitivity) follow.
+        self.mixrec_sync(id);
     }
 
     /// The plans of the mixers that still exist, their seats' endpoints
@@ -183,6 +185,10 @@ impl Control {
                     ..plan
                 },
             );
+        }
+        // Their recordings: a new section, or finished.
+        if std::mem::take(&mut self.native.mixrec_pending) {
+            self.mixrec_restore();
         }
         self.mark_dirty();
     }

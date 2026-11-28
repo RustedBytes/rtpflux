@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 /// The default file name: what rtpflux always called recordings.
 pub const DEFAULT_FILE_NAME: &str = "{call_id}-{from_tag}-{section}";
 
+/// The default file name of a conference mixer's recording.
+pub const DEFAULT_MIXER_FILE_NAME: &str = "mixer-{mixer_id}-{recording_id}-{section}{track}";
+
 /// The placeholders a file name may hold.
-pub const PLACEHOLDERS: [&str; 7] = [
+pub const PLACEHOLDERS: [&str; 10] = [
     "call_id",
     "from_tag",
     "to_tag",
@@ -17,6 +20,9 @@ pub const PLACEHOLDERS: [&str; 7] = [
     "date",
     "time",
     "timestamp",
+    "mixer_id",
+    "recording_id",
+    "track",
 ];
 
 /// The most metadata entries a recording carries, and their sizes.
@@ -34,6 +40,12 @@ pub struct Fields<'a> {
     pub section: usize,
     /// When the recording starts, seconds since the Unix epoch (UTC).
     pub unix_s: u64,
+    /// A mixer recording's mixer (`-` otherwise).
+    pub mixer_id: Option<u32>,
+    /// The native API's recording id (`-` without one).
+    pub recording_id: Option<&'a str>,
+    /// A per-participant track's endpoint id (empty for the mix).
+    pub track: &'a str,
 }
 
 /// Why a file-name template cannot be used.
@@ -171,6 +183,14 @@ pub fn render(template: &str, f: &Fields<'_>) -> String {
             "date" => out.push_str(&date),
             "time" => out.push_str(&time),
             "timestamp" => out.push_str(&f.unix_s.to_string()),
+            "mixer_id" => match f.mixer_id {
+                Some(m) => out.push_str(&m.to_string()),
+                None => out.push('-'),
+            },
+            "recording_id" => out.push_str(&super::name_part(
+                f.recording_id.map_or(b"-".as_slice(), str::as_bytes),
+            )),
+            "track" => out.push_str(&super::name_part(f.track.as_bytes())),
             _ => {}
         }
         rest = &rest[open + close + 1..];
@@ -240,8 +260,15 @@ pub fn tags(meta: &super::Meta, started_ms: u64) -> Vec<(String, String)> {
     let mut t: BTreeMap<String, String> = BTreeMap::new();
     t.insert(
         "TITLE".into(),
-        format!("{} ({})", meta.call_id, meta.section),
+        match meta.mixer_id {
+            Some(m) => format!("mixer {m} ({})", meta.section),
+            None => format!("{} ({})", meta.call_id, meta.section),
+        },
     );
+    if let Some(m) = meta.mixer_id {
+        t.insert("MIXER_ID".into(), m.to_string());
+        t.insert("RECORDING_ID".into(), meta.from_tag.clone());
+    }
     t.insert("CALL_ID".into(), meta.call_id.clone());
     t.insert("FROM_TAG".into(), meta.from_tag.clone());
     if let Some(to) = &meta.to_tag {
@@ -288,6 +315,9 @@ mod tests {
             to_tag: None,
             section: 2,
             unix_s: 1_795_609_499, // 2026-11-25 12:24:59 UTC
+            mixer_id: None,
+            recording_id: None,
+            track: "",
         };
         assert_eq!(render(DEFAULT_FILE_NAME, &f), "abc_.._d@x-f1-2");
         assert_eq!(
@@ -295,6 +325,14 @@ mod tests {
             "2026-11-25_122459---2"
         );
         assert_eq!(render("rec-{timestamp}", &f), "rec-1795609499");
+        assert_eq!(render("{mixer_id}-{recording_id}{track}", &f), "---");
+        let m = Fields {
+            mixer_id: Some(7),
+            recording_id: Some("rec-ab"),
+            ..f
+        };
+        assert_eq!(render(DEFAULT_MIXER_FILE_NAME, &m), "mixer-7-rec-ab-2");
+        assert_eq!(check_file_name(DEFAULT_MIXER_FILE_NAME), None);
     }
 
     #[test]

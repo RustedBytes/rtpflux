@@ -50,7 +50,9 @@ proxy is set up.
   - events: DTMF, announcements, recordings, ICE, DTLS, speech, bridges;
   - PCM streams to external audio services (speech recognition, voice
     bots), with barge-in and playout marks;
-  - N − 1 conference mixing with active-speaker events.
+  - N − 1 conference mixing with active-speaker events, and recording
+    of the conference's mix;
+  - echo (an endpoint hears itself), for echo tests.
 
   A Rust client is in `crates/rtpflux-client`. See
   [Media engine](docs/media-engine.md) for its status.

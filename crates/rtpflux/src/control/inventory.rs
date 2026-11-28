@@ -42,6 +42,7 @@ impl native::Native {
         let mut n = Self::default();
         n.boot_id = native::random_id("boot-");
         n.journal_cap = native::DEFAULT_JOURNAL;
+        n.max_mixer_recordings = 64;
         n
     }
 }
@@ -124,7 +125,7 @@ impl Control {
                 .recordings
                 .values()
                 .filter(|r| r.tenant == tenant)
-                .map(|r| (r.id.clone(), json!(r)))
+                .map(|r| (r.id.clone(), self.recording_view(r)))
                 .collect(),
         };
         items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -218,6 +219,7 @@ impl Control {
             "previous_boot_id": n.previous_boot,
             "restored_endpoints": n.restored,
             "restored_mixers": n.restored_mixers,
+            "restored_mixer_recordings": n.restored_mixer_recordings,
             "lost": n.lost,
             "unknown_operations": unknown,
             "durable": n.ledger.durable(),
@@ -228,7 +230,7 @@ impl Control {
     pub(super) fn native_recording(&self, req: &native::Request<'_>) -> Result<Json, NativeError> {
         let id = req.need("recording_id")?;
         match self.native.recordings.get(id) {
-            Some(r) if r.tenant == req.tenant => Ok(super::rec::recording_json(r)),
+            Some(r) if r.tenant == req.tenant => Ok(self.recording_view(r)),
             Some(_) => Err(NativeError::new(
                 Code::Unauthorized,
                 format!("recording {id}: another tenant's"),
@@ -255,7 +257,7 @@ impl Control {
                 let (_, t) = self.party_on_leg_any(*call)?;
                 String::from_utf8(t).ok()?
             }
-            Subject::Leg(..) => return None,
+            Subject::Leg(..) | Subject::Recording(_) => return None,
         };
         // Its endpoint's, or (destroyed) its last one not finished.
         let id = match self.native.endpoints.get(&tag) {
@@ -308,7 +310,11 @@ impl Control {
             .iter()
             .map(|(id, (t, m))| (*id, t.clone(), m.participants.clone()))
             .collect();
-        saved.recordings = n.recordings.values().cloned().collect::<Vec<Recording>>();
+        saved.recordings = n
+            .recordings
+            .values()
+            .map(|r| self.recording_to_save(r))
+            .collect::<Vec<Recording>>();
         saved.mixer_plans = self.mixer_plans();
     }
 
@@ -339,6 +345,7 @@ impl Control {
         for r in &saved.recordings {
             n.recordings.insert(r.id.clone(), r.clone());
         }
+        n.mixrec_pending = saved.recordings.iter().any(super::mixrec::resumable);
         n.restored = n.endpoints.keys().cloned().collect();
         n.restored.sort();
         // Announcements: back if the relay restored them (from a file),

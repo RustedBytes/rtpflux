@@ -464,6 +464,8 @@ pub struct Recording {
     /// `[recording.metadata]`: tags every recording carries (in its JSON
     /// and the audio file); `start recording` can add more.
     pub metadata: std::collections::BTreeMap<String, String>,
+    /// Conference mixers recorded at once, at most (native API).
+    pub max_mixer_recordings: usize,
 }
 
 impl Default for Recording {
@@ -480,6 +482,7 @@ impl Default for Recording {
             s3: crate::recording::store::S3Config::default(),
             file_name: crate::recording::naming::DEFAULT_FILE_NAME.to_owned(),
             metadata: std::collections::BTreeMap::new(),
+            max_mixer_recordings: 64,
         }
     }
 }

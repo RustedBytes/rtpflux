@@ -536,6 +536,7 @@ mod tests {
             amr_pts: Vec::new(),
             amr_wb_pts: Vec::new(),
             metadata: [("agent".to_owned(), "42".to_owned())].into(),
+            mixer_id: None,
         }
     }
 

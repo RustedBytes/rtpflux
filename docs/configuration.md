@@ -358,6 +358,7 @@ bitrate = 32          # kbit/s, for opus and mp3
 keep_pcap = false     # keep the pcap once converted
 storage = "local"     # or "s3"
 file_name = "{call_id}-{from_tag}-{section}"   # the default
+max_mixer_recordings = 64   # conference mixers recorded at once
 
 [recording.metadata]  # tags in every recording (optional)
 company = "Example Ltd"
@@ -389,11 +390,18 @@ them per call. `mp3` needs a build with the `mp3` feature.
 letters, digits and `. - _ @`, and the placeholders `{call_id}`,
 `{from_tag}`, `{to_tag}`, `{section}`, `{date}` (`2026-11-25`), `{time}`
 (`142530`, both UTC, when the recording starts) and `{timestamp}` (Unix
-seconds). Values are made file-name safe as before. A name that a file
+seconds); for a conference mixer's recording (native API), `{mixer_id}`,
+`{recording_id}` and `{track}` too (`-`, `-` and empty for a call's).
+With the default `file_name`, a mixer recording is called
+`mixer-{mixer_id}-{recording_id}-{section}{track}`. Values are made file-name safe as before. A name that a file
 already has is never reused: the next recording of it gets `-2`, `-3`,
 …, so even a template without the call-id never mixes two recordings
 (`--check` warns about one without `{call_id}` and `{section}`). For
 example, `"{date}_{time}-{call_id}-{section}"` sorts by time.
+
+`max_mixer_recordings` limits the conference mixers recorded at once
+through the native API (`recording.start` with a `mixer_id`; see
+[Recording a mixer](native-api.md#recording-a-mixer)).
 
 `[recording.metadata]` holds tags every recording carries, in its JSON
 and embedded in its audio file; see
