@@ -17,6 +17,8 @@
 //!   is sensitive (`endpoint.sensitive`), the recording is paused, and
 //!   resumed when none is (unless the controller paused it).
 //! - `participants`: who was in the mixer while it recorded, and when.
+//! - With `tracks`, each participant's own input is a file of its own,
+//!   on the mix's timeline.
 //! - `mixer.destroy` stops the recording first: its outcome comes after
 //!   `mixer.destroyed`.
 //! - After a restart, a recording whose mixer came back goes on in a new
@@ -71,6 +73,12 @@ pub struct MixRec {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub include_whispers: bool,
+    /// Each participant's own track too.
+    #[serde(default)]
+    pub tracks: bool,
+    /// The tracks' files, once converted: (endpoint id, file).
+    #[serde(default)]
+    pub track_files: Vec<(String, String)>,
     /// The file-name template, and when it started (seconds).
     pub template: String,
     pub started_s: u64,
@@ -115,10 +123,18 @@ fn going_on(r: &Recording) -> bool {
 
 /// A recording's settings from its `options`: `[recording]`'s format
 /// (WAV when that is `pcap`) and rate, mono, unless the options say.
+/// What `options` ask besides the settings: whisperers in the mix, and a
+/// track per participant.
+#[derive(Debug, Clone, Copy, Default)]
+struct Extras {
+    include_whispers: bool,
+    tracks: bool,
+}
+
 fn settings_of(
     options: Option<&serde_json::Map<String, Json>>,
     defaults: Settings,
-) -> Result<(Settings, bool, BTreeMap<String, String>), NativeError> {
+) -> Result<(Settings, Extras, BTreeMap<String, String>), NativeError> {
     let mut s = Settings {
         format: if defaults.format == Format::Pcap {
             Format::Wav
@@ -129,10 +145,10 @@ fn settings_of(
         keep_pcap: false,
         ..defaults
     };
-    let mut whispers = false;
+    let mut extras = Extras::default();
     let mut metadata = BTreeMap::new();
     let Some(o) = options else {
-        return Ok((s, whispers, metadata));
+        return Ok((s, extras, metadata));
     };
     if let Some(k) = o.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
         return Err(NativeError::invalid(format!(
@@ -172,13 +188,8 @@ fn settings_of(
     if let Some(p) = s.problems().first() {
         return Err(NativeError::invalid(format!("options: {p}")));
     }
-    if o.get("tracks").and_then(Json::as_bool) == Some(true) {
-        return Err(NativeError::new(
-            Code::Unsupported,
-            "options.tracks: per-participant tracks are not supported yet",
-        ));
-    }
-    whispers = o.get("include_whispers").and_then(Json::as_bool) == Some(true);
+    extras.include_whispers = o.get("include_whispers").and_then(Json::as_bool) == Some(true);
+    extras.tracks = o.get("tracks").and_then(Json::as_bool) == Some(true);
     match o.get("metadata") {
         None => {}
         Some(Json::Object(m)) => {
@@ -193,7 +204,59 @@ fn settings_of(
         }
         Some(_) => return Err(NativeError::invalid("options.metadata: an object")),
     }
-    Ok((s, whispers, metadata))
+    Ok((s, extras, metadata))
+}
+
+/// The file name of section `section` of recording `rid` of mixer
+/// `mixer` (the mix when `track` is empty, else that participant's track):
+/// `template` rendered, `-{track}` added for a track when it has no
+/// `{track}`.
+fn section_name(
+    template: &str,
+    (mixer, rid, started_s): (u32, &str, u64),
+    section: usize,
+    track: &str,
+) -> String {
+    let template = if track.is_empty() || template.contains("{track}") {
+        template.to_owned()
+    } else {
+        format!("{template}-{{track}}")
+    };
+    crate::recording::naming::render(
+        &template,
+        &crate::recording::naming::Fields {
+            call_id: format!("mixer-{mixer}").as_bytes(),
+            from_tag: rid.as_bytes(),
+            to_tag: None,
+            section,
+            unix_s: started_s,
+            mixer_id: Some(mixer),
+            recording_id: Some(rid),
+            track,
+        },
+    )
+}
+
+/// Where participant `endpoint`'s track of `section` is spooled, next to
+/// the section's mix `spool`.
+fn track_spool(
+    mix: &MixRec,
+    id: (u32, &str),
+    section: usize,
+    spool: &std::path::Path,
+    endpoint: &str,
+) -> std::path::PathBuf {
+    let dir = spool.parent().unwrap_or(std::path::Path::new("."));
+    dir.join(format!(
+        "{}.{}",
+        section_name(
+            &mix.template,
+            (id.0, id.1, mix.started_s),
+            section,
+            endpoint
+        ),
+        mixrec::SPOOL
+    ))
 }
 
 impl Control {
@@ -254,7 +317,7 @@ impl Control {
             Some(Json::Object(o)) => Some(o),
             Some(_) => return Err(NativeError::invalid("options: an object")),
         };
-        let (settings, include_whispers, extra) = settings_of(options, self.recording_settings)?;
+        let (settings, extras, extra) = settings_of(options, self.recording_settings)?;
         let mut metadata = self.recording_meta.clone();
         metadata.extend(extra);
         if let Some(why) = crate::recording::naming::check_metadata(&metadata) {
@@ -305,7 +368,9 @@ impl Control {
                 mix: Some(MixRec {
                     settings,
                     metadata,
-                    include_whispers,
+                    include_whispers: extras.include_whispers,
+                    tracks: extras.tracks,
+                    track_files: Vec::new(),
                     template,
                     started_s: now / 1000,
                     spools: Vec::new(),
@@ -342,20 +407,15 @@ impl Control {
         let (Some(mixer), Some(mix)) = (r.mixer_id, r.mix.as_mut()) else {
             return Err(NativeError::new(Code::Internal, "not a mixer recording"));
         };
-        let base = crate::recording::naming::render(
-            &mix.template,
-            &crate::recording::naming::Fields {
-                call_id: format!("mixer-{mixer}").as_bytes(),
-                from_tag: rid.as_bytes(),
-                to_tag: None,
-                section: mix.spools.len() + 1,
-                unix_s: mix.started_s,
-                mixer_id: Some(mixer),
-                recording_id: Some(rid),
-                track: "",
-            },
-        );
+        let section = mix.spools.len() + 1;
+        let base = section_name(&mix.template, (mixer, rid, mix.started_s), section, "");
         let spool = mixrec::spool_path(dir, &base);
+        let track_path: Option<mixrec::TrackPath> = mix.tracks.then(|| {
+            let (mix, rid, spool) = (mix.clone(), rid.to_owned(), spool.clone());
+            Arc::new(move |endpoint: &str| {
+                track_spool(&mix, (mixer, &rid), section, &spool, endpoint)
+            }) as mixrec::TrackPath
+        });
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
         let running = Running {
             lost: Arc::default(),
@@ -367,9 +427,10 @@ impl Control {
             rx,
             Arc::clone(&running.written),
             Arc::clone(&running.finish),
+            track_path,
         )
         .map_err(|e| NativeError::new(Code::Internal, format!("recording: {e}")))?;
-        let include_whispers = mix.include_whispers;
+        let (include_whispers, tracks) = (mix.include_whispers, mix.tracks);
         mix.spools.push(spool.display().to_string());
         let Some((_, m)) = self.native.mixers.get(&mixer) else {
             return Err(NativeError::new(Code::NotFound, format!("mixer {mixer}")));
@@ -377,6 +438,7 @@ impl Control {
         m.record(Some(crate::pcm::mixer::MixTap {
             blocks: tx,
             include_whispers,
+            tracks,
             lost: Arc::clone(&running.lost),
             paused,
         }));
@@ -402,6 +464,24 @@ impl Control {
                 .or_insert_with(|| who.join(", "));
         }
         let spools: Vec<std::path::PathBuf> = mix.spools.iter().map(Into::into).collect();
+        // Every participant's track of every section that may have one.
+        let tracks = if mix.tracks {
+            spools
+                .iter()
+                .enumerate()
+                .flat_map(|(i, spool)| {
+                    mix.participants.iter().map(move |p| {
+                        (
+                            i + 1,
+                            p.endpoint_id.clone(),
+                            track_spool(mix, (mixer, &r.id), i + 1, spool, &p.endpoint_id),
+                        )
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(Job {
             pcap: spools.first().cloned().unwrap_or_default(),
             conversion: Conversion {
@@ -423,6 +503,7 @@ impl Control {
             mix: Some(MixJob {
                 recording_id: r.id.clone(),
                 spools,
+                tracks,
             }),
         })
     }
@@ -664,13 +745,25 @@ impl Control {
         let Some(r) = self.native.recordings.get_mut(rid) else {
             return;
         };
-        let (ty, file, uploaded, failure) = match kind {
-            MediaEventKind::RecordingDone { file, uploaded } => {
-                ("recording.completed", file.clone(), *uploaded, None)
-            }
-            MediaEventKind::Failed { reason, .. } => {
-                ("recording.failed", None, None, Some(reason.clone()))
-            }
+        let (ty, file, uploaded, failure, tracks) = match kind {
+            MediaEventKind::RecordingDone {
+                file,
+                uploaded,
+                tracks,
+            } => (
+                "recording.completed",
+                file.clone(),
+                *uploaded,
+                None,
+                tracks.clone(),
+            ),
+            MediaEventKind::Failed { reason, .. } => (
+                "recording.failed",
+                None,
+                None,
+                Some(reason.clone()),
+                Vec::new(),
+            ),
             _ => return,
         };
         r.state = if file.is_some() {
@@ -708,11 +801,18 @@ impl Control {
             })
             .filter(|f| std::path::Path::new(f).exists() || uploaded == Some(true))
             .collect();
+        mix.track_files = tracks;
+        let track_list: Vec<Json> = mix
+            .track_files
+            .iter()
+            .map(|(e, f)| json!({"endpoint_id": e, "file": f, "uploaded": uploaded}))
+            .collect();
         let data = json!({
             "recording_id": rid,
             "mixer_id": r.mixer_id,
             "file": file,
             "files": mix.files,
+            "tracks": track_list,
             "uploaded": uploaded,
             "section": mix.spools.len(),
             "duration_ms": mix.periods * PERIOD_MS,
@@ -815,9 +915,19 @@ impl Control {
         o.insert("section".into(), json!(mix.spools.len()));
         o.insert("files".into(), json!(mix.files));
         o.insert(
+            "tracks".into(),
+            json!(
+                mix.track_files
+                    .iter()
+                    .map(|(e, f)| json!({"endpoint_id": e, "file": f}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        o.insert(
             "options".into(),
             json!({"format": mix.settings.format, "sample_rate": mix.settings.sample_rate,
-                   "channels": mix.settings.channels, "include_whispers": mix.include_whispers}),
+                   "channels": mix.settings.channels, "include_whispers": mix.include_whispers,
+                   "tracks": mix.tracks}),
         );
         v
     }

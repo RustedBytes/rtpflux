@@ -546,3 +546,351 @@ fn pauses_sensitivity_restart_and_keys() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// With `tracks`, each participant's own input is a file of its own, on
+/// the mix's timeline: silence before it joined; a muted one's too.
+#[test]
+fn a_track_per_participant() {
+    let dir = temp_dir("tracks");
+    let (daemon, sock) = relay(&dir, 63_300);
+    let mut api = Client::connect(&sock).unwrap();
+    let mixer = api.call("mixer.create", Value::Null).unwrap()["mixer_id"]
+        .as_u64()
+        .unwrap();
+    let a = Party::new(&mut api, 440.0);
+    let late = Party::new(&mut api, 1300.0);
+    let muted = Party::new(&mut api, 1900.0);
+    for p in [&a, &muted] {
+        api.call("mixer.add", json!({"mixer_id": mixer, "endpoint_id": p.id}))
+            .unwrap();
+    }
+    api.call(
+        "mixer.set",
+        json!({"mixer_id": mixer, "endpoint_id": muted.id, "muted": true}),
+    )
+    .unwrap();
+    api.call(
+        "events.subscribe",
+        json!({"types": ["recording.completed"], "mixer_ids": [mixer]}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    api.call(
+        "recording.start",
+        json!({"mixer_id": mixer, "options": {"tracks": true, "sample_rate": 16000}}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    api.call(
+        "mixer.add",
+        json!({"mixer_id": mixer, "endpoint_id": late.id}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    api.call("recording.stop", json!({"mixer_id": mixer}))
+        .unwrap();
+    let done = event(&mut api, "recording.completed");
+    let (mix, rate) = wav(Path::new(done["data"]["file"].as_str().unwrap()));
+    let tracks = done["data"]["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 3, "{done}");
+    let track = |id: &str| {
+        let t = tracks
+            .iter()
+            .find(|t| t["endpoint_id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {done}"));
+        wav(Path::new(t["file"].as_str().unwrap())).0
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = |t: f64| (t * f64::from(rate) / 1000.0) as usize;
+    for (id, hz) in [(&a.id, 440.0), (&late.id, 1300.0), (&muted.id, 1900.0)] {
+        let t = track(id);
+        // As long as the mix (a period either way at most).
+        assert!(
+            t.len().abs_diff(mix.len()) <= ms(20.0),
+            "{id}: {} {}",
+            t.len(),
+            mix.len()
+        );
+        let tail = &t[t.len() - ms(600.0)..];
+        assert!(has(tail, rate, hz), "{id} at the end: its own {hz} Hz");
+        for other in [440.0, 1300.0, 1900.0]
+            .into_iter()
+            .filter(|&o| (o - hz).abs() > 1.0)
+        {
+            assert!(!has(tail, rate, other), "{id}: no {other} Hz");
+        }
+    }
+    // The latecomer: silence before it joined.
+    let before = &track(&late.id)[ms(100.0)..ms(600.0)];
+    assert!(before.iter().all(|&s| s == 0), "silence before it joined");
+    // The muted one is in its track, not in the mix.
+    assert!(!has(&mix[mix.len() - ms(600.0)..], rate, 1900.0));
+    let q = api
+        .call(
+            "recording.query",
+            json!({"recording_id": done["data"]["recording_id"]}),
+        )
+        .unwrap();
+    assert_eq!(q["tracks"].as_array().unwrap().len(), 3, "{q}");
+    drop((a, late, muted));
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The saved state without any mixer (nor mixer plan) in it.
+fn forget(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
+                if k == "mixer_plans" || k == "mixers" {
+                    *x = json!([]);
+                } else {
+                    forget(x);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(forget),
+        _ => {}
+    }
+}
+
+/// A recording whose mixer does not come back after a restart is finished
+/// with what it holds, and reported lost.
+#[test]
+fn a_mixer_not_restored_finishes_its_recording() {
+    let dir = temp_dir("gone");
+    let (daemon, sock) = relay(&dir, 63_400);
+    let mut api = Client::connect(&sock).unwrap();
+    let mixer = api.call("mixer.create", Value::Null).unwrap()["mixer_id"]
+        .as_u64()
+        .unwrap();
+    let a = Party::new(&mut api, 440.0);
+    api.call("mixer.add", json!({"mixer_id": mixer, "endpoint_id": a.id}))
+        .unwrap();
+    let rid = api
+        .call("recording.start", json!({"mixer_id": mixer}))
+        .unwrap()["recording_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(1000));
+    drop(api);
+    daemon.stop();
+    // The mixer's plan gone from the saved state: it cannot be rebuilt.
+    let path = dir.join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    forget(&mut state);
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let (daemon, sock) = relay(&dir, 63_400);
+    let mut api = Client::connect(&sock).unwrap();
+    let report = api.call("recovery.report", Value::Null).unwrap();
+    assert!(
+        report["lost"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["kind"] == "mixer_recording" && l["recording_id"] == rid.as_str()),
+        "{report}"
+    );
+    let end = Instant::now() + WAIT;
+    let q = loop {
+        let q = api
+            .call("recording.query", json!({"recording_id": rid}))
+            .unwrap();
+        if q["state"] == "completed" || Instant::now() > end {
+            break q;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(q["state"], "completed", "{q}");
+    let (x, rate) = wav(Path::new(q["file"].as_str().unwrap()));
+    #[allow(clippy::cast_precision_loss)]
+    let held = x.len() as f64 * 1000.0 / f64::from(rate);
+    assert!(held > 700.0 && has(&x, rate, 440.0), "{held} ms held");
+    drop(a);
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// CPU time (clock ticks) of this process's threads whose names start
+/// with `prefix`.
+fn cpu_of(prefix: &str) -> u64 {
+    let mut ticks = 0;
+    for t in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+        let comm = std::fs::read_to_string(t.path().join("comm")).unwrap_or_default();
+        if !comm.starts_with(prefix) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(t.path().join("stat")).unwrap_or_default();
+        let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        ticks += f.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+            + f.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    }
+    ticks
+}
+
+/// A load run (by hand: `cargo test --release -p rtpflux --test mixrec
+/// load -- --ignored --nocapture`): 50 mixers of 5 participants, each
+/// sending a tone; 5 s unrecorded, then 5 s with every mixer recorded.
+/// Prints the mixers' and the recording threads' CPU, the mix packets the
+/// participants got per second, the audio lost, and how long the 50
+/// files took to make.
+#[test]
+#[ignore = "a measurement"]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn load() {
+    const MIXERS: usize = 50;
+    const SEATS: usize = 5;
+    const SECONDS: u64 = 5;
+    let dir = temp_dir("load");
+    let sock = dir.join("api.sock");
+    let config = Config::from_toml(&format!(
+        r#"
+        [control]
+        listen = ["127.0.0.1:0"]
+        native_socket = "{}"
+        [[interface]]
+        name = "lo"
+        address = "127.0.0.1"
+        [ports]
+        min = 40000
+        max = 41999
+        [sessions]
+        max = 400
+        [runtime]
+        workers = 2
+        [recording]
+        dir = "{}"
+        "#,
+        sock.display(),
+        dir.join("rec").display(),
+    ))
+    .unwrap();
+    let daemon = Daemon::start(&config).unwrap();
+    let mut api = Client::connect(&sock).unwrap();
+    // (socket, relay address) per participant.
+    let mut legs = Vec::new();
+    let mut mixers = Vec::new();
+    for _ in 0..MIXERS {
+        let m = api.call("mixer.create", Value::Null).unwrap()["mixer_id"]
+            .as_u64()
+            .unwrap();
+        for _ in 0..SEATS {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_nonblocking(true).unwrap();
+            let port = s.local_addr().unwrap().port();
+            let sdp = format!(
+                "v=0\r\no=- 7 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                 m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+            );
+            let ep = api
+                .call(
+                    "endpoint.create",
+                    json!({"remote_sdp": sdp, "options": {"flags": ["trust-address"], "endpoint-learning": "off"}}),
+                )
+                .unwrap();
+            let relay_port: u16 = ep["sdp"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("m=audio "))
+                .and_then(|l| l.split(' ').next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            api.call(
+                "mixer.add",
+                json!({"mixer_id": m, "endpoint_id": ep["endpoint_id"]}),
+            )
+            .unwrap();
+            legs.push((s, SocketAddr::from(([127, 0, 0, 1], relay_port))));
+        }
+        mixers.push(m);
+    }
+    // One phase: every participant sends a tone for SECONDS; what came
+    // back, and the CPU of the mixers and of the recording threads.
+    let mut seq = 0u16;
+    let mut phase = |legs: &[(UdpSocket, SocketAddr)]| {
+        let (m0, r0) = (
+            cpu_of("rtpflux-mixer"),
+            cpu_of("rtpflux-mixrec") + cpu_of("rtpflux-record"),
+        );
+        let started = Instant::now();
+        let mut got = 0u64;
+        let mut buf = [0u8; 2048];
+        let periods = SECONDS * 50;
+        for k in 0..periods {
+            for (i, (s, to)) in legs.iter().enumerate() {
+                let mut p = vec![0x80, 0];
+                p.extend_from_slice(&seq.to_be_bytes());
+                p.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+                p.extend_from_slice(&u32::try_from(i).unwrap().to_be_bytes());
+                #[allow(clippy::cast_possible_truncation)]
+                p.extend((0..160u32).map(|n| {
+                    let t = f64::from(u32::from(seq) * 160 + n) / 8000.0;
+                    let hz = 300.0 + 100.0 * (i % SEATS) as f64;
+                    rtpflux_core::g711::linear_to_ulaw(
+                        (4000.0 * (2.0 * std::f64::consts::PI * hz * t).sin()) as i16,
+                    )
+                }));
+                let _ = s.send_to(&p, to);
+                while s.recv_from(&mut buf).is_ok() {
+                    got += 1;
+                }
+            }
+            seq = seq.wrapping_add(1);
+            let due = Duration::from_millis(20 * (k + 1));
+            std::thread::sleep(due.saturating_sub(started.elapsed()));
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let pct = |t: u64| t as f64 / 100.0 / secs * 100.0;
+        (
+            pct(cpu_of("rtpflux-mixer") - m0),
+            pct(cpu_of("rtpflux-mixrec") + cpu_of("rtpflux-record") - r0),
+            got as f64 / secs / legs.len() as f64,
+        )
+    };
+    let (mix_cpu, _, pps) = phase(&legs);
+    eprintln!(
+        "MIXREC LOAD: {MIXERS} mixers x {SEATS}, unrecorded: mixers {mix_cpu:.1}% CPU, \
+         {pps:.1} mix packets/s per participant"
+    );
+    api.call(
+        "events.subscribe",
+        json!({"types": ["recording.completed", "recording.failed"]}),
+    )
+    .unwrap();
+    for m in &mixers {
+        api.call("recording.start", json!({"mixer_id": m})).unwrap();
+    }
+    let (mix_cpu, rec_cpu, pps) = phase(&legs);
+    eprintln!(
+        "MIXREC LOAD: recorded: mixers {mix_cpu:.1}% CPU, writers {rec_cpu:.1}% CPU, \
+         {pps:.1} mix packets/s per participant"
+    );
+    let stopping = Instant::now();
+    for m in &mixers {
+        api.call("recording.stop", json!({"mixer_id": m})).unwrap();
+    }
+    let (mut lost, mut completed) = (0u64, 0);
+    while completed < MIXERS {
+        let e = api
+            .wait_event("recording.completed", Duration::from_secs(60))
+            .unwrap()
+            .expect("every recording completes");
+        lost += e["data"]["lost_ms"].as_u64().unwrap();
+        completed += 1;
+    }
+    eprintln!(
+        "MIXREC LOAD: {MIXERS} recordings made in {:.2} s after the stop, {lost} ms lost in all",
+        stopping.elapsed().as_secs_f64()
+    );
+    assert_eq!(lost, 0);
+    drop((api, legs));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

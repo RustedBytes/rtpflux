@@ -704,10 +704,10 @@ A request naming both is refused (`invalid`).
 
 | Operation | Fields | Result |
 |---|---|---|
-| `recording.start` | `mixer_id`, `options` (`format`, `sample_rate`, `channels`, `bitrate`, `include_whispers`, `metadata`) | `recording`, `recording_id`, `mixer_id` |
+| `recording.start` | `mixer_id`, `options` (`format`, `sample_rate`, `channels`, `bitrate`, `include_whispers`, `tracks`, `metadata`) | `recording`, `recording_id`, `mixer_id` |
 | `recording.stop` | `mixer_id` | `recording`, `recording_id`, `mixer_id`, `state` (`stopped` until the files are made) |
 | `recording.pause`, `recording.resume` | `mixer_id` | `recording_id`, `mixer_id`, `state`, `changed`, `pauses` |
-| `recording.query` | `recording_id` | As an endpoint recording's, with `mixer_id` instead of `endpoint_id`, and `participants`, `duration_ms`, `lost_ms`, `section`, `files`, `options` |
+| `recording.query` | `recording_id` | As an endpoint recording's, with `mixer_id` instead of `endpoint_id`, and `participants`, `duration_ms`, `lost_ms`, `section`, `files`, `tracks`, `options` |
 
 - **What is recorded** is what a `listen` participant hears: every
   participant heard by everyone, at its input gain, through a limiter.
@@ -724,9 +724,15 @@ A request naming both is refused (`invalid`).
   `[recording] format` of `pcap` gives WAV (a mixer has no packets, and
   `format: "pcap"` is refused). `channels` is `mono` (the default) or
   `stereo` (the same mix on both). `metadata` adds tags to
-  `[recording.metadata]`'s. `tracks` (one file per participant) is not
-  supported yet: refused with `unsupported`. Any other option is
-  `invalid`.
+  `[recording.metadata]`'s. Any other option is `invalid`.
+- **Tracks.** With `tracks: true`, each participant's own input (after
+  its input gain, whatever its role or mute) is also written to a file
+  of its own, on the mix's timeline: silence before it joined and after
+  it left, so every track lines up with the mix. For transcription with
+  speakers apart. Its name is the mix's with `{track}` the endpoint id
+  (`-{track}` added to a `file_name` without it), its tags carry
+  `TRACK`. `recording.completed` and `recording.query` list them in
+  `tracks`: `[{endpoint_id, file, uploaded}]`.
 - **One at a time.** Starting again while a mixer records gives the same
   `recording_id`. At most `[recording] max_mixer_recordings` (64)
   mixers record at once; beyond, `exhausted`. With an `idempotency_key`
@@ -749,8 +755,8 @@ A request naming both is refused (`invalid`).
   stored locally or on S3, with the upload webhook. Then
   `recording.completed` (or `recording.failed`), a mixer event (see
   [Events](#events)): `recording_id`, `mixer_id`, `file` (the first
-  section's), `files` (every section's), `uploaded`, `section`,
-  `duration_ms`, `lost_ms`. After `mixer.destroy` it comes after
+  section's), `files` (every section's), `tracks`, `uploaded`,
+  `section`, `duration_ms`, `lost_ms`. After `mixer.destroy` it comes after
   `mixer.destroyed`, and `recording.query` keeps answering.
 - **File names**: `[recording] file_name` with `{mixer_id}`,
   `{recording_id}` and `{track}` (empty for the mix); with the default

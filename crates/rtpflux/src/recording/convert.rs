@@ -216,7 +216,11 @@ pub fn run(
                     from_tag: m.from_tag.clone(),
                     section: m.section,
                 },
-                MediaEventKind::RecordingDone { file, uploaded },
+                MediaEventKind::RecordingDone {
+                    file,
+                    uploaded,
+                    tracks: Vec::new(),
+                },
             );
         }
     };

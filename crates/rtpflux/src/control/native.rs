@@ -2495,13 +2495,9 @@ impl Control {
                 .publish(json!({"event": "gap", "reason": "media_overflow",
                 "missed": dropped, "source": "media", "attributed_endpoints": marked}));
         }
-        if self.native.subscribers.is_empty() {
-            // Playbacks still end for the endpoints' snapshots.
-            for e in events {
-                self.note_playback_end(&e);
-            }
-            return;
-        }
+        // Handled even with no subscriber: they change state (a
+        // recording's outcome, a playback's end and its queue) and go to
+        // the journal, replayed to whoever subscribes later from a cursor.
         for e in &events {
             self.media_event(e);
         }
@@ -2583,7 +2579,7 @@ impl Control {
                 self.native.taps.remove(stream);
                 ("stream.ended", json!({"stream_id": stream}))
             }
-            MediaEventKind::RecordingDone { file, uploaded } => (
+            MediaEventKind::RecordingDone { file, uploaded, .. } => (
                 if file.is_some() {
                     "recording.completed"
                 } else {

@@ -144,6 +144,29 @@ them all):
 | Baseline | 180, 184 ms | 107, 101 ms |
 | HEAD | 136, 133 ms | 120, 106 ms |
 
+## Recording conference mixers
+
+`mixrec::load` (an ignored test: `cargo test --release -p rtpflux --test
+mixrec load -- --ignored --nocapture`) runs 50 mixers of 5 participants,
+each participant sending a tone, for 5 s without recording, then for 5 s
+with all 50 mixers recorded (WAV, 8 kHz, mono). Measured on an
+i9-9900K (16 threads), loopback, release build, two runs:
+
+| | Mixer threads | Writer threads | Mix packets/s per participant |
+|---|---|---|---|
+| Not recorded | 23.0–26.6% of a CPU | | 50.2–50.3 |
+| Recorded | 31.8–35.4% of a CPU | under the clock-tick resolution (0.2%) | 50.1–50.2 |
+
+- Recording costs the mixers 5–12 points of one CPU for 50 mixers (about
+  0.1–0.25% each): one more sum through a limiter and a copy into the
+  queue per 20 ms. The participants' mixes keep their rate: the
+  conference is not slowed.
+- No period was lost (`lost_ms` 0 for all 50).
+- The 50 WAV files were made 0.16–0.17 s after the stop.
+- Not measured: latency to the participants as such (the rate is the
+  proxy), tracks under load, and lossy formats (Opus, MP3), whose encoding
+  runs on the conversion thread after the stop.
+
 ## Running the benchmarks
 
 ```sh

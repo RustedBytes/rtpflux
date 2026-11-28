@@ -96,11 +96,14 @@ pub enum Role {
 }
 
 /// One period of a recorded mix: its number (from 0, counted while
-/// recording and not paused) and its 20 ms at 16 kHz.
-#[derive(Clone, Copy)]
+/// recording and not paused) and its 20 ms at 16 kHz; with tracks, each
+/// participant's own input too (after its input gain, whatever its role
+/// or mute).
+#[derive(Clone)]
 pub struct MixBlock {
     pub tick: u64,
     pub pcm: [i16; MIX_FRAME],
+    pub tracks: Vec<(Arc<str>, [i16; MIX_FRAME])>,
 }
 
 /// Samples per [`MixBlock`], and their rate.
@@ -112,6 +115,8 @@ pub struct MixTap {
     pub blocks: SyncSender<MixBlock>,
     /// Whisperers in the recording too (compliance).
     pub include_whispers: bool,
+    /// Each participant's own input too.
+    pub tracks: bool,
     /// Blocks the queue had no room for.
     pub lost: Arc<AtomicU64>,
     /// Starts paused (a paused recording restored after a restart).
@@ -141,6 +146,8 @@ enum Ask {
 )]
 struct Participant {
     key: String,
+    /// The key, for recorded tracks.
+    name: Arc<str>,
     subject: Subject,
     fork: Receiver<RtpCopy>,
     inject: SyncSender<Encoded>,
@@ -268,6 +275,7 @@ impl MixerHandle {
         let dropped = Arc::new(AtomicU64::new(0));
         let part = Participant {
             key: p.key.clone(),
+            name: Arc::from(p.key.as_str()),
             subject: p.subject,
             fork: fork_rx,
             inject: inject_tx,
@@ -598,6 +606,18 @@ fn record(
     let mut block = MixBlock {
         tick: r.tick,
         pcm: [0; MIX_FRAME],
+        tracks: if r.tap.tracks {
+            parts
+                .iter()
+                .map(|p| {
+                    let mut t = p.frame;
+                    rtpflux_core::dsp::gain::apply_gain_q8(&mut t, q8(p.gain_db));
+                    (Arc::clone(&p.name), t)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     r.limiter.process(acc, &mut block.pcm);
     r.tick += 1;
@@ -620,6 +640,7 @@ mod tests {
             tap: MixTap {
                 blocks: tx,
                 include_whispers: false,
+                tracks: false,
                 lost: Arc::clone(&lost),
                 paused: false,
             },

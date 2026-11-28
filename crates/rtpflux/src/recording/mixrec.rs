@@ -8,6 +8,11 @@
 //! writer could not write, is silence at its place: the timeline stays
 //! continuous, and the loss is counted.
 //!
+//! With **tracks**, each participant's own input (after its input gain,
+//! whatever its role or mute) also goes to a spool of its own, on the same
+//! timeline: silence before it joined and after it left, so each track
+//! lines up with the mix sample for sample.
+//!
 //! When the recording ends, its sections are converted on the recording
 //! conversion thread like a call's pcap ([`super::convert::run`]): each
 //! spool becomes an audio file in the chosen format and rate (resampled
@@ -19,8 +24,9 @@ use super::settings::{Format, Settings};
 use crate::pcm::mixer::{BLOCK_RATE, BLOCK_SAMPLES, MixBlock};
 use rtpflux_core::dsp::resample::Resampler;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read as _, Write as _};
+use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,7 +42,13 @@ pub struct MixJob {
     pub recording_id: String,
     /// The spools, section after section.
     pub spools: Vec<PathBuf>,
+    /// The participants' tracks: (section from 1, endpoint id, spool).
+    /// One that was never written (no such spool) is skipped.
+    pub tracks: Vec<(usize, String, PathBuf)>,
 }
+
+/// Where participant `key`'s track of a section is spooled.
+pub type TrackPath = Arc<dyn Fn(&str) -> PathBuf + Send + Sync>;
 
 /// What the writer hands over when its queue closes: the conversion job
 /// (set when the recording ends for good, not when the relay stops) and
@@ -83,6 +95,7 @@ pub fn spawn_writer(
     blocks: Receiver<MixBlock>,
     written: Arc<Written>,
     finish: Finish,
+    tracks: Option<TrackPath>,
 ) -> std::io::Result<()> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -91,8 +104,25 @@ pub fn spawn_writer(
     let path = path.to_owned();
     std::thread::Builder::new()
         .name("rtpflux-mixrec".to_owned())
-        .spawn(move || write(&path, file, &blocks, &written, &finish))?;
+        .spawn(move || write(&path, file, &blocks, &written, &finish, tracks.as_ref()))?;
     Ok(())
+}
+
+/// A period's samples as little-endian bytes.
+fn le(pcm: &[i16; BLOCK_SAMPLES], out: &mut [u8; BLOCK_SAMPLES * 2]) {
+    for (b, s) in out.as_chunks_mut::<2>().0.iter_mut().zip(pcm) {
+        *b = s.to_le_bytes();
+    }
+}
+
+/// Write `data`, logging the first failure only (the timeline goes on).
+fn put(file: &mut impl std::io::Write, data: &[u8], path: &Path, failed: &mut bool) {
+    if let Err(e) = file.write_all(data)
+        && !*failed
+    {
+        log::warn!("recording: {}: {e}", path.display());
+        *failed = true;
+    }
 }
 
 fn write(
@@ -101,35 +131,70 @@ fn write(
     blocks: &Receiver<MixBlock>,
     written: &Written,
     finish: &Finish,
+    track_path: Option<&TrackPath>,
 ) {
     let silence = [0u8; BLOCK_SAMPLES * 2];
     let mut bytes = [0u8; BLOCK_SAMPLES * 2];
     let mut next = 0u64;
     let mut failed = false;
-    let mut put = |file: &mut File, data: &[u8]| {
-        if let Err(e) = file.write_all(data)
-            && !failed
-        {
-            // Logged once; the timeline goes on.
-            log::warn!("recording: {}: {e}", path.display());
-            failed = true;
-        }
-    };
+    // The tracks open so far: their files, and whether they had this
+    // period.
+    let mut tracks: HashMap<Arc<str>, (BufWriter<File>, PathBuf)> = HashMap::new();
     for block in blocks {
-        // Periods lost on the way: silence in their place.
+        // Periods lost on the way: silence in their place, on every track.
         while next < block.tick {
-            put(&mut file, &silence);
+            put(&mut file, &silence, path, &mut failed);
+            for (t, p) in tracks.values_mut() {
+                put(t, &silence, p, &mut failed);
+            }
             next += 1;
         }
-        for (b, s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(block.pcm) {
-            *b = s.to_le_bytes();
+        le(&block.pcm, &mut bytes);
+        put(&mut file, &bytes, path, &mut failed);
+        if let Some(track_path) = track_path {
+            for (key, pcm) in &block.tracks {
+                if !tracks.contains_key(key) {
+                    let p = track_path(key);
+                    match File::create(&p) {
+                        Ok(f) => {
+                            // Silence from the section's start.
+                            let mut w = BufWriter::with_capacity(64 * 1024, f);
+                            for _ in 0..block.tick {
+                                put(&mut w, &silence, &p, &mut failed);
+                            }
+                            tracks.insert(Arc::clone(key), (w, p));
+                        }
+                        Err(e) => {
+                            if !failed {
+                                log::warn!("recording: {}: {e}", p.display());
+                                failed = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if let Some((t, p)) = tracks.get_mut(key) {
+                    le(pcm, &mut bytes);
+                    put(t, &bytes, p, &mut failed);
+                }
+            }
+            // Those that left (or were not in this period): silence.
+            for (key, (t, p)) in &mut tracks {
+                if !block.tracks.iter().any(|(k, _)| k == key) {
+                    put(t, &silence, p, &mut failed);
+                }
+            }
         }
-        put(&mut file, &bytes);
         next = block.tick + 1;
         written.periods.store(next, Ordering::Relaxed);
     }
     let _ = file.sync_data();
     drop(file);
+    for (mut t, p) in tracks.into_values() {
+        if let Err(e) = t.flush().and_then(|()| t.get_ref().sync_data()) {
+            log::warn!("recording: {}: {e}", p.display());
+        }
+    }
     let job = finish.lock().ok().and_then(|mut h| {
         h.writer_done = true;
         h.job.take()
@@ -333,6 +398,28 @@ pub(super) fn run(
             }
         }
     }
+    let mut tracks = Vec::new();
+    for (section, endpoint, spool) in &job.tracks {
+        if !spool.exists() {
+            continue;
+        }
+        let mut meta = conversion.meta.clone();
+        meta.metadata.insert("track".to_owned(), endpoint.clone());
+        match convert_section(spool, *section, job, &conversion.settings, &meta) {
+            Ok((out, json)) => {
+                let _ = std::fs::remove_file(spool);
+                keep.push(out.clone());
+                keep.push(json);
+                tracks.push((endpoint.clone(), out.display().to_string()));
+            }
+            Err(e) => {
+                log::warn!(
+                    "recording: converting {}: {e}; the spool is kept",
+                    spool.display()
+                );
+            }
+        }
+    }
     let left = store.keep(&keep, &conversion.meta);
     let uploaded = store.uploads().then_some(left.is_empty());
     let Some(ev) = events else {
@@ -345,6 +432,7 @@ pub(super) fn run(
             MediaEventKind::RecordingDone {
                 file: Some(first.display().to_string()),
                 uploaded,
+                tracks,
             },
         ),
         (None, failure) => ev.emit(
@@ -397,6 +485,7 @@ mod tests {
         MixBlock {
             tick,
             pcm: [v; BLOCK_SAMPLES],
+            tracks: Vec::new(),
         }
     }
 
@@ -410,7 +499,7 @@ mod tests {
         let written = Arc::new(Written::default());
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel();
         let finish: Finish = Arc::default();
-        spawn_writer(&path, rx, Arc::clone(&written), Arc::clone(&finish)).unwrap();
+        spawn_writer(&path, rx, Arc::clone(&written), Arc::clone(&finish), None).unwrap();
         tx.send(block(0, 100)).unwrap();
         tx.send(block(3, 300)).unwrap();
         let job = super::super::Job {
@@ -466,6 +555,7 @@ mod tests {
         let job = MixJob {
             recording_id: "rec-1".into(),
             spools: vec![spool.clone()],
+            tracks: Vec::new(),
         };
         let meta = super::super::Meta {
             call_id: "mixer-1".into(),

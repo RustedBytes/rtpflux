@@ -27,6 +27,11 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn relay(dir: &Path, min: u16) -> (Daemon, PathBuf) {
+    relay_with(dir, min, "")
+}
+
+/// A relay with `extra` configuration at the end.
+fn relay_with(dir: &Path, min: u16, extra: &str) -> (Daemon, PathBuf) {
     let sock = dir.join("api.sock");
     let config = Config::from_toml(&format!(
         r#"
@@ -51,6 +56,7 @@ fn relay(dir: &Path, min: u16) -> (Daemon, PathBuf) {
         authority_keys = {{ k1 = "{KEY}" }}
         [runtime]
         workers = 2
+        {extra}
         "#,
         sock = sock.display(),
         max = min + 63,
@@ -354,6 +360,66 @@ fn fencing_by_authority_epochs() {
         "fenced"
     );
 
+    drop((a, b));
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A mixer's recording is a change of the mixer: it needs the mixer's
+/// group's current epoch, like every mixer operation.
+#[test]
+fn mixer_recordings_are_fenced() {
+    let dir = temp_dir("mixrec");
+    std::fs::create_dir_all(dir.join("rec")).unwrap();
+    let (daemon, sock) = relay_with(
+        &dir,
+        63_600,
+        &format!("[recording]\ndir = \"{}\"", dir.join("rec").display()),
+    );
+    let mut a = Client::connect(&sock).unwrap();
+    let lease = now_ms() + 60_000;
+    for (group, epoch) in [("conf-1", 1), ("conf-2", 1)] {
+        a.call(
+            "ownership.claim",
+            grant("default", group, epoch, "ctl-a", lease),
+        )
+        .unwrap();
+    }
+    let mixer = a
+        .call("mixer.create", with(json!({}), "conf-1", 1, "ctl-a"))
+        .unwrap()["mixer_id"]
+        .clone();
+    let start = json!({"mixer_id": mixer});
+    assert_eq!(code(a.call("recording.start", start.clone())), "fenced");
+    assert_eq!(
+        code(a.call("recording.start", with(start.clone(), "conf-2", 1, "ctl-a"))),
+        "fenced",
+        "another group's proof"
+    );
+    let rec = a
+        .call("recording.start", with(start.clone(), "conf-1", 1, "ctl-a"))
+        .unwrap();
+    assert_eq!(rec["recording"], true);
+
+    // Handed to controller b: a is stale for the recording too.
+    let mut b = Client::connect(&sock).unwrap();
+    b.call(
+        "ownership.claim",
+        grant("default", "conf-1", 2, "ctl-b", lease),
+    )
+    .unwrap();
+    let stop = json!({"mixer_id": mixer});
+    for op in ["recording.pause", "recording.stop"] {
+        assert_eq!(
+            code(a.call(op, with(stop.clone(), "conf-1", 1, "ctl-a"))),
+            "fenced",
+            "{op} with a stale epoch"
+        );
+    }
+    let done = b
+        .call("recording.stop", with(stop, "conf-1", 2, "ctl-b"))
+        .unwrap();
+    assert_eq!(done["recording_id"], rec["recording_id"]);
     drop((a, b));
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();

@@ -359,3 +359,59 @@ fn destroying_the_endpoint_finishes_its_recording() {
     daemon.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// With no event subscriber at all, a recording's outcome still reaches
+/// its record (`recording.query`).
+#[test]
+fn the_outcome_is_kept_without_subscribers() {
+    let dir = temp_dir("nosub");
+    let (daemon, sock) = relay(&dir, 62_600);
+    let mut api = Client::connect(&sock).unwrap();
+    let opts = json!({"flags": ["trust-address"], "endpoint-learning": "off"});
+    let mut ids = Vec::new();
+    let mut socks = Vec::new();
+    for _ in 0..2 {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = s.local_addr().unwrap().port();
+        let sdp = format!(
+            "v=0\r\no=- 7 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+        );
+        let ep = api
+            .call(
+                "endpoint.create",
+                json!({"remote_sdp": sdp, "options": opts}),
+            )
+            .unwrap();
+        ids.push(ep["endpoint_id"].as_str().unwrap().to_owned());
+        socks.push(s);
+    }
+    api.call(
+        "bridge.attach",
+        json!({"endpoint_id": ids[0], "peer_endpoint_id": ids[1]}),
+    )
+    .unwrap();
+    let rid = api
+        .call("recording.start", json!({"endpoint_id": ids[0]}))
+        .unwrap()["recording_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(300));
+    api.call("recording.stop", json!({"endpoint_id": ids[0]}))
+        .unwrap();
+    let end = std::time::Instant::now() + WAIT;
+    let q = loop {
+        let q = api
+            .call("recording.query", json!({"recording_id": rid}))
+            .unwrap();
+        if q["state"] != "stopped" || std::time::Instant::now() > end {
+            break q;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(q["state"], "completed", "{q}");
+    drop(api);
+    daemon.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

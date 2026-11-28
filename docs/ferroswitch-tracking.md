@@ -598,9 +598,8 @@ Evidence (`tests/conference.rs`):
   restored (it expected it lost).
 
 Not covered (spec items left as gaps):
-- A conference recording: recording takes only relayed media (step 10a),
-  and a mixer's legs are not relayed. Conference + PCM + recording
-  composition therefore lacks the recording part.
+- A conference recording: since done (see "Recording a conference
+  mixer" below).
 - Mixer-to-mixer links (cascading) are not supported, by design (no
   cycles).
 - AEC, AGC, video and T.38 are optional later milestones, per the spec.
@@ -720,16 +719,16 @@ Covered by the spec's acceptance list:
 | 1 | done | `mixrec::the_mix_a_listener_hears`: tones per party (Goertzel), duration within 40 ms of start→stop |
 | 2 | done | same test: muted, listener and whisperer absent; `include_whispers` adds the whisperer (mutation-checked) |
 | 3 | done | same test: a participant leaving, silence in the middle, `participants` intervals |
-| 4 | done, but the timeout branch is not tested | `mixrec::pauses_sensitivity_restart_and_keys`: confirmed pause, the section shorter by the pauses (mutation-checked). A pause the mixer does not confirm in time is not provoked by any test |
+| 4 | done; the timeout branch is not tested | `mixrec::pauses_sensitivity_restart_and_keys`: confirmed pause, the section shorter by the pauses (mutation-checked). A pause the mixer does not confirm in time is not provoked by any test |
 | 5 | done | same test: a sensitive participant pauses it; the controller's pause survives sensitivity going away |
 | 6 | done | first test: `mixer.destroyed` then `recording.completed`; `recording.query` answers |
-| 7 | partly | same test: a restart goes on in section 2, listed in `restored_mixer_recordings`, a file per section. The "mixer not restored" path (finished, reported `lost`) is implemented but not tested |
+| 7 | done | same test: a restart goes on in section 2, listed in `restored_mixer_recordings`, a file per section; `mixrec::a_mixer_not_restored_finishes_its_recording`: its mixer's plan removed from the state, it is finished with what it holds and reported `lost` |
 | 8 | unit level | `pcm::mixer` test: a full queue loses and counts, numbering goes on; `recording::mixrec` test: the writer fills lost periods with silence. No end-to-end run with a deliberately slow writer |
-| 9 | not tested | `[ha]` fencing is the generic one: a request naming `mixer_id` must prove the mixer's group |
+| 9 | done | `ha::mixer_recordings_are_fenced`: no proof, another group's, and a stale epoch after a handoff are `fenced`; the new owner stops it |
 | 10 | done | same test: one recording for one key; `operation.query` lists its `recording_id` |
 | 11 | not tested | same storage code path as endpoint recordings |
-| 12 | not done | `tracks: true` (P1) is refused with `unsupported` |
-| 13 | not done | no load run (50 mixers × 5) yet |
+| 12 | done | `mixrec::a_track_per_participant`: a file per participant, as long as the mix, its own tone only, silence before a latecomer joined, a muted one's input kept |
+| 13 | done | `mixrec::load` (ignored; by hand): see docs/benchmarks.md, "Recording conference mixers" |
 
 Also added:
 - `mixer.destroyed` event;
@@ -737,3 +736,12 @@ Also added:
 - the `{mixer_id}`, `{recording_id}` and `{track}` file-name placeholders;
 - `[recording] max_mixer_recordings` (64);
 - the async SDK has `EventKind::MixerDestroyed`, `MediaEvent::mixer_id` and `EventFilter::mixer_ids`.
+
+Found while testing the restart path, and fixed: with no event
+subscriber connected, the control thread dropped media events (only an
+announcement's end was kept). A recording's outcome then never reached
+`recording.query`, endpoint and mixer recordings alike. A playback queue
+did not advance, `playback.query` missed the end, and nothing went to the
+journal for a later subscriber to replay. Media events are now always
+handled. Test: `recpause::the_outcome_is_kept_without_subscribers`
+(fails without the fix).

@@ -85,6 +85,9 @@ pub enum MediaEventKind {
     RecordingDone {
         file: Option<String>,
         uploaded: Option<bool>,
+        /// A mixer recording's per-participant tracks: (endpoint id,
+        /// file).
+        tracks: Vec<(String, String)>,
     },
 }
 
